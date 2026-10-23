@@ -1,14 +1,21 @@
+//go:build windows
+
+// win.go Windows 专有能力：ShellExecuteW 打开 URL、DPAPI 解密、Qoder 数据目录与
+// OSCrypt key、隐藏窗口执行子进程。
+//
+// build tag 说明：本文件原先没有 build tag，而 Go 的隐式平台约束**只认文件名的
+// `_GOOS` 后缀**（`win.go` 不算），于是 syscall.NewLazyDLL 等 Windows 专有符号
+// 会在 linux/darwin 交叉编译时报 `undefined: syscall.NewLazyDLL`，5 平台 CI
+// 矩阵全部编不出来。现补 `//go:build windows`，平台无关部分迁到 crypto_common.go，
+// 非 Windows 桩在 win_other.go。
 package ideauth
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -38,10 +45,10 @@ func OpenURL(u string) error {
 // ---------- Windows DPAPI (CryptUnprotectData) ----------
 
 var (
-	crypt32            = syscall.NewLazyDLL("crypt32.dll")
-	procUnprotectData  = crypt32.NewProc("CryptUnprotectData")
-	kernel32           = syscall.NewLazyDLL("kernel32.dll")
-	procLocalFree      = kernel32.NewProc("LocalFree")
+	crypt32           = syscall.NewLazyDLL("crypt32.dll")
+	procUnprotectData = crypt32.NewProc("CryptUnprotectData")
+	kernel32          = syscall.NewLazyDLL("kernel32.dll")
+	procLocalFree     = kernel32.NewProc("LocalFree")
 )
 
 type dataBlob struct {
@@ -81,51 +88,6 @@ func DPAPIUnprotect(data []byte) ([]byte, error) {
 	return out.bytes(), nil
 }
 
-// ---------- AES-256-GCM（Qoder 帧：iv12 | ct | tag16） ----------
-
-// GCMDecryptIV12 解密 Qoder 风格数据体：前 12 字节 IV，末 16 字节 tag。
-func GCMDecryptIV12(key, body []byte) ([]byte, error) {
-	if len(body) < 28 {
-		return nil, fmt.Errorf("body too short: %d", len(body))
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCMWithNonceSize(block, 12)
-	if err != nil {
-		return nil, err
-	}
-	iv := body[:12]
-	ct := body[12 : len(body)-16]
-	tag := body[len(body)-16:]
-	sealed := append(append([]byte{}, ct...), tag...)
-	return gcm.Open(nil, iv, sealed, nil)
-}
-
-// GCMEncryptIV12 加密并产出 Qoder 风格数据体（iv12 | ct | tag16）。
-func GCMEncryptIV12(key, plain, iv []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCMWithNonceSize(block, 12)
-	if err != nil {
-		return nil, err
-	}
-	if len(iv) != 12 {
-		return nil, fmt.Errorf("iv must be 12 bytes, got %d", len(iv))
-	}
-	sealed := gcm.Seal(nil, iv, plain, nil)
-	ct := sealed[:len(sealed)-16]
-	tag := sealed[len(sealed)-16:]
-	out := make([]byte, 0, 12+len(ct)+16)
-	out = append(out, iv...)
-	out = append(out, ct...)
-	out = append(out, tag...)
-	return out, nil
-}
-
 // ---------- Qoder 目录与 OSCrypt key ----------
 
 // QoderDataDir 返回 Qoder 用户数据目录（Windows: %APPDATA%\com.qoder.app.stable）。
@@ -161,38 +123,6 @@ func QoderOSCryptKey() ([]byte, error) {
 		return nil, fmt.Errorf("encrypted_key 不是 DPAPI 前缀")
 	}
 	return DPAPIUnprotect(blob[5:])
-}
-
-// ---------- 通用小工具 ----------
-
-// extractJSONString 从 JSON 文本里粗略抓取某个 key 的字符串值（避免引入依赖）。
-func extractJSONString(data []byte, key string) string {
-	s := string(data)
-	needle := `"` + key + `"`
-	i := strings.Index(s, needle)
-	if i < 0 {
-		return ""
-	}
-	j := strings.IndexByte(s[i+len(needle):], ':')
-	if j < 0 {
-		return ""
-	}
-	rest := s[i+len(needle)+j+1:]
-	rest = strings.TrimLeft(rest, " \t\r\n")
-	if len(rest) == 0 || rest[0] != '"' {
-		return ""
-	}
-	rest = rest[1:]
-	end := strings.IndexByte(rest, '"')
-	if end < 0 {
-		return ""
-	}
-	return rest[:end]
-}
-
-func base64Decode(s string) ([]byte, error) {
-	// 标准 base64，含可能省略的 padding
-	return base64Std.DecodeString(strings.TrimSpace(s))
 }
 
 // runHidden 执行命令并返回 stdout（Windows 下隐藏窗口）。
