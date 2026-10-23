@@ -4478,15 +4478,51 @@ async function doMmAdd() {
 if ($('btnMmAdd')) $('btnMmAdd').onclick = doMmAdd;
 if ($('btnMmCheckinAll')) $('btnMmCheckinAll').onclick = () => doMmCheckin($('btnMmCheckinAll'));
 
-/* 总「一键签到」：WorkBuddy → Qoder → Trae，全部账号一次签完。 */
+/* 主号池（CodeBuddy / WorkBuddy 国内版账号，即网关 chat 流量的实际来源）逐号签到。
+   与 doWbCheckinAll 同构，但走网关自己的号池：overview 取号 → accounts/{uid}/checkin 签。
+   两类账号不签：国际版（realm=global，无签到体系）、今日已签（checkin_done）。
+   都计入「跳过」，不计入「失败」。 */
+async function doMainPoolCheckinAll() {
+  const d = await api('overview');
+  const all = (d && d.accounts) || [];
+  let ok = 0, skip = 0, fail = 0;
+  for (const a of all) {
+    if (!a.uid) continue;
+    if (a.realm === 'global') { skip++; continue; }
+    if (a.checkin_done) { skip++; continue; }
+    try {
+      const r = await api('accounts/' + encodeURIComponent(a.uid) + '/checkin', { method: 'POST' });
+      if (r && r.ok) {
+        // 上游「今天已签到」也会返回 ok（checkin_done=true），归为已签不算成功。
+        if (r.checkin_done) skip++; else ok++;
+      } else {
+        fail++;
+      }
+    } catch (_) { fail++; }
+  }
+  return { ok, skip, fail, total: all.length };
+}
+
+/* 总「一键签到」：主号池 → WorkBuddy → Qoder → Trae，全部账号一次签完。
+   各平台失败分别计数（不让某个平台的号失效把整条汇总染红）。 */
 async function doCheckinAll(btn) {
   const old = btn ? btn.textContent : '一键签到';
   if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
   const st = $('ckMasterState');
-  if (st) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">开始签到 WorkBuddy → Qoder → Trae</span>'; }
+  if (st) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">开始签到 主号池 → WorkBuddy → Qoder → Trae</span>'; }
   const parts = [];
+  let failCount = 0;
   try {
+    // ① 主号池：网关自己的 CodeBuddy 账号（此前这条链完全没接进「一键签到」）。
+    try {
+      const mp = await doMainPoolCheckinAll();
+      failCount += mp.fail;
+      parts.push('主号池 成功 ' + mp.ok + ' · 已签 ' + mp.skip + ' · 失败 ' + mp.fail);
+    } catch (e) { failCount++; parts.push('主号池 失败：' + e.message); }
+
+    // ② WorkBuddy IDE 号池。
     const wb = await doWbCheckinAll(null);
+    failCount += wb.fail;
     parts.push('WorkBuddy 成功 ' + wb.ok + ' · 已签 ' + wb.skip + ' · 失败 ' + wb.fail);
 
     try {
@@ -4496,24 +4532,28 @@ async function doCheckinAll(btn) {
       const qok = qr.filter(r => r.phase === 'claimed').length;
       const qal = qr.filter(r => r.phase === 'already').length;
       const qf = qr.filter(r => r.phase !== 'claimed' && r.phase !== 'already').length;
+      failCount += qf;
       let qtxt = '成功 ' + qok + ' · 已签 ' + qal + ' · 失败 ' + qf;
       if (q && q.credits) qtxt += '（+' + q.credits + '）';
       parts.push('Qoder ' + qtxt);
-    } catch (e) { parts.push('Qoder 失败：' + e.message); }
+    } catch (e) { failCount++; parts.push('Qoder 失败：' + e.message); }
 
     try {
       // MiniMax：号池逐账号签到（token 级，无需切号）。
+      // 注意：access token 有效期约 1 小时，refresh token 单次有效；客户端没续期时
+      // 这里会 401 —— 属于「该号需重新授权」，不是网关故障，如实计数即可。
       const mm = await api('ide/minimax/checkin', { method: 'POST', body: '{}' });
       const mr = (mm && mm.results) || [];
       if (!mr.length) {
         parts.push('MiniMax 无账号');
       } else {
+        failCount += (mm.failed_accounts || 0);
         let mtxt = '成功 ' + (mm.claimed_accounts || 0) + ' · 已签 ' + (mm.already_accounts || 0) +
           ' · 失败 ' + (mm.failed_accounts || 0);
         if (mm.credits) mtxt += '（+' + mm.credits + '）';
         parts.push('MiniMax ' + mtxt);
       }
-    } catch (e) { parts.push('MiniMax 失败：' + e.message); }
+    } catch (e) { failCount++; parts.push('MiniMax 失败：' + e.message); }
 
     try {
       const t = await api('trae/checkin', { method: 'POST', body: '{}' });
@@ -4521,15 +4561,16 @@ async function doCheckinAll(btn) {
       const okc = arr.filter(r => r.status === 'claimed').length;
       const alc = arr.filter(r => r.status === 'already').length;
       const fc = arr.filter(r => r.status === 'fail').length;
+      failCount += fc;
       parts.push('Trae 成功 ' + okc + ' · 已签 ' + alc + ' · 失败 ' + fc);
-    } catch (e) { parts.push('Trae 失败：' + e.message); }
+    } catch (e) { failCount++; parts.push('Trae 失败：' + e.message); }
 
     const text = parts.join('；');
-    if (st) { st.className = 'state ok'; st.textContent = '完成：' + text; }
-    const hasFail = /失败 [1-9]/.test(text);
-    toast('一键签到完成：' + text, hasFail ? 'err' : 'ok');
+    if (st) { st.className = failCount > 0 ? 'state err' : 'state ok'; st.textContent = '完成：' + text; }
+    toast('一键签到完成：' + text, failCount > 0 ? 'err' : 'ok');
     await loadCheckinPool(true);
     loadTraeStatus(true); loadTraeCredits(true); loadQkCredits(true); loadWkCredits(true);
+    loadOverview(true);
   } catch (e) {
     if (st) { st.className = 'state err'; st.textContent = e.message; }
     toast(e.message, 'err');

@@ -131,6 +131,19 @@ func runHidden(name string, args ...string) ([]byte, error) {
 	// HideWindow 只影响窗口首次显示；控制台程序仍可能闪一下黑框。
 	// 服务本体已是 GUI 子系统（-H windowsgui），子进程一律再叠 CREATE_NO_WINDOW，
 	// 从根上避免「隔一段时间弹一个 CMD/PowerShell 窗口」。
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	hideWindow(cmd)
 	return cmd.Output()
+}
+
+// hideWindow 让子进程不弹窗（仅 Windows 有意义；其他平台是空实现）。
+//
+// 单独抽出来是因为调用方往往要自己组装 cmd（设 Stdin/Dir 等），
+// 直接在业务文件里写 `cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: ...}`
+// 会把 Windows 专有的 syscall 字段带进无 build tag 的文件 —— 那类文件在
+// linux/darwin 交叉编译时会报 `unknown field HideWindow in syscall.SysProcAttr`。
+func hideWindow(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 }

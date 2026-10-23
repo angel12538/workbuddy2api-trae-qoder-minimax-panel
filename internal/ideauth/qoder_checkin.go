@@ -14,7 +14,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -150,7 +149,7 @@ func qoderRunRuntimeInfo(exe string) map[string]any {
 	cmd := exec.Command(exe, "--account-stdin")
 	cmd.Dir = filepath.Dir(exe)
 	cmd.Stdin = bytes.NewReader(nil)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	hideWindow(cmd)
 	type res struct {
 		b   []byte
 		err error

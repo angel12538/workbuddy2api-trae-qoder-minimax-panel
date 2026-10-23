@@ -64,3 +64,6 @@ func QoderOSCryptKey() ([]byte, error) {
 func runHidden(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).Output()
 }
+
+// hideWindow 非 Windows 无窗口隐藏概念，空实现。
+func hideWindow(cmd *exec.Cmd) {}
