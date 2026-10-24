@@ -1465,11 +1465,12 @@ let qoderLoginTimer = null;
 function stopQoderLoginPoll() { if (qoderLoginTimer) { clearTimeout(qoderLoginTimer); qoderLoginTimer = null; } }
 async function doQoderLogin() {
   const b = $('btnQoderLogin');
-  b.disabled = true; b.textContent = '正在启动 Qoder…';
+  const logout = $('chkQoderLogout') && $('chkQoderLogout').checked;
+  b.disabled = true; b.textContent = logout ? '正在退出并启动…' : '正在启动 Qoder…';
   $('addQoderLoginBox').hidden = false;
   $('addQoderLoginErr').hidden = true;
   try {
-    const d = await api('ide/qoder/login/start', { method: 'POST', body: '{}' });
+    const d = await api('ide/qoder/login/start', { method: 'POST', body: JSON.stringify({ logout: logout }) });
     $('addQoderLoginState').textContent = d.message || '已启动 Qoder 客户端，请在客户端里点「浏览器登录 / 扫码登录」完成鉴权…';
     stopQoderLoginPoll();
     const tick = async () => {
@@ -1477,11 +1478,15 @@ async function doQoderLogin() {
         const r = await api('ide/qoder/login/poll');
         if (r.done) {
           stopQoderLoginPoll();
-          $('addQoderLoginState').textContent = r.ok ? '登录成功，已加入号池' : '登录失败';
+          const extra = r.independent
+            ? '　✅ ' + (r.detail || '这个号现在是独立身份，能领自己那份 100 积分')
+            : (r.detail ? '　⚠️ ' + r.detail : '');
+          $('addQoderLoginState').textContent = (r.ok ? '登录成功，已加入号池' : '登录失败') + extra;
           $('addQoderDone').hidden = false;
-          $('addQoderDone').textContent = r.message || '';
+          $('addQoderDone').textContent = (r.message || '') + extra;
           if (!r.ok) { $('addQoderLoginErr').hidden = false; $('addQoderLoginErr').textContent = r.message || '登录失败'; }
           loadQoderAccounts(true);
+          loadCkQoder(true);
           return;
         }
         $('addQoderLoginState').textContent = r.message || '等待在客户端中完成登录…';

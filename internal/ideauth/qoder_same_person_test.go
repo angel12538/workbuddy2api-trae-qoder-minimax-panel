@@ -75,8 +75,8 @@ func TestQoderCheckinPoolSamePersonProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QoderCheckinPool: %v", err)
 	}
-	if out.Claimed != 1 || out.Already != 1 || out.Failed != 0 {
-		t.Fatalf("应为一个号真领到、另一个号被判定同一人已领（0 失败），实际 %+v", out)
+	if out.Claimed != 1 || out.Already != 0 || out.Blocked != 1 || out.Failed != 0 {
+		t.Fatalf("应为一个号真领到、另一个号被判定同一人已领走（单列 blocked），实际 %+v", out)
 	}
 	if out.Credits != 100 {
 		t.Errorf("新增积分应为 100（只有 A 号真领到），实际 %v", out.Credits)
@@ -90,14 +90,26 @@ func TestQoderCheckinPoolSamePersonProbe(t *testing.T) {
 		t.Errorf("A 号应真领到：phase=%s checked=%v", a.Phase, a.CheckedInToday)
 	}
 	b := byEmail["b@test.com"]
-	if b.Phase != "already" || !b.CheckedInToday {
-		t.Errorf("B 号应判为已签到（今日已领取），实际 phase=%s checked=%v", b.Phase, b.CheckedInToday)
+	// ⚠️ 关键断言：B 号**没签到**（服务端 BLOCKED）。
+	//    绝不能把它标成"已签到"（那是假签到），也不能写进本地签到记录。
+	if b.Phase != "blocked" {
+		t.Errorf("B 号应为 blocked（今天没签上），实际 phase=%s msg=%q", b.Phase, b.Msg)
+	}
+	if b.CheckedInToday {
+		t.Error("B 号没领到积分，checked_in_today 必须是 false（否则面板会显示成已签到）")
 	}
 	if !strings.Contains(b.Msg, "SAME_PERSON_ALREADY_CLAIMED") {
 		t.Errorf("B 号的说明应带上服务端判定码，实际 %q", b.Msg)
 	}
-	if !strings.Contains(b.Msg, "另一账号") {
-		t.Errorf("B 号的说明应讲清是同一人另一账号领的，实际 %q", b.Msg)
+	if strings.Contains(b.Msg, "已领取") {
+		t.Errorf("B 号的消息不能说「已领取」—— 它今天根本没领到，实际 %q", b.Msg)
+	}
+	// 本地签到记录里**不能**有 B 号（否则明天也判成已签到）
+	if CheckedInToday("qoder", "b@test.com") {
+		t.Error("B 号被服务端拒绝后不得写入本地签到记录（假签到）")
+	}
+	if !CheckedInToday("qoder", "a@test.com") {
+		t.Error("A 号真领到了，本地签到记录应存在")
 	}
 
 	// priority：B 号优先打（用户想「今天这 100 给谁就点谁」）

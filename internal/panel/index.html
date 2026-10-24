@@ -1520,6 +1520,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button id="btnQoderLogin" class="primary">浏览器登录并添加</button>
           <button id="btnQoderCapture">添加当前 Qoder 账号</button>
         </div>
+        <label class="hint" style="margin-top:10px;display:flex;gap:6px;align-items:flex-start;cursor:pointer">
+          <input type="checkbox" id="chkQoderLogout" style="margin-top:2px">
+          <span>先退出当前账号再登录（换另一个号时勾选）—— <b>必须走一次真正的登录</b>：服务端在登录时给账号发"这个人"的身份（scope），面板直接写登录态不会重新签发，两个号就会被算成同一个人、每天只能领一份 100 积分。</span>
+        </label>
         <div id="addQoderLoginBox" hidden style="margin-top:10px">
           <div class="state"><span class="dots" id="addQoderLoginState">已启动 Qoder 客户端，请在客户端里点「浏览器登录 / 扫码登录」完成鉴权…</span></div>
           <div id="addQoderLoginErr" class="state err" hidden style="margin-top:8px"></div>

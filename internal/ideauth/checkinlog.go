@@ -116,6 +116,28 @@ func LastClaimedAt(kind, key string) (time.Time, bool) {
 	return parseCheckinStamp(f.Claims[kind+":"+strings.TrimSpace(key)])
 }
 
+// UnmarkCheckedIn 撤销某签到对象的「今日已签到」记录。
+//
+// 什么时候需要：服务端明确答复「同一个人今天已经领过了」时，说明**本号**今天
+// 并没有签到 —— 之前若有本地记录，那是误记（例如把被服务端拒绝的领取也写进了
+// 记录），必须清掉，否则面板会显示成"今日已签到"（假签到）。
+func UnmarkCheckedIn(kind, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	checkinLogMu.Lock()
+	defer checkinLogMu.Unlock()
+	f := loadCheckinLogFile()
+	k := kind + ":" + key
+	if _, ok := f.Entries[k]; !ok {
+		return nil
+	}
+	delete(f.Entries, k)
+	delete(f.Claims, k)
+	return saveCheckinLogFile(f)
+}
+
 // parseCheckinStamp 解析记录值：RFC3339 时间戳优先，纯日期回落当日 00:00。
 func parseCheckinStamp(v string) (time.Time, bool) {
 	v = strings.TrimSpace(v)

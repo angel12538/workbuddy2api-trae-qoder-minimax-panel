@@ -25,6 +25,9 @@ type QoderCheckinPoolResult struct {
 	Claimed int                  `json:"claimed_accounts"` // 本次新领取的账号数
 	Already int                  `json:"already_accounts"` // 今日已领过的账号数
 	Failed  int                  `json:"failed_accounts"`  // 失败账号数
+	// Blocked 今天**没签上**的账号数：服务端判定「同一个人另一账号已领走每日额度」。
+	// 这不是失败（重试也没用），也不是"已签到"（本号根本没领到）—— 单列一栏。
+	Blocked int `json:"blocked_accounts"`
 	// Credits 本次**新增**的积分（只累加 claimed）；AlreadyCredits 是今日已领账号的额度，
 	// 单独返回，避免把「今日已领」误报成「本次又赚了」。
 	Credits        float64 `json:"credits_total"`
@@ -215,12 +218,17 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			_ = MarkClaimed("qoder", p.email)
 			_ = MarkCheckedIn("qoder", p.email)
 		case "blocked":
-			// 服务端明确答复：同一个人今天已经领过了 → 本号今天无需再领。
-			p.res.Phase = "already"
-			p.res.Msg = "今日已领取（同一人额度已由另一账号领取；服务端判定 " + detail + "）"
-			p.res.CheckedInToday = true
-			out.Already++
-			_ = MarkCheckedIn("qoder", p.email)
+			// 服务端明确答复：**同一个人**今天已经领过了（同一人另一账号领走），
+			// 也就是说**本号今天并没有签到**，今天的 100 积分也没进它的账。
+			//
+			// ⚠️ 这里绝不能写 MarkCheckedIn —— 那是"假签到"：本号压根没领到。
+			// 也不能算进 Already（那也是"今天签过了"的意思）。单列 blocked，
+			// 并把之前可能存在的误记清掉（Unmark）。
+			p.res.Phase = "blocked"
+			p.res.Msg = "今天没签上：同一人另一账号已领走每日额度（服务端判定 " + detail + "）"
+			p.res.CheckedInToday = false
+			out.Blocked++
+			_ = UnmarkCheckedIn("qoder", p.email)
 		default:
 			if CheckinRecordTrusted("qoder", p.email) {
 				p.res.Phase = "already"
