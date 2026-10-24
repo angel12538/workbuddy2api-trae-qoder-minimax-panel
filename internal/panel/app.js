@@ -71,6 +71,38 @@ function esc(s) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
+/* ── 行内控件统一外观 ─────────────────────────────────────────────────
+   全面板只有三种控件外观，别再各写各的：
+
+     · 主操作：蓝底 `xs primary` —— 签到 / 切号 / 全部签到 / 浏览器登录
+     · 次操作：灰底 `xs`          —— 移除 / 续期 / 刷新 / 同步
+     · 禁用态：灰底 + 半透明       —— 一律用 `xs disabled`（不再有"蓝底却禁用"的中间态）
+
+   「已签到 / 当前登录 / 可切换」是**状态**，只由状态徽章 `.stask` 表达，
+   **不再当按钮文案**。此前"已签到"同时出现在灰按钮和蓝按钮上，样式对不上；
+   按钮文案统一成动作本身（签到 / 切号），状态一律看徽章。
+
+   用法：
+     UI.act('data-ck-wb', uid, '签到', '今天让这个号先领')   主操作
+     UI.sub('data-qoder-remove', email, '移除')              次操作
+     UI.off('切号', '需先在客户端登录该账号一次')            禁用（带原因）
+     UI.badge('ok', '✓', '今日已签到', '上游活动列表确认')    状态徽章
+*/
+const UI = {
+  act(attr, val, label, tip) {
+    return `<button class="xs primary" ${attr}="${esc(val)}"${tip ? ` title="${esc(tip)}"` : ''}>${esc(label)}</button>`;
+  },
+  sub(attr, val, label, tip) {
+    return `<button class="xs" ${attr}="${esc(val)}"${tip ? ` title="${esc(tip)}"` : ''}>${esc(label)}</button>`;
+  },
+  off(label, tip) {
+    return `<button class="xs" disabled${tip ? ` title="${esc(tip)}"` : ''}>${esc(label)}</button>`;
+  },
+  badge(kind, mark, text, tip) {
+    return `<span class="stask ${kind}"${tip ? ` title="${esc(tip)}"` : ''}><span class="mark">${mark}</span>${esc(text)}</span>`;
+  },
+};
+
 function ago(iso) {
   if (!iso || iso.startsWith('0001-')) return '—';
   const s = (Date.now() - new Date(iso)) / 1000;
@@ -1347,7 +1379,10 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); stopTraePoll(); stopMmLoginPoll(); loginState = null; traeLoginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() {
+  stopPoll(); stopTraePoll(); stopMmLoginPoll(); stopDbBrowserPoll(); stopQoderLoginPoll();
+  loginState = null; traeLoginState = null; $('addVeil').classList.remove('on');
+}
 $('btnCloseAdd').onclick = closeAdd;
 
 /* ── Trae 账号添加（面板自拉浏览器 + CDP 取凭证）────────────────────────
@@ -1405,13 +1440,62 @@ async function pollTraeLogin() {
 $('btnTraeStart').onclick = startTraeLogin;
 $('btnTraeStop').onclick = stopTraeBrowser;
 
-/* ── Qoder 添加（把本机当前登录态存入号池）────────────────────────── */
+/* ── Qoder 添加（浏览器登录 / 捕获本机当前登录态）────────────────────
+   Qoder 的可用登录态只在桌面客户端里（网页版拿不到 IDE 能用的令牌），所以
+   「浏览器登录」= 启动客户端 → 在客户端里用浏览器/扫码完成鉴权 → 面板盯着
+   客户端登录态，一变就自动收进号池。 */
 function resetQoderPanel() {
   const dn = $('addQoderDone'), er = $('addQoderErr');
   if (dn) dn.hidden = true;
   if (er) er.hidden = true;
   const b = $('btnQoderCapture');
   if (b) { b.disabled = false; b.textContent = '添加当前 Qoder 账号'; }
+  const lb = $('btnQoderLogin');
+  if (lb) { lb.disabled = false; lb.textContent = '浏览器登录并添加'; }
+  const box = $('addQoderLoginBox');
+  if (box) box.hidden = true;
+  const le = $('addQoderLoginErr');
+  if (le) { le.hidden = true; le.textContent = ''; }
+  stopQoderLoginPoll();
+}
+let qoderLoginTimer = null;
+function stopQoderLoginPoll() { if (qoderLoginTimer) { clearTimeout(qoderLoginTimer); qoderLoginTimer = null; } }
+async function doQoderLogin() {
+  const b = $('btnQoderLogin');
+  b.disabled = true; b.textContent = '正在启动 Qoder…';
+  $('addQoderLoginBox').hidden = false;
+  $('addQoderLoginErr').hidden = true;
+  try {
+    const d = await api('ide/qoder/login/start', { method: 'POST', body: '{}' });
+    $('addQoderLoginState').textContent = d.message || '已启动 Qoder 客户端，请在客户端里点「浏览器登录 / 扫码登录」完成鉴权…';
+    stopQoderLoginPoll();
+    const tick = async () => {
+      try {
+        const r = await api('ide/qoder/login/poll');
+        if (r.done) {
+          stopQoderLoginPoll();
+          $('addQoderLoginState').textContent = r.ok ? '登录成功，已加入号池' : '登录失败';
+          $('addQoderDone').hidden = false;
+          $('addQoderDone').textContent = r.message || '';
+          if (!r.ok) { $('addQoderLoginErr').hidden = false; $('addQoderLoginErr').textContent = r.message || '登录失败'; }
+          loadQoderAccounts(true);
+          return;
+        }
+        $('addQoderLoginState').textContent = r.message || '等待在客户端中完成登录…';
+        if (r.expired) { stopQoderLoginPoll(); return; }
+      } catch (e) {
+        stopQoderLoginPoll();
+        $('addQoderLoginErr').hidden = false;
+        $('addQoderLoginErr').textContent = e.message;
+        return;
+      }
+      qoderLoginTimer = setTimeout(tick, 2500);
+    };
+    qoderLoginTimer = setTimeout(tick, 2500);
+  } catch (e) {
+    $('addQoderLoginErr').hidden = false; $('addQoderLoginErr').textContent = e.message;
+    $('addQoderLoginBox').hidden = true;
+  } finally { b.disabled = false; b.textContent = '浏览器登录并添加'; }
 }
 async function loadQoderAddTab() {
   resetQoderPanel();
@@ -1441,6 +1525,7 @@ async function doQoderCapture() {
   } finally { b.disabled = false; b.textContent = '添加当前 Qoder 账号'; }
 }
 if ($('btnQoderCapture')) $('btnQoderCapture').onclick = doQoderCapture;
+if ($('btnQoderLogin')) $('btnQoderLogin').onclick = doQoderLogin;
 
 /* ── MiniMax 添加（客户端捕获 / 粘贴 Token）────────────────────────── */
 function resetMinimaxAddPanel() {
@@ -1603,7 +1688,14 @@ if ($('btnMmLoginOpen')) $('btnMmLoginOpen').onclick = () => window.open($('mmLo
 if ($('btnMmLoginCopy')) $('btnMmLoginCopy').onclick = () => navigator.clipboard.writeText($('mmLoginCode').textContent)
   .then(() => toast('验证码已复制', 'ok'), () => toast('复制失败，请手动复制', 'err'));
 
-/* ── 豆包添加（客户端提取 / 粘贴 Cookie）──────────────────────────── */
+/* ── 豆包添加（浏览器登录 / 客户端登录并添加 / 粘贴 Cookie）────────────
+   豆包签到用的就是网页 Cookie（sessionid / ttwid / msToken），所以：
+     · 浏览器登录 —— 面板自拉一个干净浏览器窗口，你在网页版登录，面板用 CDP
+       把该会话的 Cookie 捞出来入池（与 Trae 浏览器登录同一套机制）；
+     · 客户端登录并添加 —— 拉起豆包客户端，你登录完，面板提取客户端 Cookie 入池
+       （这两个按钮以前是分开的「从客户端提取」+「启动客户端登录」，语义重复，
+        现在合成一个按钮：拉起客户端 → 你登录 → 自动提取）。
+   两个按钮拿到的凭据完全一样，区别只在"在哪登录"。 */
 function resetDoubaoAddPanel() {
   const dn = $('addDbDone'), er = $('addDbErr');
   if (dn) dn.hidden = true;
@@ -1612,36 +1704,87 @@ function resetDoubaoAddPanel() {
   if (man) man.hidden = true;
   const tg = $('btnDbToggleManual');
   if (tg) tg.textContent = '改用粘贴 Cookie';
-  const b = $('btnDbExtract');
-  if (b) { b.disabled = false; b.textContent = '从客户端提取当前账号'; }
+  const b = $('btnDbClient');
+  if (b) { b.disabled = false; b.textContent = '客户端登录并添加'; }
+  const bb = $('btnDbBrowser');
+  if (bb) { bb.disabled = false; bb.textContent = '浏览器登录并添加'; }
+  const box = $('addDbBrowserBox');
+  if (box) box.hidden = true;
+  const be = $('addDbBrowserErr');
+  if (be) { be.hidden = true; be.textContent = ''; }
+  stopDbBrowserPoll();
 }
-async function doDbExtractAdd() {
-  const b = $('btnDbExtract');
-  b.disabled = true; b.textContent = '提取中（会重启豆包客户端）…';
-  $('addDbDone').hidden = true; $('addDbErr').hidden = true;
-  try {
-    const d = await api('ide/doubao/add_extract', { method: 'POST', body: '{}' });
-    $('addDbDone').hidden = false;
-    $('addDbDone').textContent = (d.msg || '已提取') + (d.note ? '（' + d.note + '）' : '');
-    loadCkDoubao(true);
-  } catch (e) {
-    $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
-  } finally { b.disabled = false; b.textContent = '从客户端提取当前账号'; }
-}
-/* 豆包「登录窗口」：登录在客户端自己的 UI 里（网页资源加密打包，没有可复用的
-   OAuth 端点），所以这里拉起客户端本体，在客户端里登录完再点「提取」。 */
-async function doDbLaunch() {
-  const b = $('btnDbLaunch');
-  b.disabled = true; b.textContent = '正在启动…';
+/* 豆包「客户端登录并添加」：拉起客户端 → 用户登录 → 提取 Cookie 入池。 */
+async function doDbClientAdd() {
+  const b = $('btnDbClient');
+  b.disabled = true; b.textContent = '正在启动客户端…';
   $('addDbDone').hidden = false; $('addDbErr').hidden = true;
   try {
-    const d = await api('ide/doubao/launch', { method: 'POST', body: '{}' });
-    $('addDbDone').textContent = d.msg || '已启动豆包客户端';
+    await api('ide/doubao/launch', { method: 'POST', body: '{}' });
+    $('addDbDone').textContent = '已启动豆包客户端 —— 请在客户端里登录要添加的账号，登录完点下面的「提取 Cookie」';
+    b.textContent = '提取 Cookie';
+    b.onclick = async () => {
+      b.disabled = true; b.textContent = '提取中（会短暂重启客户端）…';
+      try {
+        const d = await api('ide/doubao/add_extract', { method: 'POST', body: '{}' });
+        $('addDbDone').hidden = false;
+        $('addDbDone').textContent = (d.msg || '已提取') + (d.note ? '（' + d.note + '）' : '');
+        loadCkDoubao(true);
+      } catch (e) {
+        $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
+      } finally { b.disabled = false; b.textContent = '客户端登录并添加'; b.onclick = doDbClientAdd; }
+    };
   } catch (e) {
     $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
-  } finally { b.disabled = false; b.textContent = '启动豆包客户端登录'; }
+  } finally { if (b.textContent === '正在启动客户端…') { b.disabled = false; b.textContent = '客户端登录并添加'; } }
 }
-if ($('btnDbLaunch')) $('btnDbLaunch').onclick = doDbLaunch;
+/* 豆包「浏览器登录并添加」：自拉浏览器 → 登录 → CDP 捞 Cookie 入池。 */
+let dbBrowserTimer = null;
+function stopDbBrowserPoll() { if (dbBrowserTimer) { clearTimeout(dbBrowserTimer); dbBrowserTimer = null; } }
+async function doDbBrowserAdd() {
+  const b = $('btnDbBrowser');
+  b.disabled = true; b.textContent = '正在打开浏览器…';
+  $('addDbBrowserBox').hidden = false;
+  $('addDbBrowserErr').hidden = true;
+  try {
+    const d = await api('ide/doubao/browser/start', { method: 'POST', body: '{}' });
+    $('addDbBrowserState').textContent = d.message || '已打开浏览器，请登录豆包账号…';
+    stopDbBrowserPoll();
+    const tick = async () => {
+      try {
+        const r = await api('ide/doubao/browser/poll');
+        if (r.done) {
+          stopDbBrowserPoll();
+          $('addDbBrowserState').textContent = r.ok ? '登录成功，已加入号池' : '登录失败';
+          $('addDbDone').hidden = false;
+          $('addDbDone').textContent = r.message || '';
+          if (!r.ok) { $('addDbBrowserErr').hidden = false; $('addDbBrowserErr').textContent = r.message || '登录失败'; }
+          loadCkDoubao(true);
+          return;
+        }
+        $('addDbBrowserState').textContent = r.message || '等待在浏览器中完成豆包登录…';
+        if (r.expired) { stopDbBrowserPoll(); return; }
+      } catch (e) {
+        stopDbBrowserPoll();
+        $('addDbBrowserErr').hidden = false;
+        $('addDbBrowserErr').textContent = e.message;
+        return;
+      }
+      dbBrowserTimer = setTimeout(tick, 2000);
+    };
+    dbBrowserTimer = setTimeout(tick, 2000);
+  } catch (e) {
+    $('addDbBrowserErr').hidden = false; $('addDbBrowserErr').textContent = e.message;
+    $('addDbBrowserBox').hidden = true;
+  } finally { b.disabled = false; b.textContent = '浏览器登录并添加'; }
+}
+if ($('btnDbClient')) $('btnDbClient').onclick = doDbClientAdd;
+if ($('btnDbBrowser')) $('btnDbBrowser').onclick = doDbBrowserAdd;
+if ($('btnDbBrowserStop')) $('btnDbBrowserStop').onclick = async () => {
+  stopDbBrowserPoll();
+  try { await api('ide/doubao/browser/stop', { method: 'POST', body: '{}' }); } catch (e) { /* 忽略 */ }
+  $('addDbBrowserBox').hidden = true;
+};
 async function doDbAddCookie() {
   const b = $('btnDbAddCookie');
   b.disabled = true;
@@ -1659,7 +1802,6 @@ async function doDbAddCookie() {
     $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
   } finally { b.disabled = false; }
 }
-if ($('btnDbExtract')) $('btnDbExtract').onclick = doDbExtractAdd;
 if ($('btnDbToggleManual')) $('btnDbToggleManual').onclick = () => {
   const man = $('addDbManual');
   man.hidden = !man.hidden;
@@ -2144,30 +2286,37 @@ async function loadTraeStatus(quiet) {
       return;
     }
     let done = 0, errs = 0, expired = 0;
-    const head = '<div class="thead"><div>账号</div><div>今日状态</div><div>积分</div><div>操作</div></div>';
+    // 列序与其它签到池统一：账号 | 积分 | 状态 | 操作（原来这里是 账号|状态|积分|操作）。
+    const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
     list.innerHTML = head + arr.map(a => {
       if (a.expired) expired++;
       if (a.error) errs++; else if (a.checked_in) done++;
       const status = a.expired
-        ? '<span class="stask todo"><span class="mark">!</span>凭证过期</span>'
+        ? UI.badge('todo', '!', '凭证过期')
         : (a.error
-          ? '<span class="stask todo"><span class="mark">!</span>查询失败</span>'
+          ? UI.badge('todo', '!', '查询失败')
           : (a.checked_in
-            ? '<span class="stask ok"><span class="mark">✓</span>今日已签</span>'
-            : '<span class="stask warn"><span class="mark">○</span>未签到</span>'));
+            ? UI.badge('ok', '✓', '今日已签')
+            : UI.badge('warn', '○', '未签到')));
       const credits = a.credits == null ? '—' : a.credits;
       // 续期能力：refresh_token 通道（最快）> 浏览器会话通道 > 都无（需重新登录）。
       const renewTip = a.refreshable ? '可自动续期（refresh_token 通道）'
         : (a.has_profile ? '可自动续期（浏览器会话通道）' : '暂不可自动续期，请在「添加账号 → Trae 登录」重新登录一次');
       const idTitle = (a.expires_at ? '凭证到期 ' + a.expires_at + ' · ' : '') + renewTip;
       const renewBtn = (a.refreshable || a.has_profile || a.expired)
-        ? '<button class="xs" data-trae-renew="' + esc(a.user_id || '') + '">续期</button>' : '';
+        ? UI.sub('data-trae-renew', a.user_id || '', '续期', renewTip) : '';
+      // 签到按钮：统一蓝底「签到」；已签到由状态徽章表达（不再用灰按钮写"已签到"）。
+      // 唯一禁用情形是凭证过期 —— 这时点了也必然失败，直接说清原因。
+      const ckBtn = a.expired
+        ? UI.off('签到', '凭证已过期，请先续期')
+        : UI.act('data-trae-uid', a.user_id || '', '签到',
+          a.checked_in ? '今日已签到；点击可重新签到并刷新积分' : '今天签到（领每日额度）');
       return '<div class="trow">' +
         '<div class="who"><div class="nm" title="' + esc(a.name || '') + '">' + esc(a.name || '未命名') + '</div>' +
         '<div class="id" title="' + esc(idTitle) + '">' + esc(a.user_id || '') + '</div></div>' +
-        '<div>' + status + '</div>' +
         '<div class="credits" title="当前积分">' + esc(credits) + '</div>' +
-        '<div><button class="xs" data-trae-uid="' + esc(a.user_id || '') + '"' + (a.checked_in || a.expired ? ' disabled' : '') + '>签到</button>' + renewBtn + '</div>' +
+        '<div>' + status + '</div>' +
+        '<div class="acts">' + ckBtn + renewBtn + '</div>' +
         (a.error ? '<div class="err">' + esc(a.error) + '</div>' : '') +
         '</div>';
     }).join('');
@@ -4080,15 +4229,18 @@ async function loadQoderAccounts(quiet) {
     const head = '<div class="ahead"><div>账号</div><div>状态</div><div>操作</div></div>';
     list.innerHTML = head + arr.map(a => {
       const status = a.current
-        ? '<span class="stask ok"><span class="mark">✓</span>当前登录</span>'
+        ? UI.badge('ok', '✓', '当前登录')
         : (a.expired
-          ? '<span class="stask todo"><span class="mark">!</span>凭证过期</span>'
-          : '<span class="stask warn"><span class="mark">○</span>可切换</span>');
+          ? UI.badge('todo', '!', '凭证过期')
+          : UI.badge('warn', '○', '可切换'));
+      // 操作列固定三格：切号 / 续期 / 移除。
+      // 不能切时**照样显示按钮**（禁用 + 说明原因），不再出现"这一行没有切换按钮、
+      // 那一行有"的情况。
       const sw = a.current
-        ? '<button class="xs" disabled>当前</button>'
-        : '<button class="xs primary" data-qoder-switch="' + esc(a.email) + '">切号</button>';
-      const renew = a.current ? '<button class="xs" data-qoder-renew="' + esc(a.email) + '">续期</button>' : '';
-      const rm = '<button class="xs" data-qoder-remove="' + esc(a.email) + '">移除</button>';
+        ? UI.off('当前', '已经是当前登录的账号')
+        : UI.act('data-qoder-switch', a.email, '切号', '切到这个账号（关闭 Qoder → 写入登录态 → 重启）');
+      const renew = UI.sub('data-qoder-renew', a.email, '续期', '用 refresh_token 换新 token');
+      const rm = UI.sub('data-qoder-remove', a.email, '移除');
       return '<div class="arow" data-acc="' + esc(a.email) + '">' +
         '<div class="who"><div class="nm">' + esc(a.name || '未命名') + '</div>' +
         '<div class="id" title="' + esc(a.email) + '">' + esc(a.email) + '</div></div>' +
@@ -4250,18 +4402,18 @@ async function loadTraeIdeAccounts(quiet) {
       let status, ops;
       if (a.current) {
         // 当前登录优先于其他标记：即便该账号只在签到侧存在，它此刻也是客户端里真正登录的那个。
-        status = '<span class="stask ok"><span class="mark">✓</span>当前登录</span>';
+        status = UI.badge('ok', '✓', '当前登录');
         ops = a.checkin_only
-          ? '<button class="xs" disabled title="该账号尚未保存 IDE 登录态，请点右上角「添加当前账号」">未入库</button>'
-          : '<button class="xs" disabled>当前</button>';
+          ? UI.off('未入库', '该账号尚未保存 IDE 登录态，点右上角「添加账号 → Trae」登录添加')
+          : UI.off('当前', '已经是当前登录的账号');
       } else if (a.checkin_only) {
-        status = '<span class="stask warn"><span class="mark">·</span>仅签到凭证</span>';
-        ops = '';
+        status = UI.badge('warn', '·', '仅签到凭证');
+        ops = UI.off('切号', '该账号只有签到凭据、没有 IDE 登录态，无法切号');
       } else {
-        status = '<span class="stask warn"><span class="mark">○</span>可切换</span>';
-        ops = '<button class="xs primary" data-traeide-switch="' + esc(id) + '">切号</button>';
+        status = UI.badge('warn', '○', '可切换');
+        ops = UI.act('data-traeide-switch', id, '切号', '切到这个账号（关闭 Trae → 写入登录态 → 重启）');
       }
-      const rm = a.checkin_only ? '' : '<button class="xs" data-traeide-remove="' + esc(id) + '">移除</button>';
+      const rm = UI.sub('data-traeide-remove', id, '移除');
       return '<div class="arow" data-acc="' + esc(id) + '">' +
         '<div class="who"><div class="nm">' + esc(a.name || '未命名') + '</div>' +
         '<div class="id" title="' + esc(a.email || a.user_id || '') + '">' + esc(a.email || a.user_id || '') + '</div></div>' +
@@ -4355,22 +4507,22 @@ async function loadWorkBuddyAccounts(quiet) {
       const switchable = a.hasRefresh && a.session_ready && !a.expired;
       let status;
       if (a.current) {
-        status = '<span class="stask ok"><span class="mark">✓</span>当前登录</span>';
+        status = UI.badge('ok', '✓', '当前登录');
       } else if (a.expired) {
-        status = '<span class="stask todo"><span class="mark">!</span>凭据过期</span>';
+        status = UI.badge('todo', '!', '凭据过期');
       } else if (!a.hasRefresh) {
-        status = '<span class="stask todo"><span class="mark">!</span>缺 refresh token</span>';
+        status = UI.badge('todo', '!', '缺 refresh token');
       } else if (!a.session_ready) {
-        status = '<span class="stask warn" title="该账号尚未在本机客户端登录过，未记录登录会话，无法一键切号；在客户端登录一次后会自动记录。"><span class="mark">·</span>需登录一次</span>';
+        status = UI.badge('warn', '·', '需登录一次', '该账号尚未在本机客户端登录过，未记录登录会话，无法一键切号；在客户端登录一次后会自动记录。');
       } else {
-        status = '<span class="stask warn"><span class="mark">○</span>可切换</span>';
+        status = UI.badge('warn', '○', '可切换');
       }
       const sw = a.current
-        ? '<button class="xs" disabled>当前</button>'
+        ? UI.off('当前', '已经是当前登录的账号')
         : (switchable
-          ? '<button class="xs primary" data-wb-switch="' + esc(uid) + '">切号</button>'
-          : '<button class="xs" disabled title="需先在客户端登录该账号一次，面板才会记录会话并可切号">切号</button>');
-      const rm = '<button class="xs" data-wb-remove="' + esc(uid) + '">移除</button>';
+          ? UI.act('data-wb-switch', uid, '切号', '切到这个账号（关闭 WorkBuddy → 写入凭据 → 重启）')
+          : UI.off('切号', '需先在客户端登录该账号一次，面板才会记录会话并可切号'));
+      const rm = UI.sub('data-wb-remove', uid, '移除');
       return '<div class="arow" data-acc="' + esc(uid) + '">' +
         '<div class="who"><div class="nm">' + esc(a.nickname || '未命名') +
         '<span class="tag mute" style="margin-left:6px">' + esc(wbEditionLabel(a.edition)) + '</span></div>' +
@@ -4514,14 +4666,14 @@ async function loadCkWorkBuddy(quiet) {
       const uid = wbUid(a);
       const doneToday = !!a.checked_in_today;
       const status = doneToday
-        ? '<span class="stask ok"><span class="mark">✓</span>今日已签到</span>'
+        ? UI.badge('ok', '✓', '今日已签到')
         : (a.expired
-          ? '<span class="stask todo"><span class="mark">!</span>凭据过期</span>'
-          : (a.hasRefresh ? '<span class="stask warn"><span class="mark">○</span>可签到</span>'
-            : '<span class="stask todo"><span class="mark">!</span>缺 refresh token</span>'));
-      const btn = doneToday
-        ? '<button class="xs" disabled>已签到</button>'
-        : '<button class="xs primary" data-ck-wb="' + esc(uid) + '">签到</button>';
+          ? UI.badge('todo', '!', '凭据过期')
+          : (a.hasRefresh ? UI.badge('warn', '○', '可签到')
+            : UI.badge('todo', '!', '缺 refresh token')));
+      // 签到按钮：统一蓝底「签到」；「已签到」只由状态徽章表达。
+      const btn = UI.act('data-ck-wb', uid, '签到',
+        doneToday ? '今日已签到；点击可重新签到并刷新余额' : '今天签到');
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.nickname || '未命名') + '</div>' +
         '<div class="id" title="' + esc(uid) + '">' + esc(uid || 'UID 未返回') + '</div></div>' +
@@ -4607,22 +4759,23 @@ async function loadCkQoder(quiet) {
       const quota = !!quotaMap[k];
       const why = msgMap[k] || '';
       const status = isDone
-        ? '<span class="stask ok" title="' + esc(why || '上游活动列表确认今天已领取') + '"><span class="mark">✓</span>今日已签到</span>'
+        ? UI.badge('ok', '✓', '今日已签到', why || '上游活动列表确认今天已领取')
         : (noCamp
           ? (quota
-            ? '<span class="stask mute2" title="' + esc(why || '今日每日额度已被同一人另一账号领取（服务端按人给，一日一份、先打先得）') + '"><span class="mark">○</span>额度已被同一人另一账号领走</span>'
-            : '<span class="stask mute2" title="' + esc(why || '上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取') + '"><span class="mark">○</span>暂无签到活动</span>')
+            ? UI.badge('mute2', '○', '额度已被同一人另一账号领走', why || '今日每日额度已被同一人另一账号领取（服务端按人给，一日一份、先打先得）')
+            : UI.badge('mute2', '○', '暂无签到活动', why || '上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取'))
           : (a.expired
-            ? '<span class="stask todo" title="' + esc(why || '凭证已过期，请重新登录后添加') + '"><span class="mark">!</span>凭证过期</span>'
-            : '<span class="stask warn" title="' + esc(why || '上游活动列表里有今天可领的签到活动') + '"><span class="mark">○</span>可签到</span>'));
+            ? UI.badge('todo', '!', '凭证过期', why || '凭证已过期，请重新登录后添加')
+            : UI.badge('warn', '○', '可签到', why || '上游活动列表里有今天可领的签到活动')));
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.name || '未命名') +
         (a.current ? '<span class="tag mute" style="margin-left:6px">当前登录</span>' : '') + '</div>' +
         '<div class="id" title="' + esc(email) + '">' + esc(email) + '</div></div>' +
         '<div class="credits" data-qk-cred="' + esc(email) + '"><span class="note">查询中…</span></div>' +
         '<div>' + status + '</div>' +
-        '<div><button class="xs primary" data-ck-qoder="' + esc(email) + '" title="今天让这个号先领（池里其余号也会一起打一遍）">' +
-        (isDone ? '已签到' : '签到') + '</button></div>' +
+        '<div class="acts">' +
+        UI.act('data-ck-qoder', email, '签到', '今天让这个号先领（池里其余号也会一起打一遍）') +
+        '</div>' +
         '</div>';
     }).join('');
     st.hidden = true;
@@ -4676,12 +4829,12 @@ async function loadCkMiniMax(quiet) {
         ? new Date(a.expires_at_ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
         : '';
       const status = a.error
-        ? '<span class="stask todo" title="' + esc(a.error) + '"><span class="mark">!</span>查询失败</span>'
+        ? UI.badge('todo', '!', '查询失败', a.error)
         : (isDone
-          ? '<span class="stask ok"><span class="mark">✓</span>今日已签到</span>'
+          ? UI.badge('ok', '✓', '今日已签到')
           : (a.expired
-            ? '<span class="stask todo"><span class="mark">!</span>凭证过期</span>'
-            : '<span class="stask warn"><span class="mark">○</span>可签到</span>')) +
+            ? UI.badge('todo', '!', '凭证过期')
+            : UI.badge('warn', '○', '可签到'))) +
           (expTxt ? ' <span class="tag mute">' + (a.expired ? '已于 ' : '到期 ') + expTxt + '</span>' : '');
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.user_name || a.label || 'MiniMax 账号') +
@@ -4690,10 +4843,11 @@ async function loadCkMiniMax(quiet) {
         esc(a.email || a.user_id || id) + '</div></div>' +
         '<div class="credits">' + (a.credits == null ? '—' : Number(a.credits).toFixed(0)) + '</div>' +
         '<div>' + status + '</div>' +
-        '<div><button class="xs primary" data-mm-ck="' + esc(id) + '"' + (isDone ? ' disabled' : '') + '>' +
-        (isDone ? '已签到' : '签到') + '</button>' +
-        '<button class="xs" data-mm-renew="' + esc(id) + '" style="margin-left:6px" title="用 refresh_token 换新 token（自动同步回客户端）">续期</button>' +
-        '<button class="xs" data-mm-rm="' + esc(id) + '" style="margin-left:6px">移除</button></div>' +
+        '<div class="acts">' +
+        UI.act('data-mm-ck', id, '签到', isDone ? '今日已签到；点击可重新签到' : '今天签到') +
+        UI.sub('data-mm-renew', id, '续期', '用 refresh_token 换新 token（自动同步回客户端）') +
+        UI.sub('data-mm-rm', id, '移除') +
+        '</div>' +
         '</div>';
     }).join('');
     st.hidden = true;
@@ -4807,18 +4961,20 @@ async function loadCkDoubao(quiet) {
     list.innerHTML = head + arr.map(a => {
       const isDone = !!a.checked_in_today;
       const status = isDone
-        ? '<span class="stask ok"><span class="mark">✓</span>今日已签到' +
-          (a.checked_in_at ? ' <span class="tag mute">' + esc(a.checked_in_at) + '</span>' : '') + '</span>'
-        : '<span class="stask warn"><span class="mark">○</span>可签到</span>';
+        ? UI.badge('ok', '✓', '今日已签到') +
+          (a.checked_in_at ? ' <span class="tag mute">' + esc(a.checked_in_at) + '</span>' : '')
+        : UI.badge('warn', '○', '可签到');
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.label || '豆包账号') +
-        (a.source === 'manual' ? '<span class="tag mute" style="margin-left:6px">手动</span>' : '') + '</div>' +
+        (a.source === 'manual' ? '<span class="tag mute" style="margin-left:6px">手动</span>' : '') +
+        (a.source === 'browser' ? '<span class="tag mute" style="margin-left:6px">浏览器登录</span>' : '') + '</div>' +
         '<div class="id" title="session 尾号 ' + esc(a.session_tail || '') + ' · ' + esc(a.cookie_count || 0) + ' 个 Cookie">' +
         'session 尾号 ' + esc(a.session_tail || '—') + '</div></div>' +
         '<div>' + status + '</div>' +
-        '<div><button class="xs primary" data-db-ck="' + esc(a.id) + '"' + (isDone ? ' disabled' : '') + '>' +
-        (isDone ? '已签到' : '签到') + '</button>' +
-        '<button class="xs" data-db-rm="' + esc(a.id) + '" style="margin-left:6px">移除</button></div>' +
+        '<div class="acts">' +
+        UI.act('data-db-ck', a.id, '签到', isDone ? '今日已签到；点击可重新签到' : '今天签到') +
+        UI.sub('data-db-rm', a.id, '移除') +
+        '</div>' +
         '</div>';
     }).join('');
     st.hidden = true;

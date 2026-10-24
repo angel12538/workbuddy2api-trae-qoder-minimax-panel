@@ -94,26 +94,11 @@ func (p *Panel) ideCheckinAll(ctx context.Context) {
 	p.ideWorkBuddyCheckinAll()
 	p.ideMiniMaxCheckinAll(ctx)
 	p.ideDoubaoCheckinAll(ctx)
-	// Qoder 快路径签不到的号（浏览器登录的号扫不到活动）走切号逐签：
-	// 轮流切进客户端签，完成后恢复原登录。客户端会被重启多次，属预期行为。
-	if pool, err := ideauth.LoadQoderPool(); err == nil && pool != nil {
-		for _, a := range pool.Accounts {
-			if a == nil {
-				continue
-			}
-			email := a.Email
-			if !ideauth.CheckinRecordTrusted("qoder", email) {
-				log.Printf("panel: Qoder 存在未签账号，启动切号逐签")
-				results := ideauth.QoderSwitchedCheckinAll(func(s string) {
-					log.Printf("panel: [自动切号签到] %s", s)
-				})
-				for _, r := range results {
-					log.Printf("panel: [自动切号签到] %s: %s %s", r.Email, r.Phase, r.Msg)
-				}
-				break
-			}
-		}
-	}
+	// 不再有「切号逐签」兜底：2026-10-24 实测证明 Qoder 的每日额度是**按人**给的
+	// （服务端 failureCode=SAME_PERSON_ALREADY_CLAIMED），跟「这个号有没有在客户端
+	// 登录过」无关 —— 切号并不会让同一个人的另一个号领到额度，只会把客户端反复
+	// 重启（每号一次）。所以这里改成：每个号都用它自己的 token 直接打接口，
+	// 领不到就如实报「同一人另一账号已领」。
 }
 
 // ideQoderCheckinAll Qoder 号池逐号签到。

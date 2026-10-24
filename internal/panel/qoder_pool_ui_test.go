@@ -24,7 +24,9 @@ func TestQoderCheckinUIListsAllAccounts(t *testing.T) {
 	if !strings.Contains(body, "rows.map(") {
 		t.Error("loadCkQoder 应按号池全量渲染（rows.map）")
 	}
-	if !strings.Contains(body, `data-ck-qoder="`) {
+	// 属性名由 UI.act(...) 生成（渲染结果仍是 data-ck-qoder="…"），
+	// 所以这里断言属性名本身，而不是字面量写法。
+	if !strings.Contains(body, "data-ck-qoder") {
 		t.Error("每行应有独立签到按钮（data-ck-qoder 带账号）")
 	}
 	if !strings.Contains(body, "usage?email=") {
