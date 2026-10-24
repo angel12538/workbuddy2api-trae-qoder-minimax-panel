@@ -4164,7 +4164,10 @@ async function doQoderCheckin(btn, email) {
   const old = btn ? btn.textContent : '签到';
   if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
   try {
-    const body = email ? JSON.stringify({ emails: [email] }) : '{}';
+    // 点某一行 = 「今天让这个号先打」，但**仍然把池里所有号都打一遍**
+    // （用户要求：一键领完所有号，不切号）。emails 留空 = 号池全部（后端语义）；
+    // 服务端每日额度按人给、先打先得，所以顺序决定那 100 积分落到谁头上。
+    const body = email ? JSON.stringify({ emails: [], priority: email }) : '{}';
     const d = await api('ide/qoder/checkin', { method: 'POST', body });
     const results = (d && d.results) || [];
     const okc = results.filter(r => r.phase === 'claimed').length;
@@ -4577,7 +4580,7 @@ async function loadCkQoder(quiet) {
       //    被当成当前登录号的状态用 —— 两个号的签到显示因此整个反了。
       doneMap[k] = !!r.checked_in_today;
       pendMap[k] = (r.phase === 'pending' && !r.checked_in_today);
-      quotaMap[k] = !!r.device_quota_used;
+      quotaMap[k] = !!r.same_person_taken;
       msgMap[k] = r.msg || '';
     });
     // 当前登录号：用 current.checked_in_today（**单号**口径），不用顶层聚合值。
@@ -4607,7 +4610,7 @@ async function loadCkQoder(quiet) {
         ? '<span class="stask ok" title="' + esc(why || '上游活动列表确认今天已领取') + '"><span class="mark">✓</span>今日已签到</span>'
         : (noCamp
           ? (quota
-            ? '<span class="stask mute2" title="' + esc(why || '同设备当天已有别的账号领走唯一名额') + '"><span class="mark">○</span>名额被同设备其它号占用</span>'
+            ? '<span class="stask mute2" title="' + esc(why || '今日每日额度已被同一人另一账号领取（服务端按人给，一日一份、先打先得）') + '"><span class="mark">○</span>额度已被同一人另一账号领走</span>'
             : '<span class="stask mute2" title="' + esc(why || '上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取') + '"><span class="mark">○</span>暂无签到活动</span>')
           : (a.expired
             ? '<span class="stask todo" title="' + esc(why || '凭证已过期，请重新登录后添加') + '"><span class="mark">!</span>凭证过期</span>'
@@ -4618,7 +4621,7 @@ async function loadCkQoder(quiet) {
         '<div class="id" title="' + esc(email) + '">' + esc(email) + '</div></div>' +
         '<div class="credits" data-qk-cred="' + esc(email) + '"><span class="note">查询中…</span></div>' +
         '<div>' + status + '</div>' +
-        '<div><button class="xs primary" data-ck-qoder="' + esc(email) + '"' + (isDone ? ' disabled' : '') + '>' +
+        '<div><button class="xs primary" data-ck-qoder="' + esc(email) + '" title="今天让这个号先领（池里其余号也会一起打一遍）">' +
         (isDone ? '已签到' : '签到') + '</button></div>' +
         '</div>';
     }).join('');

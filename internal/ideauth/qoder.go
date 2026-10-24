@@ -127,6 +127,13 @@ type QoderSnapshot struct {
 	DeviceID     string     `json:"device_id"`
 	Scope        string     `json:"scope"`
 	SavedAt      string     `json:"saved_at"`
+	// ClaimCID 该账号今天那条 CLAIM_BENEFIT 活动的实例 id。
+	//
+	// 服务端的每日额度按**人**给，同一个人的多个账号共用一条活动实例（实测
+	// 2026-10-24：另一个账号领过后，本号列表里就看不到这条活动，用该实例 id
+	// 去领会得到 status=BLOCKED / failureCode=SAME_PERSON_ALREADY_CLAIMED）。
+	// 记下实例 id，号池里其它号就能拿它去探一次，拿到服务端的真实判定。
+	ClaimCID string `json:"claim_cid,omitempty"`
 }
 
 // CaptureQoderSnapshot 抓取当前登录态，用于保存到号池。

@@ -25,6 +25,14 @@ type checkinLog struct {
 	// WorkBuddy / Qoder / 豆包共用一个文件，按 "kind:key" 分桶。
 	// 值为 RFC3339 时间戳；历史文件可能是纯日期（2006-01-02）。
 	Entries map[string]string `json:"entries"`
+	// Claims 记录**真实领取**（phase=claimed）的时刻，与 Entries 分开。
+	//
+	// 为什么分开：Entries 记的是「今天签过」（claimed 与 already 都算），用来
+	// 展示；Claims 记的是「这一天真正把 100 积分领到手」的时刻。Qoder 的每日
+	// 额度服务端按**人**给（同一人多个账号一天只有一份，见 qoder_pool_checkin.go
+	// 的实测记录），所以「让哪个号先打」决定了谁拿到那 100 积分 —— 要做公平
+	// 轮换，就必须知道每个号上次真正领到是什么时候。
+	Claims map[string]string `json:"claims,omitempty"`
 }
 
 func checkinLogPath() string {
@@ -43,6 +51,34 @@ func loadCheckinLog() map[string]string {
 	return f.Entries
 }
 
+// loadCheckinLogFile 读整个日志文件（entries + claims）。
+func loadCheckinLogFile() checkinLog {
+	var f checkinLog
+	raw, err := os.ReadFile(checkinLogPath())
+	if err != nil {
+		return checkinLog{Entries: map[string]string{}, Claims: map[string]string{}}
+	}
+	if json.Unmarshal(raw, &f) != nil {
+		return checkinLog{Entries: map[string]string{}, Claims: map[string]string{}}
+	}
+	if f.Entries == nil {
+		f.Entries = map[string]string{}
+	}
+	if f.Claims == nil {
+		f.Claims = map[string]string{}
+	}
+	return f
+}
+
+// saveCheckinLogFile 写回整个日志文件。
+func saveCheckinLogFile(f checkinLog) error {
+	buf, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(checkinLogPath(), buf)
+}
+
 // MarkCheckedIn 记录某签到对象今日已签到。kind ∈ {workbuddy, qoder, doubao}。
 func MarkCheckedIn(kind, key string) error {
 	key = strings.TrimSpace(key)
@@ -51,13 +87,33 @@ func MarkCheckedIn(kind, key string) error {
 	}
 	checkinLogMu.Lock()
 	defer checkinLogMu.Unlock()
-	m := loadCheckinLog()
-	m[kind+":"+key] = time.Now().Format(time.RFC3339)
-	raw, err := json.MarshalIndent(checkinLog{Entries: m}, "", "  ")
-	if err != nil {
-		return err
+	f := loadCheckinLogFile()
+	f.Entries[kind+":"+key] = time.Now().Format(time.RFC3339)
+	return saveCheckinLogFile(f)
+}
+
+// MarkClaimed 记录某账号**真正领到**积分的时刻（phase=claimed，不是 already）。
+//
+// 用途：Qoder 的每日额度服务端按「人」给，同一人的多个账号一天只有一份，
+// 谁先打谁拿到。轮换策略据此排序，保证两个号都能轮到。
+func MarkClaimed(kind, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
 	}
-	return atomicWrite(checkinLogPath(), raw)
+	checkinLogMu.Lock()
+	defer checkinLogMu.Unlock()
+	f := loadCheckinLogFile()
+	f.Claims[kind+":"+key] = time.Now().Format(time.RFC3339)
+	return saveCheckinLogFile(f)
+}
+
+// LastClaimedAt 返回某账号最后一次**真正领到**积分的时刻（没有记录返回 false）。
+func LastClaimedAt(kind, key string) (time.Time, bool) {
+	checkinLogMu.Lock()
+	defer checkinLogMu.Unlock()
+	f := loadCheckinLogFile()
+	return parseCheckinStamp(f.Claims[kind+":"+strings.TrimSpace(key)])
 }
 
 // parseCheckinStamp 解析记录值：RFC3339 时间戳优先，纯日期回落当日 00:00。

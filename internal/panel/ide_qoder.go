@@ -126,17 +126,25 @@ func (p *Panel) qoderRemove(w http.ResponseWriter, r *http.Request) {
 
 // qoderCheckin 按号池逐个账号执行每日签到（领取 Campaign Credits）。
 //
-// 请求体可选：{"emails":["a@x","b@y"]}，缺省 = 号池全部账号。
+// 请求体可选：
+//   - {"emails":["a@x","b@y"]}  缺省 = 号池全部账号
+//   - {"priority":"a@x"}        让这个号**先打**（今天想把那 100 积分给谁就传谁）
+//
 // 为什么改成批量：签到只需要各账号自己的 token + 设备级指纹，不需要切号；
 // 旧实现只签「当前登录」那一个，导致号池有两个号时另一个永远签不到。
 // 号池为空时回退到旧行为（签当前登录账号）。
+//
+// 「先打先得」是 Qoder 的硬规则（实测 failureCode=SAME_PERSON_ALREADY_CLAIMED）：
+// 每日额度按**人**给，同一个人的多个账号一天只有一份 100 Credits，谁先打谁拿到。
+// 所以一键仍然是**把每个号都打一遍**，只是顺序可以指定。
 func (p *Panel) qoderCheckin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Emails []string `json:"emails"`
+		Emails   []string `json:"emails"`
+		Priority string   `json:"priority"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	out, err := ideauth.QoderCheckinPool(req.Emails)
+	out, err := ideauth.QoderCheckinPoolOrdered(req.Emails, req.Priority)
 	if err != nil || out == nil || len(out.Results) == 0 {
 		// 号池为空/读取失败：回退到「当前登录账号」这条老路径，保证单号用户不受影响。
 		res, err2 := ideauth.QoderCheckin()

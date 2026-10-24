@@ -306,6 +306,12 @@ type QoderCheckinResult struct {
 	Refreshed bool    `json:"refreshed"`
 	Exe       string  `json:"umid_exe,omitempty"`
 	Base      string  `json:"base,omitempty"`
+	// ClaimCID 今天这条 CLAIM_BENEFIT 活动的实例 id（没有则空）。
+	//
+	// 用途：服务端的每日额度按**人**给，同一人的两个账号共用一份活动实例。
+	// 某个号的列表里看不到活动时，用**另一个号**的实例 id 去试一次就能拿到
+	// 服务端的真实判定（SAME_PERSON_ALREADY_CLAIMED），而不是含糊地说"暂无活动"。
+	ClaimCID string `json:"claim_cid,omitempty"`
 	// CheckedInToday 面板观察到该账号今天已完成领取。
 	CheckedInToday bool `json:"checked_in_today,omitempty"`
 }
@@ -492,6 +498,7 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 			// （staleClaimed）不算 —— 见 qoderCampaignIsToday 的注释。
 			res.Phase = "already"
 			res.Msg = "今日已领取"
+			res.ClaimCID = claimedToday.CampaignID
 			if claimedToday.Benefit.Amount > 0 {
 				res.Credits = claimedToday.Benefit.Amount
 			}
@@ -512,6 +519,7 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 	var got float64
 	var claimed int
 	var fails []string
+	res.ClaimCID = claimable[0].CampaignID
 	for _, c := range claimable {
 		p := fmt.Sprintf(qoderPathClaim, c.CampaignID)
 		s2, r2, err := qoderDo(base, p, http.MethodPost, token, []byte("{}"), dev)
@@ -544,6 +552,64 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 		}
 	}
 	return res, newAccess, newRefresh
+}
+
+// qoderClaimInstance 用指定的活动实例 id 领一次。
+//
+// 用途：**探测**「服务端把同一个人算作一个人」这件事。
+//
+// 实测（2026-10-24）：Qoder 的每日 100 Credits 按**人**给，一个人的多个账号
+// 共用同一条活动实例；第一个账号领过之后，另一个账号的 campaigns 列表里就
+// 看不到这条活动了。此时用**另一个账号**的实例 id 去领，服务端会如实回答：
+//
+//	{"status":"BLOCKED","failureCode":"SAME_PERSON_ALREADY_CLAIMED", …}
+//
+// 拿到这个真实判定，面板才能说「今天已签到（同一人额度已由另一账号领取）」，
+// 而不是含糊的"暂无签到活动" —— 前者是事实，后者会让人以为没签上。
+//
+// 返回：phase ∈ {"claimed"（真领到了）, "blocked"（同一人已领）, ""（无结论）}；
+// detail 是服务端的 failureCode（blocked 时）。
+func qoderClaimInstance(auth *QoderAuth, dev *QoderDevice, cid string) (phase string, amount float64, detail string) {
+	if auth == nil || cid == "" {
+		return "", 0, ""
+	}
+	if dev == nil {
+		dev = &QoderDevice{}
+	}
+	token := auth.Token
+	if qoderAuthExpired(auth) {
+		if nt, _, ok := qoderRefreshToken(auth, qoderOpenAPIBaseList()[0], dev); ok {
+			token = nt
+		}
+	}
+	for _, b := range qoderOpenAPIBaseList() {
+		st, raw, err := qoderDo(b, fmt.Sprintf(qoderPathClaim, cid), http.MethodPost, token, []byte("{}"), dev)
+		if err != nil || st != http.StatusOK {
+			continue
+		}
+		var r struct {
+			Status      string `json:"status"`
+			FailureCode string `json:"failureCode"`
+			ErrorCode   string `json:"errorCode"`
+			Benefit     struct {
+				Amount float64 `json:"amount"`
+			} `json:"benefit"`
+		}
+		if json.Unmarshal(raw, &r) != nil {
+			continue
+		}
+		switch r.Status {
+		case "CLAIMED", "SUCCESS":
+			return "claimed", r.Benefit.Amount, ""
+		case "BLOCKED":
+			code := r.FailureCode
+			if code == "" {
+				code = r.ErrorCode
+			}
+			return "blocked", 0, code
+		}
+	}
+	return "", 0, ""
 }
 
 // QoderCheckinStatus 查询当前账号的签到状态（不领取）。phase：
@@ -684,6 +750,7 @@ func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
 	case len(claimable) > 0:
 		out.result.Phase = "claimable"
 		out.result.Msg = "今日可领取"
+		out.result.ClaimCID = claimable[0].CampaignID
 		for _, c := range claimable {
 			if c.Benefit.Amount > 0 {
 				out.result.Credits = c.Benefit.Amount
@@ -693,6 +760,7 @@ func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
 	case claimedToday != nil:
 		out.result.Phase = "claimed"
 		out.result.Msg = "今日已领取"
+		out.result.ClaimCID = claimedToday.CampaignID
 		if claimedToday.Benefit.Amount > 0 {
 			out.result.Credits = claimedToday.Benefit.Amount
 		}

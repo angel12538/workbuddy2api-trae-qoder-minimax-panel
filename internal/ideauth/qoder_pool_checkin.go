@@ -1,6 +1,7 @@
 package ideauth
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +37,16 @@ type QoderCheckinPoolResult struct {
 // 每个账号独立使用自己的 token；401 时各自续期，并把轮换后的 token 写回**号池**
 // （绝不写客户端 auth.v1.dat —— 那是「当前登录号」的凭据，串写会直接把别的号顶掉）。
 func QoderCheckinPool(emails []string) (*QoderCheckinPoolResult, error) {
+	return QoderCheckinPoolOrdered(emails, "")
+}
+
+// QoderCheckinPoolOrdered 同 QoderCheckinPool，但 priority 指定的账号先打。
+//
+// 「先打先得」是 Qoder 的硬规则：每日 100 Credits 按**人**给，同一个人的多个
+// 账号一天只有一份（实测服务端返回 failureCode=SAME_PERSON_ALREADY_CLAIMED）。
+// priority 让用户能指定「今天这 100 给哪个号」—— 一键依然是把**所有**号都打一遍，
+// 只是顺序可指定，其余号照常尝试并如实回报结果。
+func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoolResult, error) {
 	pool, err := LoadQoderPool()
 	if err != nil {
 		return nil, err
@@ -47,11 +58,12 @@ func QoderCheckinPool(emails []string) (*QoderCheckinPoolResult, error) {
 		}
 	}
 
-	out := &QoderCheckinPoolResult{Results: make([]QoderCheckinResult, 0, len(pool.Accounts))}
-	baseDev := QoderDeviceInfo()
-	out.NoDevice = baseDev == nil || baseDev.MachineToken == ""
-
-	changed := false
+	// 收集要处理的账号（号池顺序），再把 priority 提到最前。
+	type poolItem struct {
+		snap  *QoderSnapshot
+		email string
+	}
+	var items []poolItem
 	for _, snap := range pool.Accounts {
 		if snap == nil || snap.Auth == nil {
 			continue
@@ -63,6 +75,39 @@ func QoderCheckinPool(emails []string) (*QoderCheckinPoolResult, error) {
 		if len(want) > 0 && !want[strings.ToLower(email)] {
 			continue
 		}
+		items = append(items, poolItem{snap: snap, email: email})
+	}
+	if p := strings.TrimSpace(priority); p != "" {
+		for i := range items {
+			if strings.EqualFold(items[i].email, p) {
+				it := items[i]
+				items = append([]poolItem{it}, append(append([]poolItem{}, items[:i]...), items[i+1:]...)...)
+				break
+			}
+		}
+	}
+
+	out := &QoderCheckinPoolResult{Results: make([]QoderCheckinResult, 0, len(items))}
+	baseDev := QoderDeviceInfo()
+	out.NoDevice = baseDev == nil || baseDev.MachineToken == ""
+
+	changed := false
+	// 本次运行里已知的活动实例 id（账号 → cid）：先领到的号会贡献自己的 cid，
+	// 后面的号就拿它去探「同一人是否已领」。
+	knownCID := map[string]string{}
+	// 需要二次探测的账号（自己的列表里没有今天的活动）。
+	type pendingProbe struct {
+		snap  *QoderSnapshot
+		email string
+		res   *QoderCheckinResult
+		auth  *QoderAuth
+		dev   *QoderDevice
+	}
+	var probes []pendingProbe
+
+	for _, it := range items {
+		snap := it.snap
+		email := it.email
 		auth := cloneQoderAuth(snap.Auth)
 		// 每个账号用**自己的**设备标识（不是客户端的物理设备），否则同一设备只能签一个号。
 		dev := qoderDeviceForAccount(auth)
@@ -77,6 +122,17 @@ func QoderCheckinPool(emails []string) (*QoderCheckinPoolResult, error) {
 			snap.Auth.RefreshToken = rt
 			changed = true
 		}
+		if res.ClaimCID != "" {
+			knownCID[strings.ToLower(res.Email)] = res.ClaimCID
+			if snap.ClaimCID != res.ClaimCID {
+				snap.ClaimCID = res.ClaimCID
+				changed = true
+			}
+		}
+		if res.Phase == "pending" {
+			probes = append(probes, pendingProbe{snap: snap, email: email, res: res, auth: auth, dev: dev})
+			continue
+		}
 		// 上游「领完即删」：今天已经领过的账号，activities 会变成空列表，
 		// 上游报 pending。此时用**可信的**本地签到记录兜底（10:05 前写入的记录
 		// 是旧版误报，不能用来把 pending 翻成 already），否则面板永远显示"可签到"。
@@ -86,22 +142,99 @@ func QoderCheckinPool(emails []string) (*QoderCheckinPoolResult, error) {
 			res.CheckedInToday = true
 		}
 		switch res.Phase {
-		case "claimed", "already":
-			_ = MarkCheckedIn("qoder", res.Email)
-			res.CheckedInToday = true
-		}
-		switch res.Phase {
 		case "claimed":
 			out.Claimed++
 			out.Credits += res.Credits
+			res.CheckedInToday = true
+			_ = MarkClaimed("qoder", res.Email)
+			_ = MarkCheckedIn("qoder", res.Email)
 		case "already":
 			out.Already++
 			out.AlreadyCredits += res.Credits
+			res.CheckedInToday = true
+			_ = MarkCheckedIn("qoder", res.Email)
 		default:
 			out.Failed++
 		}
 		out.Results = append(out.Results, *res)
 	}
+
+	// 二次探测：自己的列表里没有今天的活动 → 拿同一人**另一个账号**的活动实例
+	// id 去领一次，向服务端要一个真实判定（而不是含糊地说"暂无活动"）。
+	//
+	// 实测（2026-10-24）：另一个账号领过之后，服务端回
+	// status=BLOCKED / failureCode=SAME_PERSON_ALREADY_CLAIMED —— 说明这个号
+	// 今天的每日额度已经被「同一个人」的另一个账号领走了，本号确实无需再领。
+	// 若这次反而领成功（服务端放行），那就是真·领到，按 claimed 计。
+	for i := range probes {
+		p := &probes[i]
+		cid := ""
+		for em, c := range knownCID {
+			if !strings.EqualFold(em, p.email) {
+				cid = c
+				break
+			}
+		}
+		if cid == "" {
+			// 号池快照里可能已存着别的号的实例 id（上次扫描记下的）。
+			for _, o := range pool.Accounts {
+				if o == nil || o.ClaimCID == "" {
+					continue
+				}
+				if !strings.EqualFold(o.Email, p.email) {
+					cid = o.ClaimCID
+					break
+				}
+			}
+		}
+		if cid == "" {
+			// 没有任何兄弟号的活动实例可比 → 只能按"活动未下发"如实说。
+			if CheckinRecordTrusted("qoder", p.email) {
+				p.res.Phase = "already"
+				p.res.Msg = "今日已领取（本地记录）"
+				p.res.CheckedInToday = true
+				out.Already++
+				out.AlreadyCredits += p.res.Credits
+				_ = MarkCheckedIn("qoder", p.email)
+			} else {
+				out.Failed++
+			}
+			out.Results = append(out.Results, *p.res)
+			continue
+		}
+		ph, amt, detail := qoderClaimInstance(p.auth, p.dev, cid)
+		switch ph {
+		case "claimed":
+			p.res.Phase = "claimed"
+			p.res.Msg = fmt.Sprintf("签到成功 +%.0f Credits", amt)
+			p.res.Credits = amt
+			p.res.Claimed = 1
+			p.res.CheckedInToday = true
+			out.Claimed++
+			out.Credits += amt
+			_ = MarkClaimed("qoder", p.email)
+			_ = MarkCheckedIn("qoder", p.email)
+		case "blocked":
+			// 服务端明确答复：同一个人今天已经领过了 → 本号今天无需再领。
+			p.res.Phase = "already"
+			p.res.Msg = "今日已领取（同一人额度已由另一账号领取；服务端判定 " + detail + "）"
+			p.res.CheckedInToday = true
+			out.Already++
+			_ = MarkCheckedIn("qoder", p.email)
+		default:
+			if CheckinRecordTrusted("qoder", p.email) {
+				p.res.Phase = "already"
+				p.res.Msg = "今日已领取（本地记录）"
+				p.res.CheckedInToday = true
+				out.Already++
+				_ = MarkCheckedIn("qoder", p.email)
+			} else {
+				out.Failed++
+			}
+		}
+		out.Results = append(out.Results, *p.res)
+	}
+
 	if changed {
 		if err := SaveQoderPool(pool); err != nil {
 			return out, err
@@ -184,9 +317,9 @@ type QoderScanAccount struct {
 	// Source 判定来源：upstream = 上游活动列表确认；local = 上游看不到今日活动
 	// （领完即删），但本地有可信记录。
 	Source string `json:"source,omitempty"`
-	// DeviceQuotaUsed 本账号看不到今日活动，是因为同设备已有别的账号领走了
-	// 当天的唯一名额（服务端每设备每日限领一个号）。
-	DeviceQuotaUsed bool `json:"device_quota_used,omitempty"`
+	// DeviceQuotaUsed 本账号看不到今日活动，是因为**同一个人**的另一账号
+	// 已领走了当天唯一一份每日额度（服务端按人给，先打先得）。
+	DeviceQuotaUsed bool `json:"same_person_taken,omitempty"`
 }
 
 // QoderPoolScan 逐账号向**上游**核实签到状态（并发 2，只查不领）。
@@ -262,6 +395,12 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 		}
 		row.Phase = res.Phase
 		row.Msg = res.Msg
+		// 记下今天这条活动实例 id：号池里其它号（看不到这条活动的）要靠它去
+		// 向服务端要一个真实判定。
+		if res.ClaimCID != "" && snap.ClaimCID != res.ClaimCID {
+			snap.ClaimCID = res.ClaimCID
+			_ = SaveQoderPool(pool)
+		}
 		// 本地记录的可信判定：10:05 前写入的今日记录是旧版误报（把昨天的陈旧
 		// 已领活动当成了今天的），一律忽略并明确提示。
 		trusted := CheckinRecordTrusted("qoder", email)
@@ -304,13 +443,13 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 				row.Msg = "上游核实失败（" + res.Msg + "）；本地记录今日已签 " + row.CheckedInAt
 			}
 		}
-		// 设备名额：每台设备每日限领一个账号（服务端规则，2026-10-24 实测：
-		// 第一个号领取后，同设备其余账号的签到活动被隐藏）。本机今天已有其他
-		// 账号可信领取记录、而本账号看不到签到活动时，如实说明而不是笼统的
-		// "活动未下发" —— 这两种情况处理方式完全不同，用户需要分得清。
+		// 每日额度按**人**给（实测 2026-10-24：另一个账号领过后，服务端回
+		// failureCode=SAME_PERSON_ALREADY_CLAIMED；设备指纹怎么换都无效）。
+		// 本机今天已有其他账号的可信领取记录、而本账号看不到签到活动时，如实说明
+		// —— 这与笼统的"活动未下发"是两回事，用户需要分得清。
 		if res.Phase == "pending" && !trusted && UsedDeviceQuotaToday(email) {
 			row.DeviceQuotaUsed = true
-			row.Msg = "本设备今日签到名额已被其他账号使用（每设备每日限领一次，服务端规则）"
+			row.Msg = "今日每日额度已被同一人另一账号领取（服务端按人给，一日一份、先打先得）"
 		}
 		out[i] = row
 		}(i, j)

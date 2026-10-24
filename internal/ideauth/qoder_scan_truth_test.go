@@ -207,8 +207,8 @@ func TestQoderScanDeviceQuotaExplained(t *testing.T) {
 	if !b.DeviceQuotaUsed {
 		t.Error("b@x.com：同设备其它号已领名额，应标记 device_quota_used")
 	}
-	if !strings.Contains(b.Msg, "名额已被其他账号使用") {
-		t.Errorf("b@x.com：msg 应说明名额被占，实际 %q", b.Msg)
+	if !strings.Contains(b.Msg, "同一人另一账号领取") {
+		t.Errorf("b@x.com：msg 应说明额度被同一人另一账号领走，实际 %q", b.Msg)
 	}
 }
 
