@@ -74,19 +74,22 @@ function esc(s) {
 /* ── 行内控件统一外观 ─────────────────────────────────────────────────
    全面板只有三种控件外观，别再各写各的：
 
-     · 主操作：蓝底 `xs primary` —— 签到 / 切号 / 全部签到 / 浏览器登录
+     · 主操作：蓝底 `xs primary` —— **现在可执行**的动作：签到 / 切号 / 全部签到
      · 次操作：灰底 `xs`          —— 移除 / 续期 / 刷新 / 同步
-     · 禁用态：灰底 + 半透明       —— 一律用 `xs disabled`（不再有"蓝底却禁用"的中间态）
+     · 禁用态：灰底 + 半透明       —— **已经做完了**或**当前做不了**的动作：
+                                     已签到（签完就变灰）/ 凭证过期 / 当前登录号
 
-   「已签到 / 当前登录 / 可切换」是**状态**，只由状态徽章 `.stask` 表达，
-   **不再当按钮文案**。此前"已签到"同时出现在灰按钮和蓝按钮上，样式对不上；
-   按钮文案统一成动作本身（签到 / 切号），状态一律看徽章。
+   规则：**同一个动作在不同平台必须是同一个外观**。
+     · 还没签到 → 蓝底「签到」，可点
+     · 已经签到 → 灰底「已签到」，禁用（点击无效）
+   状态徽章 `.stask` 另外讲上游核实的细节（例如"额度被同一人另一账号领走"），
+   与按钮分工：按钮管"能不能点"，徽章管"到底怎么回事"。
 
    用法：
-     UI.act('data-ck-wb', uid, '签到', '今天让这个号先领')   主操作
-     UI.sub('data-qoder-remove', email, '移除')              次操作
-     UI.off('切号', '需先在客户端登录该账号一次')            禁用（带原因）
-     UI.badge('ok', '✓', '今日已签到', '上游活动列表确认')    状态徽章
+     UI.act('data-ck-wb', uid, '签到', '今天签到')      主操作（蓝）
+     UI.sub('data-qoder-remove', email, '移除')         次操作（灰）
+     UI.off('已签到', '今日已签到')                     禁用（灰）
+     UI.badge('ok', '✓', '今日已签到', '上游确认')       状态徽章
 */
 const UI = {
   act(attr, val, label, tip) {
@@ -2305,12 +2308,12 @@ async function loadTraeStatus(quiet) {
       const idTitle = (a.expires_at ? '凭证到期 ' + a.expires_at + ' · ' : '') + renewTip;
       const renewBtn = (a.refreshable || a.has_profile || a.expired)
         ? UI.sub('data-trae-renew', a.user_id || '', '续期', renewTip) : '';
-      // 签到按钮：统一蓝底「签到」；已签到由状态徽章表达（不再用灰按钮写"已签到"）。
-      // 唯一禁用情形是凭证过期 —— 这时点了也必然失败，直接说清原因。
+      // 签到按钮：未签 = 蓝底可点；已签 = 灰底禁用「已签到」；凭证过期 = 灰底禁用「签到」。
       const ckBtn = a.expired
         ? UI.off('签到', '凭证已过期，请先续期')
-        : UI.act('data-trae-uid', a.user_id || '', '签到',
-          a.checked_in ? '今日已签到；点击可重新签到并刷新积分' : '今天签到（领每日额度）');
+        : (a.checked_in
+          ? UI.off('已签到', '今日已签到')
+          : UI.act('data-trae-uid', a.user_id || '', '签到', '今天签到（领每日额度）'));
       return '<div class="trow">' +
         '<div class="who"><div class="nm" title="' + esc(a.name || '') + '">' + esc(a.name || '未命名') + '</div>' +
         '<div class="id" title="' + esc(idTitle) + '">' + esc(a.user_id || '') + '</div></div>' +
@@ -4671,9 +4674,11 @@ async function loadCkWorkBuddy(quiet) {
           ? UI.badge('todo', '!', '凭据过期')
           : (a.hasRefresh ? UI.badge('warn', '○', '可签到')
             : UI.badge('todo', '!', '缺 refresh token')));
-      // 签到按钮：统一蓝底「签到」；「已签到」只由状态徽章表达。
-      const btn = UI.act('data-ck-wb', uid, '签到',
-        doneToday ? '今日已签到；点击可重新签到并刷新余额' : '今天签到');
+      // 签到按钮：未签 = 蓝底可点；已签 = 灰底禁用（文案也变成"已签到"）。
+      // 状态徽章另说（徽章讲的是上游核实的细节，比如"额度被同一人另一账号领走"）。
+      const btn = doneToday
+        ? UI.off('已签到', '今日已签到（点击可重新签到并刷新余额）')
+        : UI.act('data-ck-wb', uid, '签到', '今天签到');
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.nickname || '未命名') + '</div>' +
         '<div class="id" title="' + esc(uid) + '">' + esc(uid || 'UID 未返回') + '</div></div>' +
@@ -4774,7 +4779,7 @@ async function loadCkQoder(quiet) {
         '<div class="credits" data-qk-cred="' + esc(email) + '"><span class="note">查询中…</span></div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' +
-        UI.act('data-ck-qoder', email, '签到', '今天让这个号先领（池里其余号也会一起打一遍）') +
+        (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-ck-qoder', email, '签到', '今天让这个号先领（池里其余号也会一起打一遍）')) +
         '</div>' +
         '</div>';
     }).join('');
@@ -4844,7 +4849,7 @@ async function loadCkMiniMax(quiet) {
         '<div class="credits">' + (a.credits == null ? '—' : Number(a.credits).toFixed(0)) + '</div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' +
-        UI.act('data-mm-ck', id, '签到', isDone ? '今日已签到；点击可重新签到' : '今天签到') +
+        (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-mm-ck', id, '签到', '今天签到')) +
         UI.sub('data-mm-renew', id, '续期', '用 refresh_token 换新 token（自动同步回客户端）') +
         UI.sub('data-mm-rm', id, '移除') +
         '</div>' +
@@ -4972,7 +4977,7 @@ async function loadCkDoubao(quiet) {
         'session 尾号 ' + esc(a.session_tail || '—') + '</div></div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' +
-        UI.act('data-db-ck', a.id, '签到', isDone ? '今日已签到；点击可重新签到' : '今天签到') +
+        (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-db-ck', a.id, '签到', '今天签到')) +
         UI.sub('data-db-rm', a.id, '移除') +
         '</div>' +
         '</div>';
