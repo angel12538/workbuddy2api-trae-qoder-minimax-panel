@@ -1628,6 +1628,20 @@ async function doDbExtractAdd() {
     $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
   } finally { b.disabled = false; b.textContent = '从客户端提取当前账号'; }
 }
+/* 豆包「登录窗口」：登录在客户端自己的 UI 里（网页资源加密打包，没有可复用的
+   OAuth 端点），所以这里拉起客户端本体，在客户端里登录完再点「提取」。 */
+async function doDbLaunch() {
+  const b = $('btnDbLaunch');
+  b.disabled = true; b.textContent = '正在启动…';
+  $('addDbDone').hidden = false; $('addDbErr').hidden = true;
+  try {
+    const d = await api('ide/doubao/launch', { method: 'POST', body: '{}' });
+    $('addDbDone').textContent = d.msg || '已启动豆包客户端';
+  } catch (e) {
+    $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
+  } finally { b.disabled = false; b.textContent = '启动豆包客户端登录'; }
+}
+if ($('btnDbLaunch')) $('btnDbLaunch').onclick = doDbLaunch;
 async function doDbAddCookie() {
   const b = $('btnDbAddCookie');
   b.disabled = true;

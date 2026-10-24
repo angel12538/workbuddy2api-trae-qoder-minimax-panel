@@ -1570,11 +1570,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <!-- 豆包：从客户端提取 Cookie，或手动粘贴 -->
       <div id="addTabDoubao" class="tab-panel" hidden>
-        <div class="state" id="addDbCur" style="margin-bottom:8px">需要本机已安装并登录豆包客户端（凭据从客户端 Cookie 库解密）。</div>
+        <div class="state" id="addDbCur" style="margin-bottom:8px">凭据从豆包客户端的 Cookie 库解密。点「启动豆包客户端登录」拉起客户端，在客户端里登录要添加的账号，登录完点「从客户端提取当前账号」收进号池。</div>
         <div id="addDbDone" class="state ok" hidden></div>
         <div id="addDbErr" class="state err" hidden></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
           <button id="btnDbExtract" class="primary">从客户端提取当前账号</button>
+          <button id="btnDbLaunch">启动豆包客户端登录</button>
           <button id="btnDbToggleManual">改用粘贴 Cookie</button>
         </div>
         <div id="addDbManual" hidden style="margin-top:12px">

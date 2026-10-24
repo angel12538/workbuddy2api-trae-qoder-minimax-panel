@@ -140,6 +140,31 @@ func extractDoubaoCookies() (map[string]string, error) {
 	return doubao.ExtractFromCookiesDB(name)
 }
 
+// doubaoLaunch 启动豆包桌面客户端（可见窗口），用于「登录窗口」。
+//
+// 豆包的登录在客户端自己的 UI 里（扫码 / 账号密码），网页资源又是加密打包的
+// （应用内有 liblark_resource_encrypt.dll），静态扫不到可复用的 OAuth 端点 —
+// 所以这里的「登录窗口」= 拉起客户端本体的登录界面：你在客户端里登录完，
+// 再点「从客户端提取当前账号」把登录态收进号池。
+func (p *Panel) doubaoLaunch(w http.ResponseWriter, r *http.Request) {
+	if !doubao.HasClient() {
+		writeErr(w, http.StatusBadRequest, "未找到豆包客户端（%LOCALAPPDATA%\\Doubao），请先安装")
+		return
+	}
+	if ideauth.ClientRunning("doubao") {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "running": true,
+			"msg": "豆包客户端已在运行 —— 直接在客户端里登录，登录完回面板点「从客户端提取当前账号」",
+		})
+		return
+	}
+	note := ideauth.LaunchClient("doubao")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "running": true, "note": note,
+		"msg": "已启动豆包客户端 —— 在客户端里登录要添加的账号，登录完回面板点「从客户端提取当前账号」",
+	})
+}
+
 // doubaoAddCookie 手动粘贴 Cookie（浏览器 F12 → Network 任一请求 → Cookie 头整串）。
 func (p *Panel) doubaoAddCookie(w http.ResponseWriter, r *http.Request) {
 	var req struct {

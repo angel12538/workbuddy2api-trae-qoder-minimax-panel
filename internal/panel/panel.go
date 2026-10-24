@@ -275,6 +275,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/ide/doubao/accounts", p.withAuth(p.doubaoAccounts))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/add_extract", p.withAuth(p.doubaoAddExtract))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/add_cookie", p.withAuth(p.doubaoAddCookie))
+	p.mux.HandleFunc("POST /panel/api/ide/doubao/launch", p.withAuth(p.doubaoLaunch))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/remove", p.withAuth(p.doubaoRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/checkin", p.withAuth(p.doubaoCheckin))
 	p.mux.HandleFunc("GET /panel/api/ide/doubao/status", p.withAuth(p.doubaoStatus))
