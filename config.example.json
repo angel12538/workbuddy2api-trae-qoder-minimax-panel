@@ -22,7 +22,7 @@
   "schedule": {
     "checkin_hours": [9, 21],
     "growth_hours": [1],
-    "ide_checkin_hours": [9],
+    "ide_checkin_hours": [10],
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],

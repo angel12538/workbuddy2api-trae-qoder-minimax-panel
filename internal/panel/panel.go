@@ -89,6 +89,12 @@ type Panel struct {
 	loginMu sync.Mutex
 	logins  map[string]loginSession
 
+	// mmLoginMu/mmLogins 进行中的 MiniMax 设备码授权会话（state → 会话）。
+	// 与上面的 WorkBuddy 登录会话分开存：两套 OAuth 服务器、两套端点、两套
+	// 错误语义，混在一起迟早串味。
+	mmLoginMu sync.Mutex
+	mmLogins  map[string]*minimax.DeviceSession
+
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
 	// 而不是并发跑两遍浪费上游请求（动作虽幂等，expert 系每遍含 8 次真实对话）。
@@ -173,6 +179,7 @@ func New(cfg Config) *Panel {
 		started: time.Now(),
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
+		mmLogins: map[string]*minimax.DeviceSession{},
 	}
 	p.routes()
 	return p
@@ -248,6 +255,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/switch", p.withAuth(p.qoderSwitch))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/remove", p.withAuth(p.qoderRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/checkin", p.withAuth(p.qoderCheckin))
+	p.mux.HandleFunc("POST /panel/api/ide/qoder/checkin_switched", p.withAuth(p.qoderCheckinSwitched))
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/checkin-status", p.withAuth(p.qoderCheckinStatus))
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/usage", p.withAuth(p.qoderUsage))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/renew", p.withAuth(p.qoderRenew))
@@ -256,8 +264,20 @@ func (p *Panel) routes() {
 	// MiniMax Code：多账号号池 + 每日签到 + 积分（token 级操作，无需切号）
 	p.mux.HandleFunc("GET /panel/api/ide/minimax/accounts", p.withAuth(p.minimaxAccounts))
 	p.mux.HandleFunc("POST /panel/api/ide/minimax/add", p.withAuth(p.minimaxAdd))
+	p.mux.HandleFunc("POST /panel/api/ide/minimax/add_manual", p.withAuth(p.minimaxAddManual))
 	p.mux.HandleFunc("POST /panel/api/ide/minimax/remove", p.withAuth(p.minimaxRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/minimax/checkin", p.withAuth(p.minimaxCheckin))
+	p.mux.HandleFunc("POST /panel/api/ide/minimax/renew", p.withAuth(p.minimaxRenew))
+	p.mux.HandleFunc("POST /panel/api/ide/minimax/login/start", p.withAuth(p.minimaxLoginStart))
+	p.mux.HandleFunc("GET /panel/api/ide/minimax/login/poll", p.withAuth(p.minimaxLoginPoll))
+
+	// 豆包（Doubao 桌面客户端）：多账号签到池（Cookie 凭据 + CDP 浏览器通道）
+	p.mux.HandleFunc("GET /panel/api/ide/doubao/accounts", p.withAuth(p.doubaoAccounts))
+	p.mux.HandleFunc("POST /panel/api/ide/doubao/add_extract", p.withAuth(p.doubaoAddExtract))
+	p.mux.HandleFunc("POST /panel/api/ide/doubao/add_cookie", p.withAuth(p.doubaoAddCookie))
+	p.mux.HandleFunc("POST /panel/api/ide/doubao/remove", p.withAuth(p.doubaoRemove))
+	p.mux.HandleFunc("POST /panel/api/ide/doubao/checkin", p.withAuth(p.doubaoCheckin))
+	p.mux.HandleFunc("GET /panel/api/ide/doubao/status", p.withAuth(p.doubaoStatus))
 
 	// Trae IDE 本地账号（读号池 / 添加 / 切号）
 	p.mux.HandleFunc("GET /panel/api/ide/trae/accounts", p.withAuth(p.traeIdeAccounts))

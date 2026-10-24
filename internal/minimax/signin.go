@@ -307,11 +307,13 @@ func oauthAudience() string {
 	return defaultAudience
 }
 
-// RefreshToken 结果。
+// RefreshToken 结果。UsedRefreshToken 记录本次续期用的 RT：
+// 写回客户端 auth.json 时靠它定位要更新的那条记录（绝不能碰别的记录）。
 type Refreshed struct {
-	AccessToken  string
-	RefreshToken string
-	ExpiresAt    time.Time
+	AccessToken      string
+	RefreshToken     string
+	UsedRefreshToken string
+	ExpiresAt        time.Time
 }
 
 // Refresh 用 refresh_token 换新 token。
@@ -326,7 +328,7 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (*Refreshed, 
 	// scope / audience 必填（见 defaultScope 注释的实测契约）；缺了上游直接拒。
 	form.Set("scope", oauthScope())
 	form.Set("audience", oauthAudience())
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthURL(), strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.oauthTokenURL(), strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +354,7 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (*Refreshed, 
 	if r.AccessToken == "" {
 		return nil, fmt.Errorf("续期响应没有 access_token")
 	}
-	out := &Refreshed{AccessToken: r.AccessToken, RefreshToken: r.RefreshToken}
+	out := &Refreshed{AccessToken: r.AccessToken, RefreshToken: r.RefreshToken, UsedRefreshToken: refreshToken}
 	if out.RefreshToken == "" {
 		out.RefreshToken = refreshToken // 服务端没轮换则沿用
 	}
@@ -387,6 +389,335 @@ func refreshAccount(ctx context.Context, c *Client, acc *Account) bool {
 	return true
 }
 
+// ---------------------------------------------------------------------------
+// 凭证续期（v2）
+//
+// MiniMax 的 access token 只有 1 小时，refresh token **每次刷新都会轮换**（旧的
+// 立即作废）。这套轮换语义带来两类故障，必须分开处理：
+//
+//  1. 号池独占账号（没登录在客户端里）：号池自己持有 RT 链，定期刷新即可长期
+//     有效 —— 刷新后把新 RT 写回号池，链条不断。
+//  2. 与客户端相同的账号：客户端也在用同一根 RT 链，两边共享。客户端刷一次，
+//     号池里存的 RT 就作废一次（这就是「token 一小时就过期」的真相：号池副本
+//     没人续，而续期用的 RT 又被客户端轮换掉了）。反过来，如果号池先刷，客户端
+//     存的 RT 也会作废 —— 所以号池续期成功后**必须把新 token 同步回客户端的
+//     auth.json**，两边永远共享最新的 RT，谁先刷都不掉链。
+//
+// 判定「是不是客户端账号」必须用服务端 user_id（RT 本身不能证明身份），且只有
+// 确认是同一个 user 才允许用客户端的 RT 代刷 —— 否则会把 A 账号刷成 B 账号的
+// token，还会作废客户端的 RT（等于把用户从客户端里踢下线）。
+// ---------------------------------------------------------------------------
+
+// isInvalidGrant 判断是否为 refresh token 已作废（被轮换/过期）。
+func isInvalidGrant(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "invalid_grant")
+}
+
+// WriteClientCredentials 把凭证写回客户端 auth.json（按 refreshToken 匹配记录；
+// 匹配不到不写 —— 绝不覆盖不明身份的记录）。返回是否写入。
+func WriteClientCredentials(nw *Refreshed) bool {
+	if nw == nil || nw.RefreshToken == "" {
+		return false
+	}
+	written := false
+	for _, p := range AuthCandidates() {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		// ⚠️ 必须用通用 JSON 而不是固定结构体：客户端 auth.json 的记录里有
+		// schemaVersion / scopes / generation / loginEpoch / audience 等校验字段，
+		// 固定结构体写回会把它们全部剥掉 —— 客户端随后报
+		// 「CredentialRecordCorruptError: stored OAuth credential record is invalid」
+		// （2026-10-24 实测踩坑）。这里只改三个 token 字段，其余原样保留。
+		var doc map[string]any
+		if json.Unmarshal(raw, &doc) != nil {
+			continue
+		}
+		records, _ := doc["records"].(map[string]any)
+		if records == nil {
+			continue
+		}
+		hit := false
+		for k, rv := range records {
+			rec, ok := rv.(map[string]any)
+			if !ok {
+				continue
+			}
+			// 只更新「我们刚用它的 RT 完成续期」的那条记录；其它记录不碰。
+			if rt, _ := rec["refreshToken"].(string); rt != nw.UsedRefreshToken {
+				continue
+			}
+			rec["accessToken"] = nw.AccessToken
+			rec["refreshToken"] = nw.RefreshToken
+			rec["expiresAtMs"] = nw.ExpiresAt.UnixMilli()
+			records[k] = rec
+			hit = true
+		}
+		if !hit {
+			continue
+		}
+		buf, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			continue
+		}
+		if err := atomicWriteFile(p, buf); err == nil {
+			written = true
+		}
+	}
+	return written
+}
+
+// atomicWriteFile 原子写文件（临时文件 + rename，客户端 auth.json 与号池共用）。
+func atomicWriteFile(p string, data []byte) error {
+	dir := filepath.Dir(p)
+	tmp, err := os.CreateTemp(dir, ".mm-tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return os.Rename(name, p)
+}
+
+// adoptClientCredentials 把客户端当前登录态并入号池账号（身份经 user_id 校验）。
+func adoptClientCredentials(ctx context.Context, c *Client, acc *Account, cc Credentials, clientUID string) bool {
+	if clientUID == "" || acc.UserID == "" || acc.UserID != clientUID {
+		return false
+	}
+	acc.AccessToken, acc.RefreshToken = cc.AccessToken, cc.RefreshToken
+	if !cc.ExpiresAt.IsZero() {
+		acc.ExpiresAtMs = cc.ExpiresAt.UnixMilli()
+	}
+	acc.SavedAt = time.Now().Format(time.RFC3339)
+	saveAccount(*acc)
+	return true
+}
+
+// saveAccount 把账号快照写回号池（按 ID 匹配；找不到则跳过）。
+func saveAccount(acc Account) {
+	if pool, err := LoadPool(); err == nil {
+		for _, a := range pool.Accounts {
+			if a != nil && a.ID == acc.ID {
+				*a = acc
+			}
+		}
+		_ = SavePool(pool)
+	}
+}
+
+// RenewResult 单账号续期结果。
+type RenewResult struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Phase    string `json:"phase"` // renewed / adopted / skipped / error
+	Msg      string `json:"msg"`
+	SyncedClient bool `json:"synced_client,omitempty"` // 新 token 已同步回客户端 auth.json
+}
+
+// expiringSoon 判断账号是否将在 d 内过期（已过期也算）。
+func (a *Account) expiringSoon(d time.Duration) bool {
+	if a.ExpiresAtMs <= 0 {
+		return true // 没记到期时间：当作临期，逼一次续期
+	}
+	return time.Now().Add(d).After(time.UnixMilli(a.ExpiresAtMs))
+}
+
+// clientIdentity 客户端当前登录的 user_id（一次 profile 查询；失败返回空）。
+func (c *Client) clientIdentity(ctx context.Context) (Credentials, string) {
+	cc, err := LoadCredentials()
+	if err != nil {
+		return Credentials{}, ""
+	}
+	if p, err := c.FetchProfile(ctx, cc); err == nil && p != nil {
+		return cc, p.UserID
+	}
+	return cc, ""
+}
+
+// RenewAccount 续期单个号池账号（安全语义见本文件顶部注释）。
+// force=false 时，距过期还有 30 分钟以上的账号直接跳过。
+func (c *Client) RenewAccount(ctx context.Context, id string, force bool) RenewResult {
+	pool, err := LoadPool()
+	if err != nil {
+		return RenewResult{ID: id, Phase: "error", Msg: "读取号池失败: " + err.Error()}
+	}
+	var acc *Account
+	for _, a := range pool.Accounts {
+		if a != nil && a.ID == id {
+			acc = a
+			break
+		}
+	}
+	if acc == nil {
+		return RenewResult{ID: id, Phase: "error", Msg: "号池里没有该账号"}
+	}
+	return c.renewAccount(ctx, pool, acc, force)
+}
+
+func (c *Client) renewAccount(ctx context.Context, pool *PoolFile, acc *Account, force bool) RenewResult {
+	res := RenewResult{ID: acc.ID, Label: acc.Label}
+	if !force && !acc.expiringSoon(30*time.Minute) {
+		res.Phase = "skipped"
+		res.Msg = "凭证仍在有效期内（>30 分钟），无需续期"
+		return res
+	}
+	// 1) 用号池自己的 RT 续期（号池独占账号的主路径；客户端账号也走这条 ——
+	//    客户端已刷过时这里会 invalid_grant，落到底下的兜底分支）。
+	//    续期端点按账号区域选：国际号必须打 account.minimax.io，用 CN 端点刷
+	//    必然 invalid_grant（token 的签发域与校验域一致）。
+	rc := c.ForRegion(acc.Region)
+	if acc.RefreshToken != "" {
+		if nw, err := rc.Refresh(ctx, acc.RefreshToken); err == nil {
+			acc.AccessToken, acc.RefreshToken = nw.AccessToken, nw.RefreshToken
+			if !nw.ExpiresAt.IsZero() {
+				acc.ExpiresAtMs = nw.ExpiresAt.UnixMilli()
+			}
+			acc.SavedAt = time.Now().Format(time.RFC3339)
+			saveAccount(*acc)
+			// 同一个账号也登录在客户端里：新 RT 必须同步回客户端，否则客户端
+			// 下次刷新必挂（refresh token 已被我们轮换掉）。宁多写不少写。
+			res.Phase, res.Msg = "renewed", "凭证已续期"
+			if nw.UsedRefreshToken != "" && WriteClientCredentials(nw) {
+				res.SyncedClient = true
+				res.Msg += "（已同步回客户端）"
+			}
+			return res
+		}
+	}
+	// 2) 号池 RT 失效：若该账号就是客户端当前登录的账号， adopt 客户端的最新
+	//    登录态（客户端自己刷新过）。身份必须经 user_id 校验。
+	cc, clientUID := c.clientIdentity(ctx)
+	if clientUID != "" && acc.UserID == clientUID {
+		if adoptClientCredentials(ctx, c, acc, cc, clientUID) {
+			// 客户端的 AT 也过期时替它续一把（写回两边）：客户端在运行时无所谓，
+			// 不在运行时号池就是它唯一的续期者。
+			if credsOf(acc).Expired() && cc.RefreshToken != "" {
+				if nw, err := rc.Refresh(ctx, cc.RefreshToken); err == nil {
+					acc.AccessToken, acc.RefreshToken = nw.AccessToken, nw.RefreshToken
+					if !nw.ExpiresAt.IsZero() {
+						acc.ExpiresAtMs = nw.ExpiresAt.UnixMilli()
+					}
+					acc.SavedAt = time.Now().Format(time.RFC3339)
+					saveAccount(*acc)
+					if WriteClientCredentials(nw) {
+						return RenewResult{ID: acc.ID, Label: acc.Label, Phase: "renewed",
+							Msg: "已接管客户端登录态并续期（同步回客户端）", SyncedClient: true}
+					}
+				}
+			}
+			return RenewResult{ID: acc.ID, Label: acc.Label, Phase: "adopted",
+				Msg: "已从客户端同步最新凭证"}
+		}
+	}
+	res.Phase = "error"
+	res.Msg = "refresh_token 已失效（可能被客户端轮换或已过期）；请在 MiniMax Code 重新登录该账号后点「添加当前账号」"
+	return res
+}
+
+// RenewAll 批量续期号池账号（缺省 = 临期账号；force = 全部）。串行执行，
+// 单号失败不影响其它号。
+func (c *Client) RenewAll(ctx context.Context, force bool) []RenewResult {
+	pool, err := LoadPool()
+	if err != nil {
+		return []RenewResult{{Phase: "error", Msg: "读取号池失败: " + err.Error()}}
+	}
+	out := make([]RenewResult, 0, len(pool.Accounts))
+	for _, a := range pool.Accounts {
+		if a == nil {
+			continue
+		}
+		out = append(out, c.renewAccount(ctx, pool, a, force))
+	}
+	return out
+}
+
+// AddManual 手动添加账号（粘贴 access_token / refresh_token）—— 默认国内区。
+// 身份从服务端补齐（user_id 做去重键），避免同一账号重复入库。
+func (c *Client) AddManual(ctx context.Context, access, refresh string, expiresAtMs int64) (*Account, bool, error) {
+	return c.AddManualRegion(ctx, access, refresh, expiresAtMs, RegionCN)
+}
+
+// AddManualRegion 手动添加账号并指定区域（cn / global）。
+//
+// 区域决定两件事：资料/签到/续期打哪套域（国际号必须走 agent.minimax.io 与
+// account.minimax.io），以及号池里记的 region 字段。
+func (c *Client) AddManualRegion(ctx context.Context, access, refresh string, expiresAtMs int64, region string) (*Account, bool, error) {
+	access = strings.TrimSpace(access)
+	if access == "" {
+		return nil, false, fmt.Errorf("access_token 不能为空")
+	}
+	region = NormalizeRegion(region)
+	cred := Credentials{AccessToken: access, RefreshToken: strings.TrimSpace(refresh)}
+	if expiresAtMs <= 0 {
+		expiresAtMs = time.Now().Add(time.Hour).UnixMilli() // 未提供则按 1 小时估
+	}
+	cred.ExpiresAt = time.UnixMilli(expiresAtMs)
+	pool, err := LoadPool()
+	if err != nil {
+		return nil, false, err
+	}
+	id := Fingerprint(access)
+	var prof *Profile
+	if c != nil {
+		if p, perr := c.ForRegion(region).FetchProfile(ctx, cred); perr == nil && p != nil && p.UserID != "" {
+			prof = p
+			id = "u" + p.UserID
+		}
+	}
+	added := true
+	for _, a := range pool.Accounts {
+		if a == nil {
+			continue
+		}
+		same := a.ID == id || (prof != nil && prof.UserID != "" && a.UserID == prof.UserID)
+		if !same {
+			continue
+		}
+		a.ID = id
+		a.AccessToken, a.RefreshToken, a.ExpiresAtMs = cred.AccessToken, cred.RefreshToken, expiresAtMs
+		a.SavedAt = time.Now().Format(time.RFC3339)
+		a.Region = region
+		if prof != nil {
+			a.UserID, a.UserName, a.Email, a.AvatarURL = prof.UserID, prof.UserName, prof.Email, prof.Avatar
+			if prof.UserName != "" {
+				a.Label = prof.UserName
+			}
+		}
+		dedupeByUser(pool)
+		added = false
+		if err := SavePool(pool); err != nil {
+			return nil, false, err
+		}
+		return a, false, nil
+	}
+	acc := &Account{
+		ID: id, Label: fmt.Sprintf("MiniMax 账号 %d", len(pool.Accounts)+1),
+		Region: region,
+		AccessToken: cred.AccessToken, RefreshToken: cred.RefreshToken,
+		ExpiresAtMs: expiresAtMs, SavedAt: time.Now().Format(time.RFC3339),
+	}
+	if prof != nil {
+		acc.UserID, acc.UserName, acc.Email, acc.AvatarURL = prof.UserID, prof.UserName, prof.Email, prof.Avatar
+		if prof.UserName != "" {
+			acc.Label = prof.UserName
+		}
+	}
+	pool.Accounts = append(pool.Accounts, acc)
+	if err := SavePool(pool); err != nil {
+		return nil, false, err
+	}
+	return acc, added, nil
+}
+
 // credsOf 由账号快照构造凭证。
 func credsOf(a *Account) Credentials {
 	cred := Credentials{AccessToken: a.AccessToken, RefreshToken: a.RefreshToken}
@@ -411,6 +742,9 @@ func is401(err error) bool {
 type Account struct {
 	ID           string `json:"id"`
 	Label        string `json:"label"`
+	// Region 区域（cn / global）。决定续期与签到打哪套域 —— 国际号必须走
+	// account.minimax.io / agent.minimax.io，用 CN 端点刷必然 invalid_grant。
+	Region       string `json:"region,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 	UserName     string `json:"user_name,omitempty"`
 	Email        string `json:"email,omitempty"`
@@ -500,6 +834,8 @@ func CaptureCurrent(ctx context.Context, c *Client) (*Account, bool, error) {
 	if !cred.ExpiresAt.IsZero() {
 		exp = cred.ExpiresAt.UnixMilli()
 	}
+	// 区域从 auth.json 路径推断（~/.minimax/auth/prod/{cn,global}/…）。
+	region := RegionFromAuthPath(cred.Source)
 	added := true
 	for _, a := range pool.Accounts {
 		if a == nil {
@@ -513,6 +849,9 @@ func CaptureCurrent(ctx context.Context, c *Client) (*Account, bool, error) {
 		a.ID = id
 		a.AccessToken, a.RefreshToken, a.ExpiresAtMs = cred.AccessToken, cred.RefreshToken, exp
 		a.SavedAt = time.Now().Format(time.RFC3339)
+		if region != "" {
+			a.Region = region
+		}
 		if prof != nil {
 			a.UserID, a.UserName, a.Email, a.AvatarURL = prof.UserID, prof.UserName, prof.Email, prof.Avatar
 			if prof.UserName != "" {
@@ -528,6 +867,7 @@ func CaptureCurrent(ctx context.Context, c *Client) (*Account, bool, error) {
 	}
 	acc := &Account{
 		ID: id, Label: fmt.Sprintf("MiniMax 账号 %d", len(pool.Accounts)+1),
+		Region: region,
 		AccessToken: cred.AccessToken, RefreshToken: cred.RefreshToken,
 		ExpiresAtMs: exp, SavedAt: time.Now().Format(time.RFC3339),
 	}
@@ -592,15 +932,20 @@ func SigninAccounts(ctx context.Context, client *Client, ids []string) ([]Accoun
 		if len(want) > 0 && !want[a.ID] {
 			continue
 		}
+		// 按账号区域选客户端：国际号的签到要打 agent.minimax.io。
+		rc := client.ForRegion(a.Region)
+		if rc == nil {
+			rc = client
+		}
 		// access token 只有 1 小时：过期就先续，再签；401 再补一次续期重试。
 		if credsOf(a).Expired() {
-			refreshAccount(ctx, client, a)
+			refreshAccount(ctx, rc, a)
 		}
 		cred := credsOf(a)
-		claim, err := client.ClaimSignin(ctx, cred)
-		if err != nil && is401(err) && refreshAccount(ctx, client, a) {
+		claim, err := rc.ClaimSignin(ctx, cred)
+		if err != nil && is401(err) && refreshAccount(ctx, rc, a) {
 			cred = credsOf(a)
-			claim, err = client.ClaimSignin(ctx, cred)
+			claim, err = rc.ClaimSignin(ctx, cred)
 		}
 		res := AccountSignin{ID: a.ID, Label: a.Label, Expired: cred.Expired()}
 		if err != nil {
@@ -617,6 +962,7 @@ func SigninAccounts(ctx context.Context, client *Client, ids []string) ([]Accoun
 type AccountStatus struct {
 	ID           string  `json:"id"`
 	Label        string  `json:"label"`
+	Region       string  `json:"region,omitempty"`
 	UserID       string  `json:"user_id,omitempty"`
 	UserName     string  `json:"user_name,omitempty"`
 	Email        string  `json:"email,omitempty"`
@@ -647,19 +993,25 @@ func StatusOfAccounts(ctx context.Context, client *Client) ([]AccountStatus, err
 		if a == nil {
 			continue
 		}
+		// 按账号区域选客户端：国际号的签到/积分要打 agent.minimax.io。
+		rc := client.ForRegion(a.Region)
+		if rc == nil {
+			rc = client
+		}
 		if credsOf(a).Expired() {
-			refreshAccount(ctx, client, a)
+			refreshAccount(ctx, rc, a)
 		}
 		cred := credsOf(a)
-		signin, err := client.QuerySignin(ctx, cred)
-		if err != nil && is401(err) && refreshAccount(ctx, client, a) {
+		signin, err := rc.QuerySignin(ctx, cred)
+		if err != nil && is401(err) && refreshAccount(ctx, rc, a) {
 			cred = credsOf(a)
-			signin, err = client.QuerySignin(ctx, cred)
+			signin, err = rc.QuerySignin(ctx, cred)
 		}
 		// 补齐真实昵称/邮箱（号池只存 token，没有身份信息），并写回池文件。
-		client.fillProfile(ctx, a, cred)
+		rc.fillProfile(ctx, a, cred)
 		st := AccountStatus{
 			ID: a.ID, Label: a.Label, UserID: a.UserID, UserName: a.UserName, Email: a.Email,
+			Region: NormalizeRegion(a.Region),
 			AvatarURL: a.AvatarURL, Expired: cred.Expired(), ExpiresAtMs: a.ExpiresAtMs,
 		}
 		if err == nil && signin.Today != nil {
@@ -668,10 +1020,10 @@ func StatusOfAccounts(ctx context.Context, client *Client) ([]AccountStatus, err
 		} else if err != nil {
 			st.Error = err.Error()
 		}
-		credits, cerr := client.QueryCredits(ctx, cred)
-		if cerr != nil && is401(cerr) && refreshAccount(ctx, client, a) {
+		credits, cerr := rc.QueryCredits(ctx, cred)
+		if cerr != nil && is401(cerr) && refreshAccount(ctx, rc, a) {
 			cred = credsOf(a)
-			credits, cerr = client.QueryCredits(ctx, cred)
+			credits, cerr = rc.QueryCredits(ctx, cred)
 		}
 		if cerr == nil && credits != nil {
 			st.Credits = credits.Remaining

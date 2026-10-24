@@ -90,12 +90,14 @@ func freePort(ports []int) (int, error) {
 // 实测把 190MB+ 的 profile 写进了 `C:\Program Files\Google\Chrome\Application\data\`，
 // 我们自己的目录反而空空如也，自动续期自然读不到登录态。
 func traeBrowserBaseDir(p *Panel) string {
-	if d := strings.TrimSpace(p.cfg.ConfigPath); d != "" {
-		dir := filepath.Dir(d)
-		if abs, err := filepath.Abs(dir); err == nil {
-			dir = abs
+	if p != nil {
+		if d := strings.TrimSpace(p.cfg.ConfigPath); d != "" {
+			dir := filepath.Dir(d)
+			if abs, err := filepath.Abs(dir); err == nil {
+				dir = abs
+			}
+			return filepath.Join(dir, "data")
 		}
-		return filepath.Join(dir, "data")
 	}
 	return filepath.Join(os.TempDir(), "wb2api")
 }

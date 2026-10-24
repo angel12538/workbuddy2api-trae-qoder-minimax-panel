@@ -126,6 +126,8 @@ body {
 .stask { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
 .stask .mark { font-size: 13px; line-height: 1; width: 14px; text-align: center; flex: none; }
 .stask.ok .mark { color: var(--ok); }
+.stask.mute2 { color: var(--ink-3); }
+.stask.mute2 .mark { color: var(--ink-3); }
 .stask.warn .mark { color: var(--warn); } .stask.warn .fr { color: var(--warn); font-variant-numeric: tabular-nums; }
 .stask.todo { color: var(--ink-3); }
 .srow .luck { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -648,10 +650,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="sub" id="navSub">控制台</div>
     </div>
     <ul>
-      <li><a href="#accounts" data-view="accounts" class="on">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5" r="2.6"/><path d="M2.8 13.2c.5-2.7 2.6-4.2 5.2-4.2s4.7 1.5 5.2 4.2"/></svg>
-        账号池</a></li>
-      <li><a href="#checkin" data-view="checkin">
+      <li><a href="#checkin" data-view="checkin" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="3" width="11.6" height="10" rx="1.8"/><path d="M2.2 6.2h11.6M5 1.8v2.4M11 1.8v2.4"/><path d="m6.2 9 1.4 1.4L10 8"/></svg>
         签到池</a></li>
       <li><a href="#usage" data-view="usage">
@@ -684,7 +683,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
   <div class="main">
     <div class="topbar">
-      <h2 id="ttl">账号池</h2>
+      <h2 id="ttl">签到池</h2>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
       <div class="grow"></div>
@@ -739,63 +738,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 账号池（CodeBuddy 主号池 —— 聊天流量的实际来源） -->
-    <!--
-      这段 DOM 此前被移除，导致 app.js 里的 renderAccounts / 账号运维按钮 / 批量
-      操作全部失去挂载点：面板上看不到任何账号的状态，也没法手动签到、查余额、
-      解冻、暂停选号、禁用、移除或跑单号任务（12 个 /panel/api 账号运维接口
-      只能靠 curl 调）。渲染器与事件委托一直保留在 app.js 里，补回 DOM 即可恢复。
-    -->
-    <section class="view" id="view-accounts" hidden>
-      <div class="box">
-        <header>
-          <h3>账号池</h3>
-          <span class="grow"></span>
-          <span class="note" id="accNote"></span>
-          <button class="xs" id="btnTravelAll" title="猫猫旅行巡检（含领养链路）">旅行巡检</button>
-          <button class="xs" id="btnActivityAll" title="活跃上报（点亮连登 / 解锁领养）">活跃上报</button>
-          <button class="xs" id="btnKeepaliveAll" title="token 保活">全部保活</button>
-          <button class="xs primary" id="btnCheckinAll">全部签到</button>
-        </header>
-        <div class="stats">
-          <div class="stat"><div class="v" id="sTotal">0</div><div class="k">账号总数</div></div>
-          <div class="stat"><div class="v" id="sHealthy">0</div><div class="k">可用</div></div>
-          <div class="stat"><div class="v" id="sCooling">0</div><div class="k">冷却中</div></div>
-          <div class="stat"><div class="v" id="sDisabled">0</div><div class="k">已禁用</div></div>
-          <div class="stat"><div class="v" id="sPaused">0</div><div class="k">暂停选号</div></div>
-          <div class="stat"><div class="v" id="sCredits">0</div><div class="k">积分剩余 / 总额</div></div>
-          <div class="stat"><div class="v" id="sSticky">0</div><div class="k">粘性会话</div></div>
-        </div>
-        <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr>
-              <th></th>
-              <th>账号</th>
-              <th>状态</th>
-              <th>积分</th>
-              <th>成功 / 失败</th>
-              <th>在途</th>
-              <th>最近用量</th>
-              <th>最近成功</th>
-              <th class="c-acts">操作</th>
-            </tr></thead>
-            <tbody id="accBody"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- 积分到期提醒：每账号一行，色点=危险度，正文=最近到期批次与日均需耗。
-           默认渲染本地快照（零成本，随 overview 刷新）；点「检查」才逐账号查上游拿明细。 -->
-      <div class="box" id="expBox" hidden>
-        <header>
-          <h3>积分到期提醒</h3>
-          <span class="grow"></span>
-          <span class="note" id="expNote"></span>
-          <button class="xs" id="btnExp" title="逐账号向上游实时查询到期明细（较慢）">检查</button>
-        </header>
-        <div class="pad"><div id="expList"></div></div>
-      </div>
-    </section>
+    <!-- 账号池（CodeBuddy 主号池）视图已按需求移除（2026-10-24）：
+         该号池仍是聊天网关与定时签到的数据来源（overview / scheduler 照常工作），
+         只是不再有独立页面 —— 签到池的「一键签到」覆盖主号池，账号明细走用量/积分页。 -->
 
     <!-- 签到池 -->
     <section class="view" id="view-checkin" hidden>
@@ -824,6 +769,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>Qoder 签到</h3>
           <span class="grow"></span>
           <span class="note" id="ckQoderSummary"></span>
+          <button class="xs" id="btnCkQoderSwitched" title="逐个把客户端切到号池账号签到（浏览器登录的号扫不到活动，必须客户端登录；每号重启一次客户端，约 N×40 秒）">切号签到</button>
           <button class="xs primary" id="btnCkQoderCheckinAll">全部签到</button>
         </header>
         <div class="state" id="ckQoderState"><span class="dots">加载中</span></div>
@@ -836,10 +782,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="ckMmSummary"></span>
           <button class="xs" id="btnMmAdd" title="把 MiniMax Code 当前登录的账号存入号池">添加当前账号</button>
+          <button class="xs" id="btnMmRenewAll" title="给号池全部账号续期凭证（token 只有 1 小时，定时任务每 30 分钟也会自动续）">全部续期</button>
           <button class="xs primary" id="btnMmCheckinAll">全部签到</button>
         </header>
         <div class="state" id="ckMmState"><span class="dots">加载中</span></div>
         <div id="ckMmList"></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>豆包签到</h3>
+          <span class="grow"></span>
+          <span class="note" id="ckDbSummary"></span>
+          <button class="xs" id="btnDbAdd" title="从本机豆包客户端提取当前登录 Cookie（会短暂重启客户端）">从客户端提取</button>
+          <button class="xs primary" id="btnDbCheckinAll">全部签到</button>
+        </header>
+        <div class="state" id="ckDbState"><span class="dots">加载中</span></div>
+        <div id="ckDbList"></div>
       </div>
 
       <div class="box">
@@ -1521,6 +1480,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <button class="tab on" data-tab="wb">WorkBuddy</button>
         <button class="tab" data-tab="trae">Trae</button>
         <button class="tab" data-tab="qoder">Qoder</button>
+        <button class="tab" data-tab="minimax">MiniMax</button>
+        <button class="tab" data-tab="doubao">豆包</button>
         <button class="tab" data-tab="import">导入 JSON</button>
       </div>
     </header>
@@ -1566,6 +1527,60 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addQoderErr" class="state err" hidden></div>
         <div style="margin-top:10px">
           <button id="btnQoderCapture" class="primary">添加当前 Qoder 账号</button>
+        </div>
+      </div>
+      <!-- MiniMax：浏览器登录（设备码）/ 捕获客户端登录态 / 粘贴 access+refresh token -->
+      <div id="addTabMinimax" class="tab-panel" hidden>
+        <div class="state" id="addMmCur" style="margin-bottom:8px">正在读取本机 MiniMax Code 登录态…</div>
+        <div id="addMmDone" class="state ok" hidden></div>
+        <div id="addMmErr" class="state err" hidden></div>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button id="btnMmCapture" class="primary">添加当前 MiniMax 账号</button>
+          <button id="btnMmToggleManual">改用粘贴 Token</button>
+        </div>
+        <div id="addMmManual" hidden style="margin-top:12px">
+          <div class="hint" style="margin-bottom:6px">粘贴 access_token（mmoat_ 开头）与 refresh_token（mmort_ 开头）。适合添加未在本机登录的账号。</div>
+          <input type="text" id="mmAccessInput" placeholder="access_token (mmoat_...)" style="width:100%;margin-bottom:6px">
+          <input type="text" id="mmRefreshInput" placeholder="refresh_token (mmort_...)（可选）" style="width:100%;margin-bottom:8px">
+          <button id="btnMmAddManual" class="primary">保存账号</button>
+        </div>
+        <!-- 浏览器登录：OAuth 设备码授权（RFC 8628 + S256 PKCE） -->
+        <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+          <div class="realm-row" style="margin-bottom:8px">
+            <span class="hint" style="font-size:12px">版本：</span>
+            <label class="realm-opt"><input type="radio" name="mmRealm" value="cn" checked> 国内版（CN）</label>
+            <label class="realm-opt"><input type="radio" name="mmRealm" value="global"> 国际版（Global）</label>
+          </div>
+          <div class="hint" style="margin-bottom:8px">
+            浏览器登录：点按钮拿到验证码与授权链接，在浏览器里登录要添加的 MiniMax 账号，授权完自动入池并签到。
+            授权窗口只有 5 分钟，超时了点按钮重发。
+          </div>
+          <button id="btnMmLogin" class="primary">浏览器登录添加账号</button>
+          <div id="addMmLoginBox" hidden style="margin-top:10px">
+            <div class="state">在浏览器打开下面的链接，输入验证码完成登录：</div>
+            <div class="url" id="mmLoginUrl"></div>
+            <div class="state">验证码 <b id="mmLoginCode"></b> · 剩余 <span id="mmLoginCountdown">--</span></div>
+            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+              <button id="btnMmLoginOpen" class="primary">打开授权页</button>
+              <button id="btnMmLoginCopy">复制验证码</button>
+            </div>
+            <div id="addMmLoginErr" class="state err" hidden style="margin-top:8px"></div>
+          </div>
+        </div>
+      </div>
+      <!-- 豆包：从客户端提取 Cookie，或手动粘贴 -->
+      <div id="addTabDoubao" class="tab-panel" hidden>
+        <div class="state" id="addDbCur" style="margin-bottom:8px">需要本机已安装并登录豆包客户端（凭据从客户端 Cookie 库解密）。</div>
+        <div id="addDbDone" class="state ok" hidden></div>
+        <div id="addDbErr" class="state err" hidden></div>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button id="btnDbExtract" class="primary">从客户端提取当前账号</button>
+          <button id="btnDbToggleManual">改用粘贴 Cookie</button>
+        </div>
+        <div id="addDbManual" hidden style="margin-top:12px">
+          <div class="hint" style="margin-bottom:6px">粘贴完整 Cookie 串（浏览器 F12 → Network 任意 doubao.com 请求 → Request Headers → Cookie，需含 sessionid）。</div>
+          <textarea id="dbCookieInput" rows="4" placeholder="sessionid=...; ttwid=...; msToken=..." style="width:100%;margin-bottom:8px"></textarea>
+          <button id="btnDbAddCookie" class="primary">保存账号</button>
         </div>
       </div>
       <!-- 导入 JSON -->

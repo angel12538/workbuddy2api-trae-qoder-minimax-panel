@@ -2,7 +2,7 @@
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
-let view = 'accounts';
+let view = 'checkin';   // 账号池视图已移除（2026-10-24）：签到池是默认首页
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let traeLoginState = null, traeTimer = null;   // Trae 授权登录（与 WorkBuddy 那套分开）
@@ -341,9 +341,9 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', checkin: '签到池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', ideaccounts: 'IDE 账号池', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { checkin: '签到池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', ideaccounts: 'IDE 账号池', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
-  if (!(v in TITLES)) v = 'accounts';
+  if (!(v in TITLES)) v = 'checkin';
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
@@ -355,8 +355,6 @@ function go(v) {
   if (v === 'packages') { loadPackages(); loadPkIdea(true); }
   if (v === 'taskscenter') { reattachQueueView(); loadIdeaTasks(true); }
   if (v === 'checkin') { loadTraeStatus(true); loadTraeCredits(true); loadCheckinPool(true); loadQkCredits(true); loadWkCredits(true); }
-  // 账号池页的到期提醒默认渲染本地快照（随 overview 免费刷新）；逐账号上游明细
-  // 由「检查」按钮显式触发，不在进视图时自动打上游。
   // 冻结期内进 IDE 账号页不自动重取：保留切换前那份列表与滚动位置。
   if (v === 'ideaccounts' && !viewFrozen()) { loadQoderAccounts(true); loadTraeIdeAccounts(true); loadWorkBuddyAccounts(true); }
   saveViewState();
@@ -372,8 +370,8 @@ setTimeout(() => {
   // 优先还原上次停留的视图与滚动位置（切号后按 F5、或从别的页切回来都不回顶部）；
   // 没有历史记录时再按 URL hash 进入。
   if (!restoreViewState()) {
-    const hash = (location.hash || '#accounts').slice(1);
-    go(hash in TITLES ? hash : 'accounts');
+    const hash = (location.hash || '#checkin').slice(1);
+    go(hash in TITLES ? hash : 'checkin');
   }
 }, 0);
 
@@ -1285,6 +1283,8 @@ function openAdd() {
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   resetTraePanel();
   resetQoderPanel();
+  resetMinimaxAddPanel();
+  resetDoubaoAddPanel();
   stopPoll(); stopTraePoll();
 }
 function switchAddTab(tab) {
@@ -1292,14 +1292,19 @@ function switchAddTab(tab) {
   $('addTabWb').hidden = tab !== 'wb';
   $('addTabTrae').hidden = tab !== 'trae';
   $('addTabQoder').hidden = tab !== 'qoder';
+  $('addTabMinimax').hidden = tab !== 'minimax';
+  $('addTabDoubao').hidden = tab !== 'doubao';
   $('addTabImport').hidden = tab !== 'import';
-  // 页脚那组按钮只服务 WorkBuddy 设备码流程；Trae / Qoder 流程有自己的按钮（在面板内）。
+  // 页脚那组按钮只服务 WorkBuddy 设备码流程；其它流程有自己的按钮（在面板内）。
   const wb = tab === 'wb';
   $('btnStartLogin').hidden = !wb || !$('addReady').hidden;
   $('btnCopyUrl').hidden = !wb || $('addReady').hidden;
   $('btnOpenUrl').hidden = !wb || $('addReady').hidden;
   if (tab === 'trae') stopPoll(); else stopTraePoll();
+  if (tab !== 'minimax') stopMmLoginPoll();
   if (tab === 'qoder') loadQoderAddTab();
+  if (tab === 'minimax') loadMinimaxAddTab();
+  if (tab === 'doubao') resetDoubaoAddPanel();
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -1342,7 +1347,7 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); stopTraePoll(); loginState = null; traeLoginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() { stopPoll(); stopTraePoll(); stopMmLoginPoll(); loginState = null; traeLoginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
 
 /* ── Trae 账号添加（面板自拉浏览器 + CDP 取凭证）────────────────────────
@@ -1436,6 +1441,217 @@ async function doQoderCapture() {
   } finally { b.disabled = false; b.textContent = '添加当前 Qoder 账号'; }
 }
 if ($('btnQoderCapture')) $('btnQoderCapture').onclick = doQoderCapture;
+
+/* ── MiniMax 添加（客户端捕获 / 粘贴 Token）────────────────────────── */
+function resetMinimaxAddPanel() {
+  const dn = $('addMmDone'), er = $('addMmErr');
+  if (dn) dn.hidden = true;
+  if (er) er.hidden = true;
+  const man = $('addMmManual');
+  if (man) man.hidden = true;
+  const tg = $('btnMmToggleManual');
+  if (tg) tg.textContent = '改用粘贴 Token';
+  const b = $('btnMmCapture');
+  if (b) { b.disabled = false; b.textContent = '添加当前 MiniMax 账号'; }
+  resetMmLoginPanel();
+}
+async function loadMinimaxAddTab() {
+  resetMinimaxAddPanel();
+  const cur = $('addMmCur');
+  if (!cur) return;
+  cur.className = 'state';
+  cur.innerHTML = '<span class="dots">读取中</span>';
+  try {
+    const d = await api('ide/minimax/accounts');
+    cur.className = 'state';
+    if (d.has_client) {
+      cur.textContent = '本机 MiniMax Code 已登录，点「添加当前账号」即可（已有 ' + (d.accounts || []).length + ' 个账号在号池）。';
+    } else {
+      cur.textContent = '本机 MiniMax Code 未登录。可先用其它账号的 Token 粘贴添加（下方「改用粘贴 Token」）。';
+    }
+  } catch (e) { cur.className = 'state err'; cur.textContent = e.message; }
+}
+async function doMmCapture() {
+  const b = $('btnMmCapture');
+  b.disabled = true; b.textContent = '添加中…';
+  $('addMmDone').hidden = true; $('addMmErr').hidden = true;
+  try {
+    const d = await api('ide/minimax/add', { method: 'POST', body: '{}' });
+    $('addMmDone').hidden = false;
+    $('addMmDone').textContent = (d.added ? '已添加：' : '已更新：') + (d.label || d.id);
+    loadCkMiniMax(true);
+  } catch (e) {
+    $('addMmErr').hidden = false; $('addMmErr').textContent = e.message;
+  } finally { b.disabled = false; b.textContent = '添加当前 MiniMax 账号'; }
+}
+async function doMmAddManual() {
+  const b = $('btnMmAddManual');
+  b.disabled = true;
+  $('addMmDone').hidden = true; $('addMmErr').hidden = true;
+  try {
+    const d = await api('ide/minimax/add_manual', {
+      method: 'POST',
+      body: JSON.stringify({ access_token: $('mmAccessInput').value.trim(), refresh_token: $('mmRefreshInput').value.trim() }),
+    });
+    $('addMmDone').hidden = false;
+    $('addMmDone').textContent = d.msg || ('已保存：' + (d.label || d.id));
+    $('mmAccessInput').value = ''; $('mmRefreshInput').value = '';
+    loadCkMiniMax(true);
+  } catch (e) {
+    $('addMmErr').hidden = false; $('addMmErr').textContent = e.message;
+  } finally { b.disabled = false; }
+}
+if ($('btnMmCapture')) $('btnMmCapture').onclick = doMmCapture;
+if ($('btnMmToggleManual')) $('btnMmToggleManual').onclick = () => {
+  const man = $('addMmManual');
+  man.hidden = !man.hidden;
+  $('btnMmToggleManual').textContent = man.hidden ? '改用粘贴 Token' : '收起粘贴框';
+};
+if ($('btnMmAddManual')) $('btnMmAddManual').onclick = doMmAddManual;
+
+/* ── MiniMax 浏览器登录（OAuth 设备码，RFC 8628）─────────────────────
+   服务端申请 device_code → 用户在浏览器授权 → 面板轮询换 token → 入池。
+   两个实测约束决定了这段逻辑的形状：
+     · 授权窗口只有 300 秒（上游 expires_in=300）→ 必须显示倒计时并允许重发；
+     · 轮询快于服务端给的 interval 会拿到 slow_down → 轮询节奏跟着服务端走。 */
+let mmLoginState = null, mmLoginTimer = null, mmLoginCdTimer = null, mmLoginInterval = 3;
+function stopMmLoginPoll() {
+  if (mmLoginTimer) { clearTimeout(mmLoginTimer); mmLoginTimer = null; }
+  if (mmLoginCdTimer) { clearInterval(mmLoginCdTimer); mmLoginCdTimer = null; }
+}
+function resetMmLoginPanel() {
+  stopMmLoginPoll();
+  mmLoginState = null;
+  const box = $('addMmLoginBox');
+  if (box) box.hidden = true;
+  const er = $('addMmLoginErr');
+  if (er) { er.hidden = true; er.textContent = ''; }
+  const b = $('btnMmLogin');
+  if (b) { b.disabled = false; b.textContent = '浏览器登录添加账号'; }
+}
+function startMmCountdown(sec) {
+  if (mmLoginCdTimer) clearInterval(mmLoginCdTimer);
+  let left = Math.max(0, sec | 0);
+  const tick = () => {
+    const el = $('mmLoginCountdown');
+    if (!el) return;
+    if (left <= 0) {
+      el.textContent = '已过期，请重新申请';
+      stopMmLoginPoll();
+      return;
+    }
+    const m = Math.floor(left / 60), s = left % 60;
+    el.textContent = m + ':' + String(s).padStart(2, '0');
+    left--;
+  };
+  tick();
+  mmLoginCdTimer = setInterval(tick, 1000);
+}
+async function startMmLogin() {
+  const b = $('btnMmLogin');
+  const er = $('addMmLoginErr');
+  b.disabled = true; b.textContent = '正在申请…';
+  er.hidden = true; er.textContent = '';
+  const realm = (document.querySelector('input[name="mmRealm"]:checked') || {}).value || 'cn';
+  try {
+    const r = await api('ide/minimax/login/start', { method: 'POST', body: JSON.stringify({ region: realm }) });
+    mmLoginState = r.state;
+    mmLoginInterval = Math.max(2, r.interval || 3);
+    $('addMmLoginBox').hidden = false;
+    $('mmLoginUrl').textContent = r.verification_uri_complete || r.verification_uri || '';
+    $('mmLoginCode').textContent = r.user_code || '';
+    b.disabled = false; b.textContent = '重新申请';
+    startMmCountdown(r.expires_in || 300);
+    mmLoginTimer = setTimeout(pollMmLogin, mmLoginInterval * 1000);
+  } catch (e) {
+    b.disabled = false; b.textContent = '浏览器登录添加账号';
+    er.hidden = false; er.textContent = e.message;
+  }
+}
+async function pollMmLogin() {
+  if (!mmLoginState) return;
+  try {
+    const r = await api('ide/minimax/login/poll?state=' + encodeURIComponent(mmLoginState));
+    if (r.done) {
+      stopMmLoginPoll();
+      $('addMmLoginBox').hidden = true;
+      $('addMmDone').hidden = false;
+      $('addMmDone').textContent = (r.msg || ('已添加：' + (r.label || r.id))) + (r.checkin ? ' · ' + r.checkin : '');
+      loadCkMiniMax(true);
+      return;
+    }
+    if (r.fatal) {
+      stopMmLoginPoll();
+      $('addMmLoginErr').hidden = false;
+      $('addMmLoginErr').textContent = r.error || '授权失败';
+      return;
+    }
+    if (r.interval) mmLoginInterval = Math.max(2, r.interval);
+    if (r.message) {
+      const er = $('addMmLoginErr');
+      er.hidden = false; er.textContent = r.message;
+    }
+    mmLoginTimer = setTimeout(pollMmLogin, mmLoginInterval * 1000);
+  } catch (e) {
+    stopMmLoginPoll();
+    $('addMmLoginErr').hidden = false;
+    $('addMmLoginErr').textContent = e.message + '（关闭后重新添加）';
+  }
+}
+if ($('btnMmLogin')) $('btnMmLogin').onclick = startMmLogin;
+if ($('btnMmLoginOpen')) $('btnMmLoginOpen').onclick = () => window.open($('mmLoginUrl').textContent, '_blank');
+if ($('btnMmLoginCopy')) $('btnMmLoginCopy').onclick = () => navigator.clipboard.writeText($('mmLoginCode').textContent)
+  .then(() => toast('验证码已复制', 'ok'), () => toast('复制失败，请手动复制', 'err'));
+
+/* ── 豆包添加（客户端提取 / 粘贴 Cookie）──────────────────────────── */
+function resetDoubaoAddPanel() {
+  const dn = $('addDbDone'), er = $('addDbErr');
+  if (dn) dn.hidden = true;
+  if (er) er.hidden = true;
+  const man = $('addDbManual');
+  if (man) man.hidden = true;
+  const tg = $('btnDbToggleManual');
+  if (tg) tg.textContent = '改用粘贴 Cookie';
+  const b = $('btnDbExtract');
+  if (b) { b.disabled = false; b.textContent = '从客户端提取当前账号'; }
+}
+async function doDbExtractAdd() {
+  const b = $('btnDbExtract');
+  b.disabled = true; b.textContent = '提取中（会重启豆包客户端）…';
+  $('addDbDone').hidden = true; $('addDbErr').hidden = true;
+  try {
+    const d = await api('ide/doubao/add_extract', { method: 'POST', body: '{}' });
+    $('addDbDone').hidden = false;
+    $('addDbDone').textContent = (d.msg || '已提取') + (d.note ? '（' + d.note + '）' : '');
+    loadCkDoubao(true);
+  } catch (e) {
+    $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
+  } finally { b.disabled = false; b.textContent = '从客户端提取当前账号'; }
+}
+async function doDbAddCookie() {
+  const b = $('btnDbAddCookie');
+  b.disabled = true;
+  $('addDbDone').hidden = true; $('addDbErr').hidden = true;
+  try {
+    const d = await api('ide/doubao/add_cookie', {
+      method: 'POST',
+      body: JSON.stringify({ cookie: $('dbCookieInput').value }),
+    });
+    $('addDbDone').hidden = false;
+    $('addDbDone').textContent = d.msg || '已保存';
+    $('dbCookieInput').value = '';
+    loadCkDoubao(true);
+  } catch (e) {
+    $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
+  } finally { b.disabled = false; }
+}
+if ($('btnDbExtract')) $('btnDbExtract').onclick = doDbExtractAdd;
+if ($('btnDbToggleManual')) $('btnDbToggleManual').onclick = () => {
+  const man = $('addDbManual');
+  man.hidden = !man.hidden;
+  $('btnDbToggleManual').textContent = man.hidden ? '改用粘贴 Cookie' : '收起粘贴框';
+};
+if ($('btnDbAddCookie')) $('btnDbAddCookie').onclick = doDbAddCookie;
 
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
@@ -3673,6 +3889,7 @@ function renderExpiry(d) {
       (rest ? '<div class="note">' + rest + '</div>' : '') +
       '</span></div>';
   }).join('');
+  if (!$('expList')) return;   // 账号池视图已移除：到期卡片 DOM 不存在时静默跳过
   $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
   // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
   const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
@@ -3729,6 +3946,7 @@ function renderExpirySnapshot(d) {
       '<div class="note">仅最早一批，点「检查」看全部到期批次</div>' +
       '</span></div>';
   }).join('');
+  if (!$('expList')) return;   // 账号池视图已移除：到期卡片 DOM 不存在时静默跳过
   $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
   $('expNote').textContent = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
   $('expBox').hidden = false;
@@ -3937,10 +4155,15 @@ async function doQoderCheckin(btn, email) {
     const results = (d && d.results) || [];
     const okc = results.filter(r => r.phase === 'claimed').length;
     const alc = results.filter(r => r.phase === 'already').length;
-    const bad = results.filter(r => r.phase !== 'claimed' && r.phase !== 'already');
+    // pending = 上游没有下发每日签到活动（不是故障；官方限时活动已结束/未开放时
+    // 会一直如此）。单独列出不算失败，避免误读成"签不上"。
+    const nop = results.filter(r => r.phase === 'pending').length;
+    const bad = results.filter(r => r.phase !== 'claimed' && r.phase !== 'already' && r.phase !== 'pending');
     let text;
     if (results.length > 1 || !email) {
-      text = 'Qoder 签到：成功 ' + okc + ' · 今日已领 ' + alc + ' · 失败 ' + bad.length;
+      text = 'Qoder 签到：成功 ' + okc + ' · 今日已领 ' + alc +
+        (nop ? ' · 暂无活动 ' + nop : '') + ' · 失败 ' + bad.length;
+      if (nop && !okc && !alc && !bad.length) text += '（上游当前没有可领的签到活动；每 30 分钟自动重试，一旦下发即自动领取）';
       if (d && d.credits) text += '，新增 +' + d.credits + ' Credits';
       else if (d && d.credits_already) text += '（今日已入账 ' + d.credits_already + '）';
     } else {
@@ -3950,7 +4173,7 @@ async function doQoderCheckin(btn, email) {
           : (r.msg || (d && d.msg) || r.phase || '签到失败');
     }
     if (bad.length && bad[0].msg) text += '；' + bad[0].email + '：' + bad[0].msg;
-    toast(text, bad.length ? 'err' : 'ok');
+    toast(text, bad.length ? 'err' : (nop && !okc ? 'warn' : 'ok'));
     // 切号冻结期间不自动重绘（画面要保持切换前），只弹结果。
     if (!viewFrozen()) {
       loadCkQoder(true);
@@ -3963,6 +4186,20 @@ async function doQoderCheckin(btn, email) {
 if ($('btnQoderRefresh')) $('btnQoderRefresh').onclick = () => { thawView(); loadQoderAccounts(false); };
 if ($('btnQoderAdd')) $('btnQoderAdd').onclick = doQoderAdd;
 if ($('btnCkQoderCheckinAll')) $('btnCkQoderCheckinAll').onclick = () => doQoderCheckin($('btnCkQoderCheckinAll'));
+if ($('btnCkQoderSwitched')) $('btnCkQoderSwitched').onclick = () => doQoderSwitchedCheckin($('btnCkQoderSwitched'));
+
+// doQoderSwitchedCheckin 切号逐号签到：逐个切客户端（重启 N 次，约 N×40 秒）。
+async function doQoderSwitchedCheckin(btn) {
+  if (!confirm('切号逐号签到：会把 Qoder 客户端轮流切到号池每个账号（每号重启一次客户端，全部完成后恢复你原来的登录）。\n\n注意：每台设备每天只有一个号能领到签到积分（服务端规则）。\n\n继续？')) return;
+  const old = btn ? btn.textContent : '切号签到';
+  if (btn) { btn.disabled = true; btn.textContent = '切号签到中…'; }
+  try {
+    const d = await api('ide/qoder/checkin_switched', { method: 'POST', body: '{}' });
+    toast(d.msg || '切号签到完成', 'ok');
+    if (!viewFrozen()) { loadCkQoder(true); loadQkCredits(true); }
+  } catch (e) { toast(e.message, 'err'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = old || '切号签到'; } }
+}
 
 /* ── Trae IDE 账号（切号） ──────────────────────────────────────────
    与「Trae 签到」不同：这里管的是 Trae IDE 自身登录态
@@ -4237,7 +4474,7 @@ async function loadCheckinPool(quiet) {
   if (ckPoolLoading) return;
   ckPoolLoading = true;
   try {
-    await Promise.all([loadCkWorkBuddy(quiet), loadCkQoder(quiet), loadCkMiniMax(quiet)]);
+    await Promise.all([loadCkWorkBuddy(quiet), loadCkQoder(quiet), loadCkMiniMax(quiet), loadCkDoubao(quiet)]);
   } finally { ckPoolLoading = false; }
 }
 
@@ -4316,9 +4553,11 @@ async function loadCkQoder(quiet) {
     const rows = arr.length ? arr : (cur ? [{ email: cur, name: d.current_name || '当前登录', current: true }] : []);
     // 今日签到状态：本地日志（号池全量），不打上游。
     const st2 = await api('ide/qoder/checkin-status').catch(() => null);
-    const doneMap = {};
+    const doneMap = {}, pendMap = {};
     ((st2 && st2.results) || []).forEach(r => {
-      if (r && r.email) doneMap[String(r.email).toLowerCase()] = !!r.checked_in_today;
+      if (!r || !r.email) return;
+      doneMap[String(r.email).toLowerCase()] = !!r.checked_in_today;
+      pendMap[String(r.email).toLowerCase()] = (r.phase === 'pending' && !r.checked_in_today);
     });
     if (cur && st2 && typeof st2.checked_in_today === 'boolean') {
       doneMap[cur.toLowerCase()] = !!st2.checked_in_today;
@@ -4338,11 +4577,14 @@ async function loadCkQoder(quiet) {
     list.innerHTML = head + rows.map(a => {
       const email = a.email || '';
       const isDone = !!doneMap[email.toLowerCase()];
+      const noCamp = !!pendMap[String(email).toLowerCase()];
       const status = isDone
         ? '<span class="stask ok"><span class="mark">✓</span>今日已签到</span>'
-        : (a.expired
-          ? '<span class="stask todo"><span class="mark">!</span>凭证过期</span>'
-          : '<span class="stask warn"><span class="mark">○</span>可签到</span>');
+        : (noCamp
+          ? '<span class="stask mute2" title="上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取"><span class="mark">○</span>暂无签到活动</span>'
+          : (a.expired
+            ? '<span class="stask todo"><span class="mark">!</span>凭证过期</span>'
+            : '<span class="stask warn"><span class="mark">○</span>可签到</span>'));
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.name || '未命名') +
         (a.current ? '<span class="tag mute" style="margin-left:6px">当前登录</span>' : '') + '</div>' +
@@ -4400,13 +4642,17 @@ async function loadCkMiniMax(quiet) {
     list.innerHTML = head + arr.map(a => {
       const id = a.id || '';
       const isDone = !!a.claimed_today;
+      const expTxt = a.expires_at_ms
+        ? new Date(a.expires_at_ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+        : '';
       const status = a.error
         ? '<span class="stask todo" title="' + esc(a.error) + '"><span class="mark">!</span>查询失败</span>'
         : (isDone
           ? '<span class="stask ok"><span class="mark">✓</span>今日已签到</span>'
           : (a.expired
             ? '<span class="stask todo"><span class="mark">!</span>凭证过期</span>'
-            : '<span class="stask warn"><span class="mark">○</span>可签到</span>'));
+            : '<span class="stask warn"><span class="mark">○</span>可签到</span>')) +
+          (expTxt ? ' <span class="tag mute">' + (a.expired ? '已于 ' : '到期 ') + expTxt + '</span>' : '');
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.user_name || a.label || 'MiniMax 账号') +
         (id && id === (d.current_id || '') ? '<span class="tag mute" style="margin-left:6px">当前</span>' : '') + '</div>' +
@@ -4416,6 +4662,7 @@ async function loadCkMiniMax(quiet) {
         '<div>' + status + '</div>' +
         '<div><button class="xs primary" data-mm-ck="' + esc(id) + '"' + (isDone ? ' disabled' : '') + '>' +
         (isDone ? '已签到' : '签到') + '</button>' +
+        '<button class="xs" data-mm-renew="' + esc(id) + '" style="margin-left:6px" title="用 refresh_token 换新 token（自动同步回客户端）">续期</button>' +
         '<button class="xs" data-mm-rm="' + esc(id) + '" style="margin-left:6px">移除</button></div>' +
         '</div>';
     }).join('');
@@ -4423,10 +4670,33 @@ async function loadCkMiniMax(quiet) {
     list.querySelectorAll('button[data-mm-ck]').forEach(b => {
       b.onclick = () => doMmCheckin(b, b.dataset.mmCk);
     });
+    list.querySelectorAll('button[data-mm-renew]').forEach(b => {
+      b.onclick = () => doMmRenew(b, b.dataset.mmRenew);
+    });
     list.querySelectorAll('button[data-mm-rm]').forEach(b => {
       b.onclick = () => doMmRemove(b.dataset.mmRm);
     });
   } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+}
+
+// doMmRenew 续期单个 MiniMax 账号（或 id 为空 = 全部临期账号）。
+async function doMmRenew(btn, id) {
+  const old = btn ? btn.textContent : '续期';
+  if (btn) { btn.disabled = true; btn.textContent = '续期中…'; }
+  try {
+    const body = id ? JSON.stringify({ id }) : JSON.stringify({ force: false });
+    const d = await api('ide/minimax/renew', { method: 'POST', body });
+    const rs = (d && d.results) || [];
+    const bad = rs.filter(r => r.phase === 'error');
+    if (!bad.length) {
+      const r = rs[0] || {};
+      toast((r.msg || '凭证已续期') + (r.synced_client ? '（已同步回客户端）' : ''), 'ok');
+    } else {
+      toast(bad.map(r => (r.label || r.id) + '：' + r.msg).join('；'), 'err');
+    }
+    loadCkMiniMax(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = old || '续期'; } }
 }
 
 // doMmCheckin 签到单个/全部。id 为空 = 号池全部账号。
@@ -4476,7 +4746,106 @@ async function doMmAdd() {
 }
 
 if ($('btnMmAdd')) $('btnMmAdd').onclick = doMmAdd;
+if ($('btnMmRenewAll')) $('btnMmRenewAll').onclick = () => doMmRenew($('btnMmRenewAll'), '');
 if ($('btnMmCheckinAll')) $('btnMmCheckinAll').onclick = () => doMmCheckin($('btnMmCheckinAll'));
+
+/* ── 豆包签到（多账号，Cookie 凭据 + CDP 无头浏览器通道）────────────
+   豆包签到接口依赖 AGW 设备签名，纯 HTTP 实测被拦；无头浏览器注入 Cookie +
+   客户端 UA 打开活动页由页面自身链路完成签到（与 Trae 凭证提取同机制）。
+   每号一个会话，约 15-40 秒，全部签到请耐心等。 */
+async function loadCkDoubao(quiet) {
+  const st = $('ckDbState'), list = $('ckDbList');
+  if (!st || !list) return;
+  if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
+  try {
+    const d = await api('ide/doubao/accounts');
+    const arr = (d && d.accounts) || [];
+    const done = arr.filter(a => a.checked_in_today).length;
+    if ($('ckDbSummary')) {
+      $('ckDbSummary').textContent = arr.length
+        ? ('共 ' + arr.length + ' 个 · 已签 ' + done)
+        : (d.has_client ? '号池为空（本机已装豆包客户端，可一键提取）' : '本机未安装豆包客户端');
+    }
+    if (!arr.length) {
+      st.hidden = false; st.className = 'state';
+      st.textContent = d.has_client
+        ? '号池为空。点「从客户端提取」把当前登录的豆包账号存进来（客户端会短暂重启）。'
+        : '本机未安装豆包客户端。可先安装并登录，再提取；或通过「添加账号 → 豆包」粘贴 Cookie。';
+      list.innerHTML = ''; return;
+    }
+    const head = '<div class="thead"><div>账号</div><div>状态</div><div>操作</div></div>';
+    list.innerHTML = head + arr.map(a => {
+      const isDone = !!a.checked_in_today;
+      const status = isDone
+        ? '<span class="stask ok"><span class="mark">✓</span>今日已签到' +
+          (a.checked_in_at ? ' <span class="tag mute">' + esc(a.checked_in_at) + '</span>' : '') + '</span>'
+        : '<span class="stask warn"><span class="mark">○</span>可签到</span>';
+      return '<div class="trow">' +
+        '<div class="who"><div class="nm">' + esc(a.label || '豆包账号') +
+        (a.source === 'manual' ? '<span class="tag mute" style="margin-left:6px">手动</span>' : '') + '</div>' +
+        '<div class="id" title="session 尾号 ' + esc(a.session_tail || '') + ' · ' + esc(a.cookie_count || 0) + ' 个 Cookie">' +
+        'session 尾号 ' + esc(a.session_tail || '—') + '</div></div>' +
+        '<div>' + status + '</div>' +
+        '<div><button class="xs primary" data-db-ck="' + esc(a.id) + '"' + (isDone ? ' disabled' : '') + '>' +
+        (isDone ? '已签到' : '签到') + '</button>' +
+        '<button class="xs" data-db-rm="' + esc(a.id) + '" style="margin-left:6px">移除</button></div>' +
+        '</div>';
+    }).join('');
+    st.hidden = true;
+    list.querySelectorAll('button[data-db-ck]').forEach(b => {
+      b.onclick = () => doDoubaoCheckin(b, b.dataset.dbCk);
+    });
+    list.querySelectorAll('button[data-db-rm]').forEach(b => {
+      b.onclick = () => doDoubaoRemove(b.dataset.dbRm);
+    });
+  } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+}
+
+async function doDoubaoCheckin(btn, id) {
+  const old = btn ? btn.textContent : '签到';
+  if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
+  try {
+    const body = id ? JSON.stringify({ ids: [id] }) : '{}';
+    const d = await api('ide/doubao/checkin', { method: 'POST', body });
+    const results = (d && d.results) || [];
+    let text;
+    if (results.length > 1 || !id) {
+      text = '豆包签到：成功 ' + (d.claimed_accounts || 0) +
+        ' · 今日已领 ' + (d.already_accounts || 0) + ' · 失败 ' + (d.failed_accounts || 0);
+    } else {
+      const r = results[0] || {};
+      text = r.phase === 'claimed' ? '签到成功'
+        : r.phase === 'already' ? '今日已签到'
+          : ((r.msg || '签到失败') + (r.sample ? '｜' + r.sample : ''));
+    }
+    toast(text, (d.failed_accounts || 0) > 0 ? 'err' : 'ok');
+    if (!viewFrozen()) loadCkDoubao(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = old || '签到'; } }
+}
+
+async function doDoubaoRemove(id) {
+  if (!confirm('从豆包签到池移除该账号？')) return;
+  try {
+    await api('ide/doubao/remove', { method: 'POST', body: JSON.stringify({ id }) });
+    toast('已移除', 'ok');
+    loadCkDoubao(true);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function doDoubaoExtract(btn) {
+  const old = btn ? btn.textContent : '从客户端提取';
+  if (btn) { btn.disabled = true; btn.textContent = '提取中…'; }
+  try {
+    const d = await api('ide/doubao/add_extract', { method: 'POST', body: '{}' });
+    toast(d.msg || '已提取', 'ok');
+    loadCkDoubao(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = old || '从客户端提取'; } }
+}
+
+if ($('btnDbAdd')) $('btnDbAdd').onclick = () => doDoubaoExtract($('btnDbAdd'));
+if ($('btnDbCheckinAll')) $('btnDbCheckinAll').onclick = () => doDoubaoCheckin($('btnDbCheckinAll'), '');
 
 /* 主号池（CodeBuddy / WorkBuddy 国内版账号，即网关 chat 流量的实际来源）逐号签到。
    与 doWbCheckinAll 同构，但走网关自己的号池：overview 取号 → accounts/{uid}/checkin 签。
@@ -4531,9 +4900,10 @@ async function doCheckinAll(btn) {
       const qr = (q && q.results) || [];
       const qok = qr.filter(r => r.phase === 'claimed').length;
       const qal = qr.filter(r => r.phase === 'already').length;
-      const qf = qr.filter(r => r.phase !== 'claimed' && r.phase !== 'already').length;
+      const qnop = qr.filter(r => r.phase === 'pending').length;
+      const qf = qr.filter(r => r.phase !== 'claimed' && r.phase !== 'already' && r.phase !== 'pending').length;
       failCount += qf;
-      let qtxt = '成功 ' + qok + ' · 已签 ' + qal + ' · 失败 ' + qf;
+      let qtxt = '成功 ' + qok + ' · 已签 ' + qal + (qnop ? ' · 暂无活动 ' + qnop : '') + ' · 失败 ' + qf;
       if (q && q.credits) qtxt += '（+' + q.credits + '）';
       parts.push('Qoder ' + qtxt);
     } catch (e) { failCount++; parts.push('Qoder 失败：' + e.message); }
@@ -4564,6 +4934,20 @@ async function doCheckinAll(btn) {
       failCount += fc;
       parts.push('Trae 成功 ' + okc + ' · 已签 ' + alc + ' · 失败 ' + fc);
     } catch (e) { failCount++; parts.push('Trae 失败：' + e.message); }
+
+    try {
+      // 豆包：CDP 无头浏览器通道（每号一个会话，耗时略长）。
+      const db = await api('ide/doubao/checkin', { method: 'POST', body: '{}' });
+      const dr = (db && db.results) || [];
+      if (!dr.length) {
+        parts.push('豆包 无账号');
+      } else {
+        failCount += (db.failed_accounts || 0);
+        const dok = dr.filter(r => r.phase === 'claimed').length;
+        const dal = dr.filter(r => r.phase === 'already').length;
+        parts.push('豆包 成功 ' + dok + ' · 已签 ' + dal + ' · 失败 ' + (db.failed_accounts || 0));
+      }
+    } catch (e) { failCount++; parts.push('豆包 失败：' + e.message); }
 
     const text = parts.join('；');
     if (st) { st.className = failCount > 0 ? 'state err' : 'state ok'; st.textContent = '完成：' + text; }

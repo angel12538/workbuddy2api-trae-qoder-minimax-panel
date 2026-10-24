@@ -13,6 +13,7 @@ package panel
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
@@ -99,5 +100,66 @@ func (p *Panel) minimaxCheckin(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "results": results,
 		"claimed_accounts": claimed, "already_accounts": already, "failed_accounts": failed,
 		"credits": credits, "msg": msg,
+	})
+}
+
+// minimaxRenew 续期 MiniMax 凭证。
+//
+// MiniMax 的 access token 只有 1 小时、refresh token 每次刷新都轮换，号池副本
+// 不续就死（这就是「一小时后全过期」的根因）。面板支持三种续法：
+//   - {"force":true}            → 全部账号强制续期
+//   - {}                        → 只续临期（30 分钟内过期）账号 —— 定时任务同款
+//   - {"id":"u569..."}          → 单账号续期（前端「续期」按钮）
+//
+// 与客户端相同账号的续期会自动把新 token 同步回客户端 auth.json（refresh token
+// 是单次有效的轮换令牌，不同步回写客户端下次刷新必挂）。
+func (p *Panel) minimaxRenew(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID    string `json:"id"`
+		Force bool   `json:"force"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.ID != "" {
+		res := p.minimaxClient.RenewAccount(r.Context(), req.ID, true)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": res.Phase != "error", "results": []minimax.RenewResult{res}})
+		return
+	}
+	results := p.minimaxClient.RenewAll(r.Context(), req.Force)
+	okN, errN := 0, 0
+	for _, res := range results {
+		switch res.Phase {
+		case "renewed", "adopted":
+			okN++
+		case "error":
+			errN++
+		}
+	}
+	log.Printf("panel: MiniMax 续期完成：%d 成功 / %d 失败", okN, errN)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": errN == 0, "results": results})
+}
+
+// minimaxAddManual 手动添加账号（粘贴 access_token / refresh_token）。
+// 「添加账号」弹窗里 MiniMax 页签的手动通道：没有客户端也能加号。
+func (p *Panel) minimaxAddManual(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresAtMs  int64  `json:"expires_at_ms"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request: "+err.Error())
+		return
+	}
+	acc, added, err := p.minimaxClient.AddManual(r.Context(), req.AccessToken, req.RefreshToken, req.ExpiresAtMs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "minimax_add_failed: "+err.Error())
+		return
+	}
+	verb := "已添加"
+	if !added {
+		verb = "已更新"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "added": added, "id": acc.ID, "label": acc.Label, "msg": verb + "：" + acc.Label,
 	})
 }

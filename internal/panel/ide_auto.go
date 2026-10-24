@@ -17,6 +17,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/doubao"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/ideauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -33,7 +34,7 @@ func (p *Panel) StartIDECheckinAuto(ctx context.Context, hours []int) {
 	go func() {
 		for {
 			next := nextTraeFire(time.Now(), hours)
-			log.Printf("panel: IDE 号池自动签到已排程（Qoder/WorkBuddy/MiniMax），下次 %s", next.Format("01-02 15:04"))
+			log.Printf("panel: IDE 号池自动签到已排程（Qoder/WorkBuddy/MiniMax/豆包），下次 %s", next.Format("01-02 15:04"))
 			// 用 NewTimer 而不是 time.After：ctx 取消时 time.After 的定时器不会被回收，
 			// 下一次时点最远 24h 才触发，等于白挂一个 24h 的 timer（进程长期运行会累积）。
 			timer := time.NewTimer(time.Until(next))
@@ -48,11 +49,71 @@ func (p *Panel) StartIDECheckinAuto(ctx context.Context, hours []int) {
 	}()
 }
 
+// StartMinimaxRenewAuto 启动 MiniMax 凭证自动续期。
+//
+// access token 只有 1 小时、refresh token 每刷必轮换 —— 号池副本不续就会全部
+// 过期（401）。这里每 30 分钟巡检一次：临期（30 分钟内过期）的账号自动续期，
+// 续出的新 refresh token 同步回客户端 auth.json（与客户端共享同一条 RT 链，
+// 谁先刷都不掉）。与签到排程独立：签到 1 天 1 次，续期 1 天 ~48 次。
+func (p *Panel) StartMinimaxRenewAuto(ctx context.Context) {
+	if p.minimaxClient == nil {
+		return
+	}
+	go func() {
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				results := p.minimaxClient.RenewAll(ctx, false)
+				renewed, adopted, failed := 0, 0, 0
+				for _, r := range results {
+					switch r.Phase {
+					case "renewed":
+						renewed++
+					case "adopted":
+						adopted++
+					case "error":
+						failed++
+						log.Printf("panel: MiniMax 自动续期失败 %s: %s", r.Label, r.Msg)
+					}
+				}
+				if renewed > 0 || adopted > 0 || failed > 0 {
+					log.Printf("panel: MiniMax 自动续期巡检：续期 %d / 同步 %d / 失败 %d", renewed, adopted, failed)
+				}
+			}
+		}
+	}()
+}
+
 // ideCheckinAll 自动排程用的 IDE 号池全量签到（无 HTTP 上下文，结果只进日志）。
 func (p *Panel) ideCheckinAll(ctx context.Context) {
 	p.ideQoderCheckinAll()
 	p.ideWorkBuddyCheckinAll()
 	p.ideMiniMaxCheckinAll(ctx)
+	p.ideDoubaoCheckinAll(ctx)
+	// Qoder 快路径签不到的号（浏览器登录的号扫不到活动）走切号逐签：
+	// 轮流切进客户端签，完成后恢复原登录。客户端会被重启多次，属预期行为。
+	if pool, err := ideauth.LoadQoderPool(); err == nil && pool != nil {
+		for _, a := range pool.Accounts {
+			if a == nil {
+				continue
+			}
+			email := a.Email
+			if !ideauth.CheckinRecordTrusted("qoder", email) {
+				log.Printf("panel: Qoder 存在未签账号，启动切号逐签")
+				results := ideauth.QoderSwitchedCheckinAll(func(s string) {
+					log.Printf("panel: [自动切号签到] %s", s)
+				})
+				for _, r := range results {
+					log.Printf("panel: [自动切号签到] %s: %s %s", r.Email, r.Phase, r.Msg)
+				}
+				break
+			}
+		}
+	}
 }
 
 // ideQoderCheckinAll Qoder 号池逐号签到。
@@ -131,4 +192,39 @@ func (p *Panel) ideMiniMaxCheckinAll(ctx context.Context) {
 		}
 	}
 	log.Printf("panel: MiniMax 自动签到完成：成功 %d / 已签 %d / 失败 %d", ok, already, failed)
+}
+
+// ideDoubaoCheckinAll 豆包号池逐号签到（CDP 通道，串行，每号一个无头会话）。
+// 结果同样写本地签到记录（checkin_log.json），失败只进日志。
+func (p *Panel) ideDoubaoCheckinAll(ctx context.Context) {
+	pool, err := doubao.LoadPool()
+	if err != nil || pool == nil || len(pool.Accounts) == 0 {
+		return
+	}
+	ok, already, failed := 0, 0, 0
+	for _, a := range pool.Accounts {
+		if a == nil || a.SessionID == "" {
+			continue
+		}
+		// 可信的今日记录：跳过（CDP 每号要开一个无头浏览器，能省则省）。
+		if ideauth.CheckinRecordTrusted("doubao", a.ID) {
+			already++
+			continue
+		}
+		res := p.doubaoSigninOne(a)
+		switch res.Phase {
+		case "claimed":
+			_ = ideauth.MarkCheckedIn("doubao", a.ID)
+			ok++
+		case "already":
+			_ = ideauth.MarkCheckedIn("doubao", a.ID)
+			already++
+		default:
+			failed++
+			log.Printf("panel: 豆包自动签到失败 %s: %s", a.Label, res.Msg)
+		}
+	}
+	if len(pool.Accounts) > 0 {
+		log.Printf("panel: 豆包自动签到完成：成功 %d / 已签 %d / 失败 %d", ok, already, failed)
+	}
 }

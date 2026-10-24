@@ -2,8 +2,6 @@ package ideauth
 
 import (
 	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -247,6 +245,53 @@ type qoderCampaignsData struct {
 	Campaigns []QoderCampaign `json:"campaigns"`
 }
 
+// qoderCST Qoder 活动体系用的时区（每日 10:00 (UTC+8) 刷新当天 campaignId）。
+var qoderCST = time.FixedZone("UTC+8", 8*60*60)
+
+// qoderTodayStartCST 返回「今天」（UTC+8 自然日）的零点时刻。
+func qoderTodayStartCST() time.Time {
+	now := time.Now().In(qoderCST)
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, qoderCST)
+}
+
+// qoderCampaignIsToday 判断活动是否属于「今天」下发的（startAt 在今天零点之后）。
+//
+// 为什么必须判这个：Qoder 的每日签到（CLAIM_BENEFIT）campaignId 每天换新，但服务端
+// 会把**昨天已领过的活动**留在列表里直到当天刷新。此前代码只要看到 CLAIMED 的
+// CLAIM_BENEFIT 就报「今日已领取」，于是 09:00 的自动签到天天被昨天的陈旧活动
+// 骗成「已签」，写进本地记录后 30 分钟重试循环也不再补签 —— 10:00 真活动下发时
+// 什么都不会发生。这就是「每天都告诉我已经签了，但实际上没签上」的完整链条。
+func qoderCampaignIsToday(c QoderCampaign) bool {
+	if c.StartAt <= 0 {
+		return true // 上游没给 startAt：无从判断，按今天处理（宁误报可签不误报已签）
+	}
+	return time.Unix(c.StartAt, 0).After(qoderTodayStartCST())
+}
+
+// qoderClassifyCampaigns 把活动列表分成「今日可领 / 今日已领 / 陈旧已领」，其余忽略。
+func qoderClassifyCampaigns(campaigns []QoderCampaign) (claimable []QoderCampaign, claimedToday, staleClaimed *QoderCampaign) {
+	for _, c := range campaigns {
+		if c.ActionType != qoderClaimAction {
+			continue
+		}
+		switch c.ClaimStatus {
+		case "CLAIMABLE":
+			claimable = append(claimable, c)
+		case "CLAIMED":
+			if qoderCampaignIsToday(c) {
+				if claimedToday == nil {
+					cp := c
+					claimedToday = &cp
+				}
+			} else if staleClaimed == nil {
+				cp := c
+				staleClaimed = &cp
+			}
+		}
+	}
+	return claimable, claimedToday, staleClaimed
+}
+
 // QoderCheckinResult 签到结果。
 type QoderCheckinResult struct {
 	Email      string  `json:"email"`
@@ -439,21 +484,25 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 	res.Total = len(top.Campaigns)
 
 	var claimable []QoderCampaign
-	for _, c := range top.Campaigns {
-		if c.ActionType == qoderClaimAction && c.ClaimStatus == "CLAIMABLE" {
-			claimable = append(claimable, c)
-		}
-	}
+	var claimedToday, staleClaimed *QoderCampaign
+	claimable, claimedToday, staleClaimed = qoderClassifyCampaigns(top.Campaigns)
 	if len(claimable) == 0 {
-		for _, c := range top.Campaigns {
-			if c.ActionType == qoderClaimAction && c.ClaimStatus == "CLAIMED" {
-				res.Phase = "already"
-				res.Msg = "今日已领取"
-				if c.Benefit.Amount > 0 {
-					res.Credits = c.Benefit.Amount
-				}
-				return res, newAccess, newRefresh
+		if claimedToday != nil {
+			// 只有「今天下发的活动」已领取才算是真·已签。昨天的陈旧活动
+			// （staleClaimed）不算 —— 见 qoderCampaignIsToday 的注释。
+			res.Phase = "already"
+			res.Msg = "今日已领取"
+			if claimedToday.Benefit.Amount > 0 {
+				res.Credits = claimedToday.Benefit.Amount
 			}
+			return res, newAccess, newRefresh
+		}
+		if staleClaimed != nil {
+			// 列表里只有昨天已领的签到活动：今天的还没下发（10:00 刷新）。
+			// 绝不能把它当成「今日已领取」写进本地记录 —— 那正是每天误报已签的根因。
+			res.Phase = "pending"
+			res.Msg = "今日签到活动尚未下发（Qoder 每天 10:00 后刷新；后台每 30 分钟自动重试）"
+			return res, newAccess, newRefresh
 		}
 		res.Phase = "pending"
 		res.Msg = "活动尚未下发（Qoder 每天 10:00 后陆续放出；后台每 30 分钟自动重试）"
@@ -497,77 +546,165 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 	return res, newAccess, newRefresh
 }
 
-// QoderCheckinStatus 只查询当前账号的签到状态（不领取）。phase：
-// claimed（今日已领）/ claimable（今日可领）/ pending（无活动）/ login_required / error。
+// QoderCheckinStatus 查询当前账号的签到状态（不领取）。phase：
+// claimed（今日已领）/ claimable（今日可领）/ pending（活动未下发或只有陈旧活动）/
+// login_required / error。
+//
+// 与签到路径同一套判定（qoderClassifyCampaigns）：只有「今天下发的活动」CLAIMED
+// 才算已签，昨天的陈旧活动一律报 pending。过期 token 先续期再查（国际服对过期
+// token 返回 200 + 空列表，不刷新会永远"暂无活动"）。
 func QoderCheckinStatus() *QoderCheckinResult {
 	auth, err := ReadQoderAuth()
 	if err != nil {
 		return &QoderCheckinResult{Phase: "login_required", Msg: "未登录或无法读取登录态"}
 	}
-	res := &QoderCheckinResult{Email: auth.User.Email, Name: auth.User.Name, UID: auth.User.ID}
 	dev := qoderDeviceForAccount(auth)
-	res.DeviceOK = dev.MachineToken != "" && dev.MachineID != ""
+	res := qoderScanAuth(auth, dev)
+	if at, rt := res.newAccess, res.newRefresh; at != "" || rt != "" {
+		// 当前登录号：续期结果必须写回客户端登录态。
+		_ = writeBackQoderTokens(auth, at, rt)
+	}
+	return res.result
+}
+
+// QoderScanCurrent 对「当前客户端登录账号」做一次上游核实（只查不领），
+// 续期结果写回客户端登录态。返回给面板直接渲染的 map。
+func QoderScanCurrent() map[string]any {
+	auth, err := ReadQoderAuth()
+	if err != nil {
+		return map[string]any{"phase": "login_required", "msg": "未登录或无法读取登录态"}
+	}
+	oc := qoderScanAuth(auth, qoderDeviceForAccount(auth))
+	if oc.newAccess != "" || oc.newRefresh != "" {
+		_ = writeBackQoderTokens(auth, oc.newAccess, oc.newRefresh)
+	}
+	r := oc.result
+	return map[string]any{
+		"email":     r.Email,
+		"name":      r.Name,
+		"phase":     r.Phase,
+		"msg":       r.Msg,
+		"refreshed": r.Refreshed,
+		"total":     r.Total,
+	}
+}
+
+// qoderScanOutcome 一次「只查不领」的产出：结果 + 续期出的新 token（调用方持久化）。
+type qoderScanOutcome struct {
+	result     *QoderCheckinResult
+	newAccess  string
+	newRefresh string
+}
+
+// qoderScanAuth 用指定登录态做一次「只查不领」的上游核实（多 base + 续期重试）。
+func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
+	out := qoderScanOutcome{result: &QoderCheckinResult{
+		Email: auth.User.Email, Name: auth.User.Name, UID: auth.User.ID,
+	}}
+	if auth == nil || (auth.Token == "" && auth.RefreshToken == "") {
+		out.result.Phase = "login_required"
+		out.result.Msg = "该账号没有可用凭证"
+		return out
+	}
+	if dev == nil {
+		dev = &QoderDevice{}
+	}
+	out.result.DeviceOK = dev.MachineToken != "" && dev.MachineID != ""
+
+	token := auth.Token
+	// 过期先续期（别等 401：国际服对过期 token 返回 200 + 空列表）。
+	if qoderAuthExpired(auth) {
+		if nt, nrt, ok := qoderRefreshToken(auth, qoderOpenAPIBaseList()[0], dev); ok {
+			token = nt
+			out.result.Refreshed = true
+			out.newAccess, out.newRefresh = nt, nrt
+			auth.Token = nt
+		}
+	}
+
 	lastErr := ""
+	authorized := false
+	emptyOK := false
+	var campaigns []QoderCampaign
 	for _, b := range qoderOpenAPIBaseList() {
-		st, raw, err := qoderDo(b, qoderPathCampaigns, http.MethodGet, auth.Token, nil, dev)
+		st, raw, err := qoderDo(b, qoderPathCampaigns, http.MethodGet, token, nil, dev)
 		if err != nil {
 			lastErr = err.Error()
 			continue
 		}
 		if st == http.StatusUnauthorized {
-			lastErr = "401"
+			if nt, nrt, ok := qoderRefreshToken(auth, b, dev); ok {
+				st2, rw2, err2 := qoderDo(b, qoderPathCampaigns, http.MethodGet, nt, nil, dev)
+				if err2 == nil && st2 == http.StatusOK {
+					token = nt
+					out.result.Refreshed = true
+					out.newAccess, out.newRefresh = nt, nrt
+					campaigns = qoderCampaignsOf(rw2)
+					out.result.Base = b
+					authorized = true
+					break
+				}
+			}
+			lastErr = "401 @ " + b
 			continue
 		}
 		if st != http.StatusOK {
-			res.Phase = "error"
-			res.Msg = fmt.Sprintf("查询活动失败 HTTP %d", st)
-			return res
+			out.result.Phase = "error"
+			out.result.Msg = fmt.Sprintf("查询活动失败 HTTP %d: %s", st, truncateStr(string(raw), 120))
+			return out
 		}
-		res.Base = b
-		var top qoderCampaignsData
-		if json.Unmarshal(raw, &top) != nil || len(top.Campaigns) == 0 {
-			var wrap struct {
-				Data qoderCampaignsData `json:"data"`
-			}
-			if json.Unmarshal(raw, &wrap) == nil {
-				top = wrap.Data
-			}
+		// 200：空列表也接受（可能领完即删 / 未下发），但要继续试下一个 base 是否有货。
+		cs := qoderCampaignsOf(raw)
+		if len(cs) > 0 {
+			campaigns = cs
+			out.result.Base = b
+			authorized = true
+			break
 		}
-		res.Total = len(top.Campaigns)
-		claimable, claimed := 0, 0
-		for _, c := range top.Campaigns {
-			if c.ActionType != qoderClaimAction {
-				continue
-			}
-			switch c.ClaimStatus {
-			case "CLAIMABLE":
-				claimable++
-				if c.Benefit.Amount > 0 {
-					res.Credits = c.Benefit.Amount
-				}
-			case "CLAIMED":
-				claimed++
-				if res.Credits == 0 && c.Benefit.Amount > 0 {
-					res.Credits = c.Benefit.Amount
-				}
-			}
+		if !emptyOK {
+			out.result.Base = b
+			emptyOK = true
 		}
-		switch {
-		case claimable > 0:
-			res.Phase = "claimable"
-			res.Msg = "今日可领取"
-		case claimed > 0:
-			res.Phase = "claimed"
-			res.Msg = "今日已领取"
-		default:
-			res.Phase = "pending"
-			res.Msg = "暂无签到活动"
-		}
-		return res
 	}
-	res.Phase = "login_required"
-	res.Msg = "token 无效或无法连接（" + lastErr + "）"
-	return res
+	if !authorized && emptyOK {
+		authorized = true
+	}
+	if !authorized {
+		out.result.Phase = "login_required"
+		if lastErr == "" {
+			lastErr = "无可用的 openapi base"
+		}
+		out.result.Msg = "token 无效或无法连接（" + lastErr + "）"
+		return out
+	}
+
+	out.result.Total = len(campaigns)
+	claimable, claimedToday, staleClaimed := qoderClassifyCampaigns(campaigns)
+	switch {
+	case len(claimable) > 0:
+		out.result.Phase = "claimable"
+		out.result.Msg = "今日可领取"
+		for _, c := range claimable {
+			if c.Benefit.Amount > 0 {
+				out.result.Credits = c.Benefit.Amount
+				break
+			}
+		}
+	case claimedToday != nil:
+		out.result.Phase = "claimed"
+		out.result.Msg = "今日已领取"
+		if claimedToday.Benefit.Amount > 0 {
+			out.result.Credits = claimedToday.Benefit.Amount
+		}
+	case staleClaimed != nil:
+		// 只有昨天的已领活动：今天的还没下发。这不是「已签」。
+		out.result.Phase = "pending"
+		out.result.Msg = "今日签到活动尚未下发（Qoder 每天 10:00 后刷新）"
+	default:
+		out.result.Phase = "pending"
+		out.result.Msg = "未观察到每日签到活动（已领完即删或尚未下发）"
+	}
+	return out
 }
 
 // parseClaimResult 解析 claim 响应，判断是否 CLAIMED。
@@ -838,35 +975,22 @@ func qoderCampaignsOf(raw []byte) []QoderCampaign {
 	return nil
 }
 
-// qoderDeviceForAccount 为每个账号派生出**独立且稳定**的设备标识。
+// qoderDeviceForAccount 返回**本机真实设备指纹**。
 //
-// 为什么必须这样做：Qoder 的活动判定是按设备（Cosy-MachineId）维度的。
-// 号池里所有账号如果共用客户端那台设备的指纹，第一个号领完之后，
-// 服务端会认为「这台设备今天已领」，其余账号直接返回空列表（showCampaign=false），
-// 表现就是"第二个号提示已签过 / 识别不到签到任务"。
+// 2026-10-24 实测修正：此前为多号同签给每个账号派生「合成 MachineId + 不发
+// MachineToken」，结果服务端**只对真实设备指纹下发每日签到活动**（合成设备
+// 的活动列表永远没有 CLAIM_BENEFIT，表现为"扫描不到签到活动"）。用真实
+// runtime-info 指纹（machineToken/machineCode/machineId 三件套）后活动正常
+// 出现并可领取（+100 Credits 实测到账）。
 //
-// 这里用账号自身 id 派生一个确定性 UUID（同一账号永远同一值），并清空
-// MachineToken / MachineCode（它们绑定真实物理设备，留着会串回设备维度）。
+// 代价：每台物理设备每日只能领一个账号（第一个领取后，同设备其他账号的
+// 签到活动被服务端隐藏，claimable=false）——这是服务端硬规则，扫描结果里
+// 会如实说明。
 func qoderDeviceForAccount(auth *QoderAuth) *QoderDevice {
-	base := QoderDeviceInfo()
-	if base == nil {
-		base = &QoderDevice{}
+	dev := QoderDeviceInfo()
+	if dev == nil {
+		dev = &QoderDevice{}
 	}
-	key := ""
-	if auth != nil {
-		key = strings.TrimSpace(auth.User.ID)
-		if key == "" {
-			key = strings.TrimSpace(auth.User.Email)
-		}
-	}
-	if key == "" {
-		return base
-	}
-	sum := sha1.Sum([]byte("qoder-account-device:" + key))
-	h := hex.EncodeToString(sum[:16])
-	machineID := h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
-	dev := *base
-	dev.MachineID = machineID
-	dev.Synthetic = true // 保留 MachineToken 仅用于 DeviceOK 判断，Apply 时不会发送
-	return &dev
+	dev.Synthetic = false
+	return dev
 }

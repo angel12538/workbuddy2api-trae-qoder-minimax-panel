@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -383,6 +384,27 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if expertType != "" {
 		body["expert_type"] = expertType
 	}
+	return c.marketExpertQuery(a, body)
+}
+
+// MarketExpertSearch 按关键词搜索专家市场（成长任务「体验「XXX专家」」用：
+// 任务只给名字，expert_id 必须靠真实市场搜索拿，编造 id 不计数）。
+// keyword 参数已实测有效（/portal/operation-platform/market/expert/list，
+// 2026-10-24：搜「中国电商运营专家」返回精确同名专家）。
+func (c *Client) MarketExpertSearch(a *auth.Auth, keyword string) ([]MarketExpert, error) {
+	if strings.TrimSpace(keyword) == "" {
+		return nil, fmt.Errorf("搜索关键词为空")
+	}
+	body := map[string]any{
+		"page": 1, "page_size": 20,
+		"sort_by": "reco_rank", "sort_order": "desc",
+		"keyword": strings.TrimSpace(keyword),
+	}
+	return c.marketExpertQuery(a, body)
+}
+
+// marketExpertQuery 专家市场查询的公共实现（list 与 search 共用端点）。
+func (c *Client) marketExpertQuery(a *auth.Auth, body map[string]any) ([]MarketExpert, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err

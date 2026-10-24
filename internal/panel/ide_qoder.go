@@ -16,6 +16,7 @@ package panel
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
@@ -184,17 +185,69 @@ func btoi(b bool) int {
 	return 0
 }
 
-// qoderCheckinStatus 当前账号的上游签到状态 + 号池各账号的本地签到记录。
-// 号池状态只读本地日志，不打上游（进页面不该发 N 个请求）。
+// qoderCheckinStatus 号池各账号的签到状态。
+//
+// v2 起逐账号向**上游**核实（并发 2，只查不领、token 过期自动续期写回号池），
+// 不再只读本地记录 —— 用户扫出来的「已签」必须是上游确认过的，而不是面板自己
+// 记的一笔账（此前 09:00 的假已签能一直挂到中午）。当前登录账号的实时状态放在
+// current 字段，号池为空时前端用。
 func (p *Panel) qoderCheckinStatus(w http.ResponseWriter, r *http.Request) {
-	res := ideauth.QoderCheckinStatus()
-	res.CheckedInToday = ideauth.CheckedInToday("qoder", res.Email) || res.Phase == "claimed"
+	results := ideauth.QoderPoolScan(nil)
+	claimed, claimable, pending, bad := 0, 0, 0, 0
+	for _, it := range results {
+		switch it.Phase {
+		case "claimed":
+			claimed++
+		case "claimable":
+			claimable++
+		case "pending":
+			pending++
+		default:
+			bad++
+		}
+	}
+	// 当前登录账号（客户端登录态）的实时状态：供「号池为空但本机已登录」的展示。
+	cur := map[string]any{}
+	if a, err := ideauth.ReadQoderAuth(); err == nil && a.User.Email != "" {
+		oc := ideauth.QoderScanCurrent()
+		oc["checked_in_today"] = ideauth.CheckedInToday("qoder", a.User.Email) ||
+			oc["phase"] == "claimed"
+		cur = oc
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"email":            res.Email,
-		"phase":            res.Phase,
-		"msg":              res.Msg,
-		"checked_in_today": res.CheckedInToday,
-		"results":          ideauth.QoderPoolStatuses(),
+		"results":          results,
+		"claimed":          claimed,
+		"claimable":        claimable,
+		"pending":          pending,
+		"bad":              bad,
+		"current":          cur,
+		"checked_in_today": bad == 0 && claimable == 0,
+	})
+}
+
+// qoderCheckinSwitched 切号逐号签到：轮流把客户端切到号池每个账号、按当前
+// 登录签到，完成后恢复原登录。每日签到活动只对客户端登录过的账号下发（浏览器
+// 登录的号扫不到），且每台设备每日限领一个号——切号是让每个号都有资格签的方式。
+// 耗时约 N×40 秒（每号一次客户端重启）。
+func (p *Panel) qoderCheckinSwitched(w http.ResponseWriter, r *http.Request) {
+	results := ideauth.QoderSwitchedCheckinAll(func(s string) {
+		log.Printf("panel: [切号签到] %s", s)
+	})
+	claimed, already, failed := 0, 0, 0
+	for _, it := range results {
+		switch it.Phase {
+		case "claimed":
+			claimed++
+		case "already":
+			already++
+		case "error":
+			failed++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "results": results,
+		"claimed_accounts": claimed, "already_accounts": already, "failed_accounts": failed,
+		"msg": fmt.Sprintf("切号签到完成：成功 %d · 已领 %d · 失败 %d", claimed, already, failed),
 	})
 }
 

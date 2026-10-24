@@ -34,7 +34,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.3-panel"
+const appVersion = "1.14.0-panel"
 
 // traeRateRange 汇总 Trae 目录的消耗倍率区间（启动日志用）。
 func traeRateRange(ms []traechat.ModelInfo) string {
@@ -406,15 +406,18 @@ func Run() {
 	// Trae 令牌自动续期：JWT 只有 8 小时，靠它定期换新，实现「长期免登录」。
 	pn.StartTraeAutoRefresh(ctx)
 
-	// IDE 号池（Qoder / WorkBuddy / MiniMax）每日自动签到。
+	// IDE 号池（Qoder / WorkBuddy / MiniMax / 豆包）每日自动签到。
 	// 此前这三个平台只有面板「一键签到」的手动入口，没有任何自动排程 ——
 	// 「每天一签到」对它们并不成立，只能靠人记得打开面板。
 	if cfg.Schedule.IDECheckinEnabled {
-		log.Printf("IDE 号池自动签到已启用：Qoder / WorkBuddy / MiniMax，%v 点", cfg.Schedule.IDECheckinHours)
+		log.Printf("IDE 号池自动签到已启用：Qoder / WorkBuddy / MiniMax / 豆包，%v 点", cfg.Schedule.IDECheckinHours)
 		pn.StartIDECheckinAuto(ctx, cfg.Schedule.IDECheckinHours)
 	} else {
 		log.Printf("IDE 号池自动签到已禁用（schedule.ide_checkin_enabled=false）")
 	}
+	// MiniMax 凭证自动续期：access token 只有 1 小时，refresh token 每刷必轮换，
+	// 号池副本不续就死。每 30 分钟巡检临期账号，与客户端共享同一条 RT 链。
+	pn.StartMinimaxRenewAuto(ctx)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，

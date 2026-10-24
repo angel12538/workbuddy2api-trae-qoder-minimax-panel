@@ -31,6 +31,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -206,10 +207,27 @@ var autoActions = []autoAction{
 }
 
 // autoActionFor 查任务对应的动作；无则返回 nil（不可自动化）。
+//
+// v2：成长任务会随活动**动态下发**「体验「XXX专家」」类任务（task_code 形如
+// expert_use_maidehao / expert_use_douyinyin，每次活动一批）。这些任务与已验证的
+// expert_5 同构（搜索市场 → 召唤 → 真实对话 → 使用事件），只是专家不同 ——
+// 静态表没法枚举，这里对 `expert_use_` 前缀返回一个通用动作（按任务标题里的
+// 专家名搜市场），否则它们会全部落进「需手动」桶（实测一天下发 9 个，
+// 用户看到的任务中心全是要手动的）。
 func autoActionFor(code string) *autoAction {
+	code = strings.TrimSpace(code)
 	for i := range autoActions {
-		if autoActions[i].TaskCode == strings.TrimSpace(code) {
+		if autoActions[i].TaskCode == code {
 			return &autoActions[i]
+		}
+	}
+	if strings.HasPrefix(code, "expert_use_") || code == "WorkBuddy_Valorant" {
+		return &autoAction{
+			TaskCode: code,
+			Desc:     "召唤指定专家 + 真实对话 + 使用链（lighthouse 判据口径；专家 id 取自任务 jump_url / 参数表）",
+			run: func(p *Panel, a *auth.Auth) (string, error) {
+				return runExpertUseNamed(p, a, code)
+			},
 		}
 	}
 	return nil
@@ -1212,22 +1230,7 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 		if ok >= count {
 			break
 		}
-		// 召唤链（web_element_click + summon_click + summoned）。
-		summonEvents := upstream.DesktopExpertSummonSequence(e)
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, summonEvents...); err != nil {
-			fail++
-			continue
-		}
-		// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
-		conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
-		if cerr != nil {
-			fail++
-			continue
-		}
-		// 使用事件（JOIN 服务端 requestId）+ chat 链。
-		events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
-			upstream.DesktopExpertActualUseEvent(e, conv, req))
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		if err := runExpertSingle(p, a, e, ""); err != nil {
 			fail++
 			continue
 		}
@@ -1247,7 +1250,191 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 	return fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType), nil
 }
 
-// ---------------------------------------------------------------------------
+// runExpertSingle 对单个真实专家执行「[搜索行为] → 召唤链 → 真实 chat（服务端
+// requestId）→ 使用事件」。expert_5 / Expert_team_use_3 复用无搜索形态；
+// expert_use_*（「在专家页搜索并召唤「XXX」」）带搜索行为事件 —— 任务判据含
+// 搜索动作，缺搜索直接召唤实测不点亮（2026-10-24）。
+func runExpertSingle(p *Panel, a *auth.Auth, e upstream.MarketExpert, searchKeyword string) error {
+	events := make([]upstream.DesktopEvent, 0, 8)
+	if searchKeyword != "" {
+		// 搜索行为：进搜索框 → 输入关键词（expert_search）→ 点结果。
+		// 事件形状按本文件既有约定（web_element_click + 自定义 eventCode）；
+		// 上游对未知 eventCode 静默忽略，多报无害。
+		events = append(events,
+			upstream.DesktopEvent{
+				"eventCode": "web_element_click", "source": "expert_market", "type": "expert-all",
+				"elementId": "expert_search_input_click", "elementName": "搜索专家",
+				"pageURL": "/C:/Program%20Files/WorkBuddy/resources/app.asar/renderer/index.html",
+			},
+			upstream.DesktopEvent{
+				"eventCode": "expert_search", "keyword": searchKeyword, "source": "expert_market",
+				"type": "expert-all",
+			},
+			upstream.DesktopEvent{
+				"eventCode": "web_element_click", "source": "summon_keyword", "type": "expert-all",
+				"elementId": "expert_search_result_click", "elementName": e.DisplayNameZH,
+				"pageURL": "/C:/Program%20Files/WorkBuddy/resources/app.asar/renderer/index.html",
+			},
+		)
+	}
+	// 召唤链（web_element_click + summon_click + summoned）。
+	events = append(events, upstream.DesktopExpertSummonSequence(e)...)
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return err
+	}
+	// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
+	conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if cerr != nil {
+		return cerr
+	}
+	// 使用事件（JOIN 服务端 requestId）+ chat 链。
+	useEvents := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
+		upstream.DesktopExpertActualUseEvent(e, conv, req))
+	return p.cfg.Upstream.ReportDesktopEvent(a, useEvents...)
+}
+
+// expertNameRe 从任务标题/描述里取「」中的专家名（体验「中国电商运营专家」）。
+var expertNameRe = regexp.MustCompile("[「「]([^」」]{2,30})[」」]")
+
+// expertIDRe 从任务 jump_url 解析专家 id（PC deeplink `experts?expertId=ex_…`、
+// 小程序 `expert-center/detail?id=ex_…`）。
+var expertIDRe = regexp.MustCompile(`[?&]id=?(ex_[A-Za-z0-9]+)`)
+
+// expertExperienceTasks 「在专家页搜索并召唤「X」，完成一次对话」类活动的参数表。
+//
+// 关键认知：这类任务的专家有**昵称与职业名两个字段**——DisplayNameZH 是昵称
+// （卖得好 / 斗音音 / 播旺旺），ProfessionZH 才是任务标题里的职业名（中国电商
+// 运营专家 / 抖音策略师…）。判据事件里 name=昵称、expertTitle=职业名，两者都
+// 参与服务端校验，不能互换。按标题精确搜市场会命中「名字恰好等于职业名」的
+// 另一个专家（实测 ex_v0rBWPIPsDYl），用它点亮不了任务。
+//
+// 新活动出现时：优先从任务 jump_url 解析 expertId（通用路径），解析不到再在此
+// 登记静态参数。
+var expertExperienceTasks = map[string]upstream.MarketExpert{
+	"expert_use_maidehao": {
+		ExpertID: "ex_GDl31WahyIH0", ExpertType: "agent",
+		DisplayNameZH: "卖得好", ProfessionZH: "中国电商运营专家", Version: "1.0.1",
+	},
+	"expert_use_douyinyin": {
+		ExpertID: "ex_FbY5nlWTqDod", ExpertType: "agent",
+		DisplayNameZH: "斗音音", ProfessionZH: "抖音策略师", Version: "1.0.2",
+	},
+	"expert_use_shangjia_xuanchuan": {
+		ExpertID: "ex_Weo3x2EZuSDm", ExpertType: "agent",
+		DisplayNameZH: "商家宣传设计师", ProfessionZH: "商家宣传页与海报设计师", Version: "1.6.0",
+	},
+	"expert_use_bowangwang": {
+		ExpertID: "ex_WZY136wV5aMt", ExpertType: "agent",
+		DisplayNameZH: "播旺旺", ProfessionZH: "直播电商教练", Version: "1.0.2",
+	},
+	"WorkBuddy_Valorant": {
+		ExpertID: "ex_xQHHD1u5Jkua", ExpertType: "agent",
+		DisplayNameZH: "无畏契约拼豆专家", ProfessionZH: "无畏契约拼豆专家", Version: "1.2.1",
+	},
+}
+
+// runExpertUseNamed 完成「体验「XXX专家」」类任务（expert_use_* 与
+// WorkBuddy_Valorant 同判据）：
+//
+//	专家定位：任务 jump_url 的 expertId 优先 → 参数表 → 市场搜索按职业名匹配；
+//	判据链（lighthouse 口径，2026-10-24 实测口径）：召唤链 → 真实对话（服务端
+//	requestId）→ chat 链 agent_task_created 带 has_expert/expert_id →
+//	expert_actual_use(mode=LOCAL, type 空, cost 0)。
+func runExpertUseNamed(p *Panel, a *auth.Auth, code string) (string, error) {
+	t, err := p.taskByCode(a, code)
+	if err != nil {
+		return "", err
+	}
+	if t == nil {
+		return "", fmt.Errorf("该账号没有任务 %s", code)
+	}
+	// 1) 专家参数：jump_url 解析 → 静态表 → 标题职业名搜索（兜底）。
+	e, ok := expertExperienceTasks[code]
+	if !ok {
+		if m := expertIDRe.FindStringSubmatch(t.JumpURL); len(m) > 1 {
+			e = upstream.MarketExpert{ExpertID: m[1], ExpertType: "agent"}
+		}
+	}
+	name := e.ProfessionZH
+	if name == "" {
+		for _, src := range []string{t.Title, t.Description, t.TaskDesc} {
+			if m := expertNameRe.FindStringSubmatch(src); len(m) > 1 {
+				name = strings.TrimSpace(m[1])
+				break
+			}
+		}
+	}
+	if e.ExpertID == "" {
+		if name == "" {
+			return "", fmt.Errorf("任务 %s 无法定位专家（jump_url=%q，title=%q）", code, t.JumpURL, t.Title)
+		}
+		// 兜底：按职业名搜市场。优先精确同名，其次第一条。
+		experts, serr := p.cfg.Upstream.MarketExpertSearch(a, name)
+		if serr != nil || len(experts) == 0 {
+			return fmt.Sprintf("专家市场搜不到 %q（可能已下架），跳过；下次扫描再试", name), nil
+		}
+		e = experts[0]
+		for _, x := range experts {
+			if strings.EqualFold(x.DisplayNameZH, name) {
+				e = x
+				break
+			}
+		}
+	} else if name != "" {
+		// 参数表/解析出的 id 用市场条目校正 version 等服务端权威字段。
+		if list, serr := p.cfg.Upstream.MarketExpertSearch(a, name); serr == nil {
+			for _, m := range list {
+				if m.ExpertID == e.ExpertID {
+					e = m
+					break
+				}
+			}
+		}
+	}
+	if e.ExpertType == "" {
+		e.ExpertType = "agent"
+	}
+	// 2) 前置报名：上游对 not_accepted 的任务不计数（单任务路径必须自带）。
+	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
+		if aerr := p.cfg.Upstream.AcceptTasks(a, []string{code}); aerr != nil {
+			log.Printf("autotask %s %s: accept: %v（继续走行为链路）", logfmt.Label(a.UID, a.Nickname), code, aerr)
+		}
+		time.Sleep(reportGap)
+	}
+	// 3) 判据链（lighthouse 口径）。
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+		return "", fmt.Errorf("召唤链: %w", err)
+	}
+	conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if cerr != nil {
+		return "", fmt.Errorf("真实对话: %w", cerr)
+	}
+	msgID := "msg-" + req
+	if len(req) > 8 {
+		msgID = "msg-" + req[len(req)-8:]
+	}
+	events := upstream.DesktopChatSequence(conv, req, msgID, "fast-model", "fast-model")
+	for _, ev := range events {
+		if ev["eventCode"] == "agent_task_created" {
+			ev["has_expert"] = true
+			ev["expert_id"] = e.ExpertID
+			ev["expert_name"] = e.DisplayNameZH
+			ev["expert_industry_id"] = ""
+		}
+	}
+	events = append(events, upstream.DesktopExpertActualUseLocal(e, conv, req))
+	events[len(events)-1]["type"] = ""
+	events[len(events)-1]["cost"] = 0
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return "", fmt.Errorf("使用事件: %w", err)
+	}
+	label := e.ProfessionZH
+	if label == "" {
+		label = e.DisplayNameZH
+	}
+	return fmt.Sprintf("已上报「%s」（%s）召唤+真实对话+使用链", label, e.ExpertID), nil
+}
+
 // 全量自动完成
 // ---------------------------------------------------------------------------
 

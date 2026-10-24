@@ -57,6 +57,15 @@ var clientApps = map[string]clientApp{
 			`%LOCALAPPDATA%\Programs\WorkBuddyAI\WorkBuddyAI.exe`,
 		},
 	},
+	// 豆包桌面客户端（Chromium 壳，Cookie 凭据在 %LOCALAPPDATA%\Doubao）。
+	// 提取 Cookie 时库文件被独占锁定，必须先结束客户端。
+	"doubao": {
+		Key:        "doubao",
+		ImageNames: []string{"Doubao.exe"},
+		ExeGlobs: []string{
+			`%LOCALAPPDATA%\Doubao\Application\Doubao.exe`,
+		},
+	},
 }
 
 // WorkBuddyClientKey 返回某版本 WorkBuddy 对应的客户端进程控制键。
@@ -70,7 +79,37 @@ func WorkBuddyClientKey(edition string) string {
 }
 
 func expandEnvPath(p string) string {
-	return os.ExpandEnv(p)
+	// Windows 的 %VAR% 语法 os.ExpandEnv 不认（它只处理 $VAR / ${VAR}），导致
+	// clientApps 里所有 %LOCALAPPDATA%\... 形态的候选路径全部落空 → 掉进
+	// discoverClientExe 的全盘兜底扫描（实测在豆包 LaunchClient 上卡死数分钟）。
+	// 这里先把 %VAR% 展开成真实路径，再交给 os.ExpandEnv 兼容 $VAR 写法。
+	out := percentExpand(p)
+	return os.ExpandEnv(out)
+}
+
+// percentExpand 展开 Windows 风格的 %VAR% 环境变量引用（不认识的 % 段原样保留）。
+func percentExpand(s string) string {
+	var b strings.Builder
+	for {
+		i := strings.IndexByte(s, '%')
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		j := strings.IndexByte(s[i+1:], '%')
+		if j < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		name := s[i+1 : i+1+j]
+		b.WriteString(s[:i])
+		if v, ok := os.LookupEnv(name); ok && name != "" {
+			b.WriteString(v)
+		} else {
+			b.WriteString("%" + name + "%") // 未定义变量原样保留（与 cmd 语义一致）
+		}
+		s = s[i+1+j+1:]
+	}
 }
 
 // findClientExe 在候选路径里找第一个存在的可执行文件。
@@ -128,6 +167,15 @@ func clientRunning(app clientApp) bool {
 		}
 	}
 	return false
+}
+
+// ClientRunning 报告客户端是否有进程在运行（豆包提取 Cookie 前后判断用）。
+func ClientRunning(key string) bool {
+	app, ok := clientApps[key]
+	if !ok {
+		return false
+	}
+	return clientRunning(app)
 }
 
 // KillClient 结束客户端进程（best-effort）。返回给用户看的描述。

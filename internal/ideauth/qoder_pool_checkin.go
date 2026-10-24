@@ -3,6 +3,8 @@ package ideauth
 import (
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // 号池多账号签到。
@@ -76,9 +78,9 @@ func QoderCheckinPool(emails []string) (*QoderCheckinPoolResult, error) {
 			changed = true
 		}
 		// 上游「领完即删」：今天已经领过的账号，activities 会变成空列表，
-		// 上游报 pending。此时用本地签到记录兜底，否则面板永远显示"可签到"、
-		// 点了却什么都不发生（用户看到的就是"签不了"）。
-		if res.Phase == "pending" && CheckedInToday("qoder", res.Email) {
+		// 上游报 pending。此时用**可信的**本地签到记录兜底（10:05 前写入的记录
+		// 是旧版误报，不能用来把 pending 翻成 already），否则面板永远显示"可签到"。
+		if res.Phase == "pending" && CheckinRecordTrusted("qoder", res.Email) {
 			res.Phase = "already"
 			res.Msg = "今日已领取（本地记录）"
 			res.CheckedInToday = true
@@ -128,13 +130,152 @@ func QoderPoolStatuses() []map[string]any {
 		if email == "" {
 			continue
 		}
-		out = append(out, map[string]any{
+		row := map[string]any{
 			"email":            email,
 			"name":             snap.Name,
 			"user_id":          snap.UserID,
 			"checked_in_today": CheckedInToday("qoder", email),
-		})
+		}
+		if t, ok := CheckedInAt("qoder", email); ok {
+			row["checked_in_at"] = t.Format(time.RFC3339)
+		}
+		out = append(out, row)
 	}
+	return out
+}
+
+// UsedDeviceQuotaToday 报告本机今天是否已有**其他**账号写入了可信的 Qoder
+// 签到记录（每设备每日限领一次；用于向被隐藏活动的账号解释原因）。
+func UsedDeviceQuotaToday(excludeEmail string) bool {
+	today := time.Now().Format("2006-01-02")
+	for email := range CheckinDates("qoder") {
+		if strings.EqualFold(email, strings.TrimSpace(excludeEmail)) {
+			continue
+		}
+		if CheckedInToday("qoder", email) && CheckinRecordTrusted("qoder", email) {
+			_ = today
+			return true
+		}
+	}
+	return false
+}
+
+// QoderScanAccount 号池单账号的上游核实结果。
+type QoderScanAccount struct {
+	Email          string `json:"email"`
+	Name           string `json:"name,omitempty"`
+	UID            string `json:"user_id,omitempty"`
+	Phase          string `json:"phase"` // claimed / claimable / pending / login_required / error
+	Msg            string `json:"msg,omitempty"`
+	CheckedInLocal bool   `json:"checked_in_local"`
+	CheckedInAt    string `json:"checked_in_at,omitempty"`
+	Refreshed      bool   `json:"refreshed,omitempty"`
+}
+
+// QoderPoolScan 逐账号向**上游**核实签到状态（并发 2，只查不领）。
+//
+// 为什么必须有这一步：此前「扫描」只读本地记录，用户永远无法确认面板说的「已签」
+// 是不是真的（实测 09:00 的假已签一直挂到中午才被发现）。现在扫描直接问上游：
+// claimable = 可领、claimed = 今天真领过、pending = 活动未下发（含只有昨天陈旧
+// 活动的情形）。上游不可达时回落本地记录并在 msg 里说明。
+func QoderPoolScan(emails []string) []QoderScanAccount {
+	pool, err := LoadQoderPool()
+	if err != nil {
+		return nil
+	}
+	want := make(map[string]bool, len(emails))
+	for _, e := range emails {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			want[e] = true
+		}
+	}
+	type job struct {
+		snap *QoderSnapshot
+	}
+	var jobs []job
+	for _, snap := range pool.Accounts {
+		if snap == nil || snap.Auth == nil {
+			continue
+		}
+		email := strings.TrimSpace(snap.Email)
+		if email == "" {
+			email = snap.Auth.User.Email
+		}
+		if len(want) > 0 && !want[strings.ToLower(email)] {
+			continue
+		}
+		jobs = append(jobs, job{snap: snap})
+	}
+	out := make([]QoderScanAccount, len(jobs))
+	sem := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	for i, j := range jobs {
+		wg.Add(1)
+		go func(i int, j job) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			snap := j.snap
+			email := strings.TrimSpace(snap.Email)
+			if email == "" {
+				email = snap.Auth.User.Email
+			}
+			row := QoderScanAccount{
+				Email:          email,
+				Name:           snap.Name,
+				UID:            snap.UserID,
+				CheckedInLocal: CheckedInToday("qoder", email),
+			}
+			if t, ok := CheckedInAt("qoder", email); ok {
+				row.CheckedInAt = t.Format(time.RFC3339)
+			}
+		auth := cloneQoderAuth(snap.Auth)
+		oc := qoderScanAuth(auth, qoderDeviceForAccount(auth))
+		res := oc.result
+		// 续期出的新 token 写回号池（绝不写客户端登录态）。
+		if oc.newAccess != "" || oc.newRefresh != "" {
+			if oc.newAccess != "" {
+				snap.Auth.Token = oc.newAccess
+			}
+			if oc.newRefresh != "" {
+				snap.Auth.RefreshToken = oc.newRefresh
+			}
+			_ = SaveQoderPool(pool)
+			row.Refreshed = true
+		}
+		row.Phase = res.Phase
+		row.Msg = res.Msg
+		// 本地记录的可信判定：10:05 前写入的今日记录是旧版误报（把昨天的陈旧
+		// 已领活动当成了今天的），一律忽略并明确提示。
+		trusted := CheckinRecordTrusted("qoder", email)
+		if row.CheckedInLocal && !trusted {
+			row.CheckedInLocal = false
+			row.Msg = strings.TrimSpace(row.Msg + "；本地存在 10:05 前的可疑签到记录（旧版误报），已忽略，以上游为准")
+		}
+		// 上游报 pending（未观察到今日活动）而本地确有可信记录：以本地记录为准
+		// 显示已签（活动可能领完即删）；本地也没有 → 如实显示未下发。
+		if res.Phase == "pending" && trusted {
+			row.Msg = "今日已领取（本地记录 " + row.CheckedInAt + "；上游活动列表未见今日活动）"
+		}
+		if res.Phase == "login_required" || res.Phase == "error" {
+			// 上游核实失败：回落本地记录，扫描不至于整行变红。
+			if trusted {
+				row.Phase = "pending"
+				row.Msg = "上游核实失败（" + res.Msg + "）；本地记录今日已签 " + row.CheckedInAt
+			}
+		}
+		// 设备名额：每台设备每日限领一个账号（服务端规则，2026-10-24 实测：
+		// 第一个号领取后，同设备其余账号的签到活动被隐藏）。本机今天已有其他
+		// 账号可信领取记录、而本账号看不到签到活动时，如实说明而不是笼统的
+		// "活动未下发"。
+		if res.Phase == "pending" && !trusted && UsedDeviceQuotaToday(email) {
+			row.Msg = "本设备今日签到名额已被其他账号使用（每设备每日限领一次，服务端规则）"
+		}
+		out[i] = row
+		}(i, j)
+	}
+	wg.Wait()
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Email < out[j].Email })
 	return out
 }
 

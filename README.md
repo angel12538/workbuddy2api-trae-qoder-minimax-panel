@@ -16,11 +16,12 @@
 > | **CodeBuddy / WorkBuddy 国内版** | 主号池（`auths/*.json`） | 聊天网关、签到、余额、成长任务一键完成、模型与档位 |
 > | **WorkBuddy 国际版** | 主号池（`realm=global`） | 同上（国际版无签到 / 成长体系） |
 > | **Trae** | IDE 账号池 | 账号管理、切号、签到、积分、客户端提取令牌 |
-> | **Qoder** | IDE 账号池 | 账号管理、切号、签到、积分、凭证自动续期 |
-> | **MiniMax Code** | 账号池 | 签到、积分、模型通道（`minimax:` 前缀） |
+> | **Qoder** | IDE 账号池 | 账号管理、切号、签到（**每台设备每日限领一个号**）、积分、凭证自动续期 |
+> | **MiniMax Code** | 账号池 | **浏览器登录**（OAuth 设备码 + S256 PKCE，无需本机客户端）、签到、积分、**凭证自动续期**（1h token / 轮换 RT 双向同步客户端）、模型通道（`minimax:` 前缀） |
+> | **豆包（Doubao）** | Cookie 签到池 | 签到（CDP 无头浏览器通道）、多账号、客户端 Cookie 一键提取 / 手动粘贴 |
 >
 > - 面板左侧「**IDE 账号池**」视图统管 Qoder / Trae IDE / WorkBuddy 三套客户端账号（添加、切号、移除、积分、签到）。
-> - 面板「**签到池**」视图的「**一键签到**」一个按钮覆盖 **主号池 + WorkBuddy + Qoder + MiniMax + Trae** 全部平台，并按平台分别统计成功 / 已签 / 失败。
+> - 面板「**签到池**」视图的「**一键签到**」一个按钮覆盖 **主号池 + WorkBuddy + Qoder + MiniMax + Trae + 豆包** 全部平台，并按平台分别统计成功 / 已签 / 失败。
 > - 模型按 **realm 前缀**分流：`cn:`（国服 CodeBuddy）、`global:`（国际版）、`trae:`（Trae 通道）、`minimax:`（MiniMax 通道）—— 同一套 `/v1/chat/completions` 与 `/v1/responses` 端点即可调用全部平台的模型。
 > - 账号凭证（`accessToken` / `refreshToken`）只落在本机 `auths/`、`data/`，**不入库**。
 
@@ -175,6 +176,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
+| **MiniMax 浏览器登录** | OAuth 2.0 设备码（RFC 8628）+ **强制 S256 PKCE**：面板出验证码与授权链接，浏览器登录完自动换 token 入号池并签到；国际版端点与网关基址整体切到 `account.minimax.io` / `agent.minimax.io`（号池按账号记 `region`，续期与签到各走各的域） |
+| **豆包（Doubao）签到池** | 客户端 Cookie 提取 / 手动粘贴两通道，凭据走 CDP 无头浏览器通道打豆包签到接口；实测可真实扫到（返回当天已签与上游签到规则原文） |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
@@ -329,6 +332,25 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 打开 `http://127.0.0.1:7863/panel/`，点右上角「**添加账号**」：面板展示授权链接 → 浏览器完成登录 → 自动检测并落盘凭证 → **热加载进池（无需重启）**，顺带完成首次签到。
 
+弹窗按平台分了六个页签，各平台的加号方式并不相同：
+
+| 页签 | 加号方式 | 说明 |
+|---|---|---|
+| WorkBuddy | OAuth 设备授权（浏览器） | 国内版 / 国际版可切换；授权链接 + 自动轮询 |
+| Trae | **面板自拉浏览器窗口** | 每次全新会话，可反复加号；授权页 OAuth 会在「认证中」卡住，不可用 |
+| Qoder | 捕获本机客户端登录态 | 另有「切号签到」把号池账号轮流切进客户端签到（见下方 FAQ） |
+| MiniMax | **浏览器登录**（设备码）/ 捕获客户端 / 粘贴 Token | 三条通道并列，互不冲突 |
+| 豆包 | 从客户端提取 Cookie / 粘贴 Cookie | 凭据走 CDP 无头浏览器通道 |
+| 导入 JSON | 上传 `auths/` 里的凭证文件 | 批量迁移用 |
+
+> **MiniMax 浏览器登录**走的是标准 OAuth 2.0 设备码流程（RFC 8628）**并强制 S256 PKCE**：面板向 `https://account.minimax.cn/oauth2/device/code` 申请 `device_code`，给出 `user_code`（如 `DPC5-6W4S`）与 `verification_uri_complete`；你在浏览器里登录该账号后，面板轮询 `https://account.minimax.cn/oauth2/token` 换出 `access_token` / `refresh_token` 并直接写入号池。
+>
+> 两个实测约束：① 授权窗口只有 **300 秒**（上游 `expires_in=300`），面板会显示倒计时，超时后重新点「浏览器登录添加账号」即可；② 轮询快于上游给的 `interval`（实测 3 秒）会返回 `slow_down`，面板按服务端返回的间隔调整轮询节奏。
+>
+> 与客户端登录态的关系：设备码授权拿到的是**独立的一根 refresh token 链**，不会把客户端正在用的那根顶掉，因此号池账号可以自己续期，不会把客户端踢下线。
+>
+> 国际版请在弹窗里选「国际版（Global）」——端点与网关基址会整体切到 `account.minimax.io` / `agent.minimax.io`，号池账号会记下 `region`，续期与签到各自走对应域。
+
 **方式 B：命令行脚本（仅 Linux / macOS，依赖 bash + python3）**
 
 ```bash
@@ -387,7 +409,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日本地时区整点夜猫子补足（23:00–08:00 计数窗口） |
 | `schedule.growth_hours` | `[1]` | 每日本地时区整点跑**成长任务队列**（第 6 类排程：扫描待办 → 排队执行 → 自动领奖；01:00 是因为 Sequential 族任务每日零点解锁） |
-| `schedule.ide_checkin_hours` | `[9]` | 每日本地时区整点**自动签到 IDE 号池**（Qoder / WorkBuddy / MiniMax 三个平台逐号签）。与主号池 `checkin_hours` 相互独立；此前这三个平台只有面板「一键签到」的手动入口，没有任何自动排程 |
+| `schedule.ide_checkin_hours` | `[10]` | 每日本地时区整点**自动签到 IDE 号池**（Qoder / WorkBuddy / MiniMax 三个平台逐号签）。与主号池 `checkin_hours` 相互独立；此前这三个平台只有面板「一键签到」的手动入口，没有任何自动排程 |
 | `schedule.ide_checkin_enabled` | `true` | IDE 号池自动签到总开关；`false` = 只保留手动入口 |
 | `schedule.checkin_enabled` | `true` | 签到总开关；`false` 真正关闭 |
 | `schedule.travel_enabled` | `true` | 猫猫旅行总开关（独立于签到） |
@@ -709,6 +731,7 @@ http://127.0.0.1:7863/panel/
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
+| IDE 号池 | `GET ide/qoder/accounts` · `POST ide/qoder/add` · `switch` · `remove` · `checkin` · `checkin_switched` · `renew` · `GET ide/qoder/checkin-status` · `usage` · `device`；`GET ide/minimax/accounts` · `POST ide/minimax/add` · `add_manual` · `remove` · `checkin` · `renew` · **`login/start` · `login/poll`**；`GET ide/doubao/accounts` · `status` · `POST ide/doubao/add_extract` · `add_cookie` · `remove` · `checkin` |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
@@ -899,6 +922,27 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **冷却到上游重置时间**：msg 带「将在 … 重置」时，账号冷却 `until` 精确等于该墙钟（按 UTC+8 解释），并封顶 `soft_rate_max`（默认 2h）
 - **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
 - **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
+
+### Qoder 号池里两个号，为什么只有一个能签到？
+
+这是 **Qoder 服务端的硬规则，不是网关的 bug**：**同一台设备每天只能让一个账号领到每日签到活动**（`CLAIM_BENEFIT`）。第一个领到的账号会在活动列表里看到 `CLAIM_BENEFIT`（`status=CLAIMED`、`amount=100`），同设备的其它账号**看不到这条活动**，因此扫不出可领的签到项。
+
+实测证据（2026-10-24，两号共用本机真实设备指纹打 `GET /sash/api/v1/me/campaigns`）：
+
+| 账号 | campaigns | 内容 |
+|---|---|---|
+| 已在客户端登录并领过的号 | 3 | `CLAIM_BENEFIT(CLAIMED,100)` + 2 条 `VIEW_DETAILS(CLAIMED)` |
+| 另一个号 | 2 | 只有同样的 2 条 `VIEW_DETAILS(CLAIMED)`，**没有 `CLAIM_BENEFIT`** |
+
+注意两号的 `VIEW_DETAILS` 活动 id **完全相同** —— 说明活动流是设备级共享的，`CLAIM_BENEFIT` 被服务端对同设备其它账号隐藏了。
+
+> ⚠️ 一个常见误解：「这个号是浏览器里加的、没在电脑上登录过，所以扫不到活动」。实测不成立：**当前正登录在 Qoder 客户端上的那个号同样看不到 `CLAIM_BENEFIT`**（因为当天名额已被同设备另一个号领走）。真正的限制是**每设备每日一个名额**，与「是否在客户端登录过」无关。
+
+面板的处理方式：
+
+- 面板会如实区分三种状态，不笼统报「活动未下发」：本地有**可信签到记录** → 已签；上游已领 → 已领；**同设备今日名额已被别的号用掉** → 「本设备今日签到名额已被其他账号使用（每设备每日限领一次，服务端规则）」。
+- 想要**每天换一个号**领到那 100 积分，用「**切号签到**」：面板把号池账号轮流切进 Qoder 客户端（写登录态 + 重启），按当前登录签到，完成后恢复原登录。注意当日积分总量仍受「每设备每日一个名额」限制 —— 切号能让每个号轮流**有资格签**，但一天只有先签到的那个号真正拿到积分。
+- 自动排程（`schedule.ide_checkin_enabled`）已内置这条兜底：快路径签不到且本地无当天可信记录的账号，会自动走切号逐签。
 
 ### 多图会话请求体超限怎么办？
 

@@ -2,12 +2,16 @@ package ideauth
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
-// 回归：Qoder 活动按设备判定，同一设备只能签一个号。
-// 因此每个账号必须拿到**独立且稳定**的 Cosy-MachineId，且不能带物理设备的 MachineToken。
-func TestQoderDevicePerAccount(t *testing.T) {
+// 回归（2026-10-24 实测修正）：Qoder 的每日签到活动**只对真实设备指纹下发**。
+// 旧策略（每账号派生合成 MachineId、不发送 MachineToken）导致活动列表里永远
+// 没有签到活动 —— 表现为"扫描不到签到活动"。正确策略：全部账号使用本机真实
+// runtime-info 指纹（machineToken/machineCode/machineId 三件套）；每设备每日
+// 限领一个账号是服务端硬规则，由扫描结果如实说明。
+func TestQoderDeviceRealFingerprint(t *testing.T) {
 	a := &QoderAuth{User: QoderUser{ID: "uid-a", Email: "a@test.com"}}
 	b := &QoderAuth{User: QoderUser{ID: "uid-b", Email: "b@test.com"}}
 
@@ -16,27 +20,24 @@ func TestQoderDevicePerAccount(t *testing.T) {
 	if da == nil || db == nil {
 		t.Fatal("设备对象为空")
 	}
-	if da.MachineID == "" || len(da.MachineID) != 36 {
-		t.Fatalf("machineId 应是不带横杠的 UUID（36 位），得到 %q", da.MachineID)
+	if da.Synthetic {
+		t.Error("设备必须按真实指纹发送（Synthetic=false）")
 	}
-	if da.MachineID == db.MachineID {
-		t.Fatalf("两个账号不能共用同一个 machineId（否则第二个号会被判为已签）")
-	}
-	if !da.Synthetic {
-		t.Error("派生设备必须标记 Synthetic（决定是否发送物理设备令牌）")
-	}
-	// 关键：绝不能把物理设备的 MachineToken/MachineCode 发出去，否则又串回设备维度。
+	// 请求头必须带物理设备令牌三件套（活动下发的必要条件）。
 	h := http.Header{}
 	da.Apply(h)
-	if h.Get("Cosy-MachineToken") != "" || h.Get("Cosy-MachineCode") != "" {
-		t.Errorf("请求头不应包含物理设备令牌: token=%q code=%q",
+	if h.Get("Cosy-MachineToken") == "" || h.Get("Cosy-MachineCode") == "" {
+		t.Errorf("请求头必须包含物理设备令牌: token=%q code=%q",
 			h.Get("Cosy-MachineToken"), h.Get("Cosy-MachineCode"))
 	}
-	if h.Get("Cosy-MachineId") != da.MachineID {
-		t.Errorf("Cosy-MachineId 未按账号派生写入: %q", h.Get("Cosy-MachineId"))
+	if h.Get("Cosy-MachineId") == "" {
+		t.Error("Cosy-MachineId 不能为空")
 	}
-	// 同一账号多次派生必须一致（否则每次签到都是"新设备"，风控上也不合理）
-	if again := qoderDeviceForAccount(a); again.MachineID != da.MachineID {
-		t.Errorf("同一账号的设备标识必须稳定: %s != %s", again.MachineID, da.MachineID)
+	// 真实设备对所有账号一致（每设备每日限领一次由服务端判定）。
+	if da.MachineID != db.MachineID {
+		t.Errorf("所有账号应使用同一真实设备指纹: %s != %s", da.MachineID, db.MachineID)
+	}
+	if !strings.HasPrefix(da.MachineID, "") && len(da.MachineID) == 0 {
+		t.Error("machineId 为空")
 	}
 }

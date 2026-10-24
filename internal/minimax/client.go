@@ -141,6 +141,10 @@ type Model struct {
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+	// Region 区域（cn / global）。决定 OAuth 服务器与签到网关的域：
+	// 国际版账号的 token 只能去 account.minimax.io 续期、agent.minimax.io 签到，
+	// 拿 CN 的客户端去刷国际号会直接 invalid_grant。
+	Region string
 
 	mu       sync.Mutex
 	models   []Model
@@ -151,7 +155,55 @@ type Client struct {
 
 // New 构造客户端（默认国内站，30s 超时由调用方覆盖）。
 func New() *Client {
-	return &Client{BaseURL: DefaultBase, HTTP: &http.Client{Timeout: 120 * time.Second}}
+	return &Client{BaseURL: DefaultBase, HTTP: &http.Client{Timeout: 120 * time.Second}, Region: RegionCN}
+}
+
+// ForRegion 返回指定区域的客户端副本。
+//
+// 不复制原客户端（里面有 sync.Mutex，复制会触发 go vet 的 copylocks），
+// 而是新建一个：模型/签到基址按区切，HTTP 连接池与凭证缓存各自独立。
+// 区域相同直接返回自身，避免每次签到都新建对象。
+func (c *Client) ForRegion(region string) *Client {
+	if c == nil {
+		return nil
+	}
+	r := NormalizeRegion(region)
+	if NormalizeRegion(c.Region) == r {
+		return c
+	}
+	// 自定义基址（测试服务器 / 自建网关）原样保留，只切区域标记 ——
+	// 否则会把指向本机的端点换成官方域名，请求直接打到线上去了。
+	base := c.BaseURL
+	switch base {
+	case agentBaseCN, agentBaseGlobal:
+		base = AgentBase(r)
+	}
+	return &Client{BaseURL: base, HTTP: c.HTTP, Region: r}
+}
+
+// oauthTokenURL 该区域 OAuth 服务器的 token 端点。
+// MINIMAX_OAUTH_URL 是显式覆盖（自建网关 / 国际版），优先于按区推导。
+func (c *Client) oauthTokenURL() string {
+	if v := strings.TrimSpace(os.Getenv("MINIMAX_OAUTH_URL")); v != "" {
+		return v
+	}
+	if c != nil && NormalizeRegion(c.Region) == RegionGlobal {
+		return accountOriginGlobal + deviceTokenPath
+	}
+	return defaultOAuthURL
+}
+
+// RegionFromAuthPath 从 auth.json 路径推断区域。
+// 目录布局：~/.minimax/auth/prod/{cn,global}/{clientId}/auth.json。
+func RegionFromAuthPath(p string) string {
+	s := strings.ReplaceAll(p, "\\", "/")
+	for _, seg := range strings.Split(s, "/") {
+		switch strings.ToLower(seg) {
+		case "global", "en", "intl", "international":
+			return RegionGlobal
+		}
+	}
+	return RegionCN
 }
 
 // credentials 带 30 秒缓存：既避免每请求读盘，又能在客户端续期后及时跟进。
