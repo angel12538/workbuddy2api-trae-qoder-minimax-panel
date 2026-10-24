@@ -387,6 +387,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日本地时区整点夜猫子补足（23:00–08:00 计数窗口） |
 | `schedule.growth_hours` | `[1]` | 每日本地时区整点跑**成长任务队列**（第 6 类排程：扫描待办 → 排队执行 → 自动领奖；01:00 是因为 Sequential 族任务每日零点解锁） |
+| `schedule.ide_checkin_hours` | `[9]` | 每日本地时区整点**自动签到 IDE 号池**（Qoder / WorkBuddy / MiniMax 三个平台逐号签）。与主号池 `checkin_hours` 相互独立；此前这三个平台只有面板「一键签到」的手动入口，没有任何自动排程 |
+| `schedule.ide_checkin_enabled` | `true` | IDE 号池自动签到总开关；`false` = 只保留手动入口 |
 | `schedule.checkin_enabled` | `true` | 签到总开关；`false` 真正关闭 |
 | `schedule.travel_enabled` | `true` | 猫猫旅行总开关（独立于签到） |
 | `schedule.activity_enabled` | `true` | 活跃上报总开关 |
@@ -563,6 +565,8 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
 | 成长任务队列 | `schedule.growth_enabled` | `growth_hours` `[1]` 整点 | 扫描全部账号成长任务待办 → 按账号排队执行（账号内串行，账号间并发 1-3）→ 进度落定后自动领奖；与面板「任务中心」同一套执行器 |
+| IDE 号池签到 | `schedule.ide_checkin_enabled` | `ide_checkin_hours` `[9]` 整点 | **Qoder / WorkBuddy / MiniMax 三个号池逐号签到**（各自用自己的 token，无需切号、无需客户端在线）；单平台失败不影响其它平台 |
+| Trae 签到 | `trae.enabled` | `trae.auto_hours` `[9,21]` 整点 | Trae 账号签到（账号来自 Trae Work 助手的 `checkin_accounts.json`）；`auto_hours` 为空 = 仅手动 |
 
 #### 禁用账号与保号任务（`schedule.include_disabled_in_tasks`）
 

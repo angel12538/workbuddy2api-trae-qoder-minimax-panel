@@ -70,6 +70,12 @@ type Config struct {
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
 		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
+		// IDECheckinHours IDE 号池（Qoder / WorkBuddy / MiniMax）每日自动签到时点。
+		//
+		// 与主号池的 checkin_hours 相互独立：主号池签到走 scheduler，IDE 号池签到
+		// 走 panel 自己的排程（与 Trae 的 trae.auto_hours 同构）。此前 IDE 号池的三个
+		// 平台只能手动点「一键签到」，没有任何自动排程。
+		IDECheckinHours []int `json:"ide_checkin_hours"` // [9]
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -85,6 +91,9 @@ type Config struct {
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
 		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
+		// IDECheckinEnabled IDE 号池（Qoder / WorkBuddy / MiniMax）自动签到总开关。
+		// 缺省 true；false = 只保留面板「一键签到」的手动入口。
+		IDECheckinEnabled bool `json:"ide_checkin_enabled"`
 
 		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
 		// 余额刷新）对**已禁用（disabled）**的账号也执行。
@@ -292,6 +301,7 @@ func Default() *Config {
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
 	c.Schedule.GrowthHours = []int{1}
+	c.Schedule.IDECheckinHours = []int{9}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -300,6 +310,7 @@ func Default() *Config {
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BlackcatEnabled = true
+	c.Schedule.IDECheckinEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Upstream.TimeoutSeconds = 120
@@ -632,6 +643,9 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.GrowthHours) == 0 {
 		c.Schedule.GrowthHours = []int{1}
 	}
+	if len(c.Schedule.IDECheckinHours) == 0 {
+		c.Schedule.IDECheckinHours = []int{9}
+	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
 		if c.Schedule.BalanceRefreshMinutes <= 0 {
@@ -720,7 +734,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
+	if err := checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.ide_checkin_hours", "ide_checkin_enabled", c.Schedule.IDECheckinHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {
@@ -751,6 +768,7 @@ func WriteDistDefault(path string) error {
 	c.Schedule.KeepaliveEnabled = false
 	c.Schedule.BlackcatEnabled = false
 	c.Schedule.GrowthEnabled = false
+	c.Schedule.IDECheckinEnabled = false
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Trae.AutoHours = nil
 	_ = c.normalize()
