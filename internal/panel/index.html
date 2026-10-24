@@ -1517,19 +1517,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addQoderDone" class="state ok" hidden></div>
         <div id="addQoderErr" class="state err" hidden></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnQoderLogin" class="primary">浏览器登录并添加</button>
+          <button id="btnQoderWeb" class="primary">网页登录并添加</button>
+          <button id="btnQoderLogin">客户端浏览器登录</button>
           <button id="btnQoderCapture">添加当前 Qoder 账号</button>
         </div>
         <label class="hint" style="margin-top:10px;display:flex;gap:6px;align-items:flex-start;cursor:pointer">
           <input type="checkbox" id="chkQoderLogout" style="margin-top:2px">
-          <span>先退出当前账号再登录（换另一个号时勾选）—— <b>必须走一次真正的登录</b>：服务端在登录时给账号发"这个人"的身份（scope），面板直接写登录态不会重新签发，两个号就会被算成同一个人、每天只能领一份 100 积分。</span>
+          <span>「客户端浏览器登录」时勾选这一项：先退出当前账号再登录另一个号。服务端在**登录时**给账号发"这个人"的身份（scope），面板直接写登录态不会重新签发，两个号就会被算成同一个人、每天只能领一份 100 积分。</span>
         </label>
+        <div id="addQoderWebBox" hidden style="margin-top:10px">
+          <div class="state"><span class="dots" id="addQoderWebState">已打开浏览器（这个账号的独立会话），请登录要添加的 Qoder 账号…</span></div>
+          <div id="addQoderWebErr" class="state err" hidden style="margin-top:8px"></div>
+        </div>
         <div id="addQoderLoginBox" hidden style="margin-top:10px">
           <div class="state"><span class="dots" id="addQoderLoginState">已启动 Qoder 客户端，请在客户端里点「浏览器登录 / 扫码登录」完成鉴权…</span></div>
           <div id="addQoderLoginErr" class="state err" hidden style="margin-top:8px"></div>
         </div>
         <div class="hint" style="margin-top:10px">
-          Qoder 的可用登录态只存在于桌面客户端（网页版拿不到 IDE 能用的令牌），所以这里的「浏览器登录」= 启动客户端 → 在客户端里用浏览器/扫码完成鉴权 → 面板自动把这个号收进号池。
+          <b>网页登录</b>：每个号一个独立浏览器会话（profile 存在本机），你在浏览器里登录一次即可，之后每天由面板用这份会话自动领取每日 100 积分 —— <b>不需要再登客户端，也不需要每次登网页</b>。<br>
+          <b>客户端浏览器登录</b>：启动 Qoder 客户端，在客户端里用浏览器/扫码完成鉴权，面板自动收录这个号。
         </div>
       </div>
       <!-- MiniMax：浏览器登录（设备码）/ 捕获客户端登录态 / 粘贴 access+refresh token -->

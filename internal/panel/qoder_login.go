@@ -104,34 +104,53 @@ func (p *Panel) qoderLoginStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// qoderLogoutClient 退出客户端当前账号（备份登录态），让客户端回到登录页。
+// qoderLogoutClient 退出客户端当前账号，让客户端回到登录页。
 //
-// 只清 auth.v1.dat（登录态），不动 qoder-data.v1.json / auth-profile-overlays
-// （设备与配置）。登录态备份到号池目录，出问题可以还原。
+// 三个坑（都踩过）：
+//  1. **必须先结束客户端**：它退出时会把内存里的登录态写回 auth.v1.dat，
+//     不先杀掉的话我们的"登出"会被它覆盖回去。
+//  2. **不能写占位符**：此前往 auth.v1.dat 写了个 3 字节的 "v10"，结果解密直接
+//     报 "body too short: 0"，面板和客户端都读不了这个文件。正确做法是**删掉它**
+//     （= 全新安装的状态），客户端启动自然回到登录界面。
+//  3. **只备份有效的登录态**：坏文件再备份一遍只会攒一串垃圾。
 func qoderLogoutClient() (string, error) {
-	dir := ideauth.QoderDataDir()
+	// 1) 先结束客户端（它退出时可能把登录态写回来）。
+	if ideauth.ClientRunning("qoder") {
+		_ = ideauth.KillClient("qoder")
+		time.Sleep(2 * time.Second)
+	}
+	return qoderClearAuthFile(ideauth.QoderDataDir())
+}
+
+// qoderClearAuthFile 清掉（并按需备份）Qoder 的登录态文件。
+//
+// 单独拆出来是为了能单测：它只动文件、不碰进程。
+func qoderClearAuthFile(dir string) (string, error) {
 	authPath := filepath.Join(dir, "auth.v1.dat")
-	raw, err := os.ReadFile(authPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "客户端本来就没登录", nil
+
+	// 只在当前登录态**有效**时备份一份（坏文件再备份一遍只会攒垃圾）。
+	note := "已退出当前账号"
+	if raw, err := os.ReadFile(authPath); err == nil {
+		if _, derr := ideauth.ReadQoderAuth(); derr == nil {
+			bakDir := ideauth.PoolDir()
+			if err := os.MkdirAll(bakDir, 0o700); err == nil {
+				bak := filepath.Join(bakDir, "qoder_auth_backup_"+time.Now().Format("20060102-150405")+".dat")
+				if err := os.WriteFile(bak, raw, 0o600); err == nil {
+					note = "已退出当前账号（登录态备份到 " + filepath.Base(bak) + "）"
+				}
+			}
+		} else {
+			note = "已清理损坏的登录态（原文件本来就无法解密）"
 		}
+	}
+
+	// 删掉登录态文件（= 全新安装状态）→ 客户端启动即登录界面。
+	// ⚠️ 绝不能写 3 字节的 "v10" 占位符：那样解密会报 "body too short: 0"，
+	// 面板和客户端都读不了这个文件（2026-10-24 实测踩过）。
+	if err := os.Remove(authPath); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	// 备份到号池目录（同一台机器的一次性保险，出错可手工还原）。
-	bakDir := ideauth.PoolDir()
-	if err := os.MkdirAll(bakDir, 0o700); err != nil {
-		return "", err
-	}
-	bak := filepath.Join(bakDir, "qoder_auth_backup_"+time.Now().Format("20060102-150405")+".dat")
-	if err := os.WriteFile(bak, raw, 0o600); err != nil {
-		return "", err
-	}
-	// 清空登录态（保留文件，清零内容也算退出；写成空文件最稳妥）。
-	if err := os.WriteFile(authPath, []byte("v10"), 0o600); err != nil {
-		return "", err
-	}
-	return "已备份到 " + filepath.Base(bak), nil
+	return note, nil
 }
 
 // qoderLoginPoll 轮询客户端登录态；账号变了就收进号池，并立刻回读它

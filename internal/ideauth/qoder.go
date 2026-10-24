@@ -47,14 +47,19 @@ func ReadQoderAuth() (*QoderAuth, error) {
 	p := filepath.Join(QoderDataDir(), qoderAuthFile)
 	raw, err := os.ReadFile(p)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("Qoder 未登录（%s 不存在）", qoderAuthFile)
+		}
 		return nil, fmt.Errorf("读取 %s 失败: %w", qoderAuthFile, err)
 	}
 	if len(raw) < 3 || string(raw[:3]) != qoderMagic {
-		return nil, fmt.Errorf("%s 魔数不匹配", qoderAuthFile)
+		// 常见成因：面板的"退出当前账号"写了占位符、或文件被截断。
+		// 这里要说人话，别把 "body too short: 0" 直接甩给用户。
+		return nil, fmt.Errorf("%s 格式不对（只有 %d 字节）：Qoder 客户端未登录，或登录态已损坏 —— 请在客户端里重新登录一次", qoderAuthFile, len(raw))
 	}
 	plain, err := GCMDecryptIV12(key, raw[3:])
 	if err != nil {
-		return nil, fmt.Errorf("解密 %s 失败: %w", qoderAuthFile, err)
+		return nil, fmt.Errorf("解密 %s 失败（%d 字节，可能已损坏）: %w", qoderAuthFile, len(raw), err)
 	}
 	var a QoderAuth
 	if err := json.Unmarshal(plain, &a); err != nil {

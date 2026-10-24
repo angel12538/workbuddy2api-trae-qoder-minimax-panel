@@ -14,7 +14,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -144,8 +143,13 @@ func (p *Panel) doubaoBrowserPoll(w http.ResponseWriter, r *http.Request) {
 	doubaoBrowserSession.mu.Unlock()
 
 	cookies, err := doubaoBrowserExtractCookies(port)
-	if err != nil || len(cookies) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待在浏览器中完成豆包登录…"})
+	if err != nil {
+		// 登录态没拿到 —— 把原因说清楚（而不是一直干等"请完成登录"）。
+		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
+		return
+	}
+	if len(cookies) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待在浏览器中完成豆包登录…（登录成功后会看到 sessionid）"})
 		return
 	}
 	acc, added, err := doubao.Upsert(cookies, "browser")
@@ -173,54 +177,29 @@ func (p *Panel) doubaoBrowserPoll(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// doubaoBrowserExtractCookies 连上浏览器 CDP，取 doubao.com 域下的 Cookie。
+// doubaoBrowserExtractCookies 连上浏览器，取豆包域下的 Cookie。
 //
-// 必须用 Network.getAllCookies：sessionid 是 HttpOnly，页面里的 document.cookie
-// 看不到它。取不到 sessionid / sessionid_ss 就说明还没登录。
+// 用**浏览器级** CDP（Storage.getCookies）而不是页面级 Network.getAllCookies：
+//  1. 页面级在部分 Chrome 版本里必须先 Network.enable，否则返回空数组 ——
+//     表现就是"在浏览器里明明登录了，却一直添加不了"（2026-10-24 实测）。
+//  2. 登录常发生在弹窗/新标签页（passport 之类），页面级拿不到真正落在
+//     .doubao.com 上的 sessionid；浏览器级一次拿全所有域。
+//
+// 登录态判定：sessionid / sessionid_ss 任一存在即认为已登录。
 func doubaoBrowserExtractCookies(port int) (map[string]string, error) {
-	targets, err := traeBrowserTargets(port)
+	all, err := cdpAllCookies(port)
 	if err != nil {
 		return nil, err
 	}
-	for _, t := range targets {
-		if !strings.Contains(t.URL, "doubao.com") {
-			continue
+	out := cookiesForDomains(all, "doubao.com")
+	if out["sessionid"] == "" && out["sessionid_ss"] == "" {
+		// 没拿到主会话 Cookie：把实际看到的域报出去（登录可能落在别的域上），
+		// 便于判断是"没登录"还是"登录了但 Cookie 名不同"。
+		doms := cookieDomainsOf(all, "sessionid", "sessionid_ss", "ttwid", "msToken", "odin_tt", "passport_csrf_token")
+		if len(doms) > 0 {
+			return nil, fmt.Errorf("浏览器里有 %s 的 Cookie，但没有 sessionid（登录可能还没完成）", strings.Join(doms, ", "))
 		}
-		ws, err := wsDial(t.WSURL, 5*time.Second)
-		if err != nil {
-			continue
-		}
-		raw, err := doubaoCDPCall(ws, 9001, "Network.getAllCookies", map[string]any{}, 8*time.Second)
-		ws.Close()
-		if err != nil {
-			continue
-		}
-		var resp struct {
-			Result struct {
-				Cookies []struct {
-					Name   string `json:"name"`
-					Value  string `json:"value"`
-					Domain string `json:"domain"`
-				} `json:"cookies"`
-			} `json:"result"`
-		}
-		if json.Unmarshal(raw, &resp) != nil {
-			continue
-		}
-		out := map[string]string{}
-		for _, c := range resp.Result.Cookies {
-			if !strings.Contains(c.Domain, "doubao.com") {
-				continue
-			}
-			if c.Name == "" || c.Value == "" {
-				continue
-			}
-			out[c.Name] = c.Value
-		}
-		if out["sessionid"] == "" && out["sessionid_ss"] == "" {
-			continue // 还没登录（或拿到的不是豆包登录态）
-		}
-		return out, nil
+		return nil, nil
 	}
-	return nil, nil
+	return out, nil
 }

@@ -1463,6 +1463,58 @@ function resetQoderPanel() {
 }
 let qoderLoginTimer = null;
 function stopQoderLoginPoll() { if (qoderLoginTimer) { clearTimeout(qoderLoginTimer); qoderLoginTimer = null; } }
+/* ── Qoder 网页登录（每号一个独立浏览器会话）──────────────────────────
+   网页控制台（qoder.com/account/usage）同样能领每日 100 Credits —— 它的成长页
+   （openapi.qoder.sh/growth-page/activity-iframe）就是同一个领取入口。
+   每个号一份独立 profile = 一份独立网页会话 → 各领各的，不互相抢名额。 */
+let qoderWebTimer = null;
+function stopQoderWebPoll() { if (qoderWebTimer) { clearTimeout(qoderWebTimer); qoderWebTimer = null; } }
+async function doQoderWebLogin(email) {
+  const b = $('btnQoderWeb');
+  b.disabled = true; b.textContent = '正在打开浏览器…';
+  $('addQoderWebBox').hidden = false;
+  $('addQoderWebErr').hidden = true;
+  try {
+    const d = await api('ide/qoder/web/start', { method: 'POST', body: JSON.stringify({ email: email }) });
+    $('addQoderWebState').textContent = d.message || '已打开浏览器，请登录要添加的 Qoder 账号…';
+    stopQoderWebPoll();
+    const tick = async () => {
+      try {
+        const r = await api('ide/qoder/web/poll?email=' + encodeURIComponent(email));
+        if (r.done) {
+          stopQoderWebPoll();
+          $('addQoderWebState').textContent = r.ok ? '完成' : '未完成';
+          $('addQoderDone').hidden = false;
+          $('addQoderDone').textContent = (r.message || '');
+          if (!r.ok) { $('addQoderWebErr').hidden = false; $('addQoderWebErr').textContent = r.message || '未完成'; }
+          loadQoderAccounts(true);
+          loadCkQoder(true);
+          return;
+        }
+        $('addQoderWebState').textContent = r.message || '等待在浏览器中完成登录…';
+        if (r.expired) { stopQoderWebPoll(); return; }
+      } catch (e) {
+        stopQoderWebPoll();
+        $('addQoderWebErr').hidden = false;
+        $('addQoderWebErr').textContent = e.message;
+        return;
+      }
+      qoderWebTimer = setTimeout(tick, 2500);
+    };
+    qoderWebTimer = setTimeout(tick, 2500);
+  } catch (e) {
+    $('addQoderWebErr').hidden = false; $('addQoderWebErr').textContent = e.message;
+    $('addQoderWebBox').hidden = true;
+  } finally { b.disabled = false; b.textContent = '网页登录并添加'; }
+}
+if ($('btnQoderWeb')) $('btnQoderWeb').onclick = () => {
+  // 网页登录按号走：先问用户要给哪个号建会话（号池里选，或手填）。
+  const cur = $('addQoderCur') ? ($('addQoderCur').getAttribute('data-email') || '') : '';
+  const email = prompt('给哪个 Qoder 账号建立网页登录会话？\n填邮箱（面板会为它建一个独立的浏览器会话，登录一次即可）：', cur || '');
+  if (!email) return;
+  doQoderWebLogin(email.trim());
+};
+
 async function doQoderLogin() {
   const b = $('btnQoderLogin');
   const logout = $('chkQoderLogout') && $('chkQoderLogout').checked;

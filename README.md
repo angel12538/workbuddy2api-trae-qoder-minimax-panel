@@ -338,26 +338,25 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 |---|---|---|
 | WorkBuddy | OAuth 设备授权（浏览器）/ 同步本机账号 | 国内版 / 国际版可切换；授权链接 + 自动轮询 |
 | Trae | **面板自拉浏览器窗口** / 从本机客户端提取 | 每次全新会话，可反复加号；授权页 OAuth 会在「认证中」卡住，不可用 |
-| Qoder | **浏览器登录（客户端接管）** / 捕获本机客户端登录态 | 见下方说明 |
+| Qoder | **网页登录**（每号独立浏览器会话）/ 客户端浏览器登录 / 捕获本机客户端登录态 | 见下方说明 |
 | MiniMax | **浏览器登录**（设备码）/ 捕获客户端 / 粘贴 Token | 三条通道并列，互不冲突 |
 | 豆包 | **浏览器登录** / **客户端登录并添加** / 粘贴 Cookie | 拿到的都是同一批网页 Cookie |
 | 导入 JSON | 上传 `auths/` 里的凭证文件 | 批量迁移用 |
 
-> **Qoder 浏览器登录**：实测网页端拿不到 IDE 能用的令牌 —— qoder.com 只有
-> `POST /api/v1/sessions`（邮箱+密码+CSRF）、`/api/v1/auth/check-login-type`、
-> `/sso/login/…`（网页 SSO），而 IDE 用的是 openapi 上 `dt-` 开头的 access token，
-> 两者不通。所以 Qoder 的「浏览器登录」= **启动客户端 → 在客户端里用浏览器/扫码
-> 完成鉴权 → 面板盯着客户端登录态，一变就自动收进号池**。全程在浏览器里鉴权，
-> 面板不需要知道客户端的登录页 URL。
+> **Qoder 网页登录**：网页控制台（`qoder.com/account/usage`）**同样能领每日 100 Credits** ——
+> 它的成长页（`openapi.qoder.sh/growth-page/activity-iframe`）就是同一个领取入口。
+> 面板给**每个号建一个独立的浏览器 profile**（存在本机 `data/qoder-web/<账号哈希>/`），
+> 你在这个窗口里登录一次即可 —— 会话留在 profile 里，之后每天由面板用这份会话自动领取，
+> **不需要再登客户端，也不需要每次登网页**。每号一份独立会话，也就各领各的额度。
 >
-> **豆包浏览器登录**：豆包签到用的就是**网页 Cookie**（`sessionid` / `ttwid` /
-> `msToken`），所以「浏览器登录」= 面板自拉一个干净浏览器窗口打开豆包网页版，
-> 你登录后，面板用 CDP 的 `Network.getAllCookies` 把该会话的 Cookie 捞出来入池
-> （`sessionid` 是 HttpOnly，`document.cookie` 读不到，必须走 CDP）。与 Trae 的
-> 浏览器登录同一套机制，每次全新 profile，多账号可反复添加。
+> **Qoder 客户端浏览器登录**（备用通道）：启动 Qoder 客户端，在客户端里用浏览器/扫码
+> 完成鉴权，面板自动收录这个号。勾选「先退出当前账号再登录」可以换一个号登录 ——
+> 服务端在**登录时**给账号发"这个人"的身份（scope），面板直接写登录态（切号）不会重新
+> 签发，两个号就会被算成同一个人、每天只能领一份 100 积分。
 >
-> 原来豆包那两个语义重复的按钮（「从客户端提取」+「启动客户端登录」）已合成一个
-> 「**客户端登录并添加**」：拉起客户端 → 你登录 → 点「提取 Cookie」。
+> **豆包浏览器登录**：面板自拉一个干净浏览器窗口打开豆包网页版，你登录一次，
+> 面板用**浏览器级** CDP（`Storage.getAllCookies`，能覆盖登录弹窗所在的其它域）抓取
+> 该会话的 Cookie 入池。
 
 > **MiniMax 浏览器登录**走的是标准 OAuth 2.0 设备码流程（RFC 8628）**并强制 S256 PKCE**：面板向 `https://account.minimax.cn/oauth2/device/code` 申请 `device_code`，给出 `user_code`（如 `DPC5-6W4S`）与 `verification_uri_complete`；你在浏览器里登录该账号后，面板轮询 `https://account.minimax.cn/oauth2/token` 换出 `access_token` / `refresh_token` 并直接写入号池。
 >
