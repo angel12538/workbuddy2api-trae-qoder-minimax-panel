@@ -5,9 +5,24 @@
 <h1 align="center">WorkBuddy2API Panel</h1>
 
 <p align="center">
-  <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
+  <b>一个面板，统管 WorkBuddy / Trae / Qoder / MiniMax 全部账号 → 统一 OpenAI 兼容网关</b><br>
   Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
 </p>
+
+> ### 🧩 平台覆盖（这是一个合集，不只是 CodeBuddy）
+>
+> | 平台 | 接入形态 | 面板能力 |
+> |---|---|---|
+> | **CodeBuddy / WorkBuddy 国内版** | 主号池（`auths/*.json`） | 聊天网关、签到、余额、成长任务一键完成、模型与档位 |
+> | **WorkBuddy 国际版** | 主号池（`realm=global`） | 同上（国际版无签到 / 成长体系） |
+> | **Trae** | IDE 账号池 | 账号管理、切号、签到、积分、客户端提取令牌 |
+> | **Qoder** | IDE 账号池 | 账号管理、切号、签到、积分、凭证自动续期 |
+> | **MiniMax Code** | 账号池 | 签到、积分、模型通道（`minimax:` 前缀） |
+>
+> - 面板左侧「**IDE 账号池**」视图统管 Qoder / Trae IDE / WorkBuddy 三套客户端账号（添加、切号、移除、积分、签到）。
+> - 面板「**签到池**」视图的「**一键签到**」一个按钮覆盖 **主号池 + WorkBuddy + Qoder + MiniMax + Trae** 全部平台，并按平台分别统计成功 / 已签 / 失败。
+> - 模型按 **realm 前缀**分流：`cn:`（国服 CodeBuddy）、`global:`（国际版）、`trae:`（Trae 通道）、`minimax:`（MiniMax 通道）—— 同一套 `/v1/chat/completions` 与 `/v1/responses` 端点即可调用全部平台的模型。
+> - 账号凭证（`accessToken` / `refreshToken`）只落在本机 `auths/`、`data/`，**不入库**。
 
 <p align="center">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
