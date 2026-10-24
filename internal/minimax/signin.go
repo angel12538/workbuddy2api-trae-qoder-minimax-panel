@@ -264,6 +264,19 @@ func parseFloatOr0(s string) float64 {
 const (
 	defaultOAuthURL = "https://account.minimax.cn/oauth2/token"
 	defaultClientID = "mcode-public"
+	// defaultScope / defaultAudience 是 OAuth 续期必须带的两个参数。
+	//
+	// 实测契约（MiniMax Code 客户端自身用的同一套 grant）：
+	//   POST https://account.minimax.cn/oauth2/token
+	//   grant_type=refresh_token & refresh_token=<mmort_…> & client_id=mcode-public
+	//   & scope=agent.default & audience=agent-backend
+	//   -> { access_token, refresh_token, token_type, expires_in, scope }
+	//
+	// 此前只发前三个参数，缺 scope/audience —— 上游对不完整的续期请求直接拒，
+	// 于是号池里的 access token 一过期就只能 401，号也就永远签不上。
+	// 两个参数都能用环境变量覆盖（国际版 / 自建网关）。
+	defaultScope    = "agent.default"
+	defaultAudience = "agent-backend"
 )
 
 func oauthURL() string {
@@ -278,6 +291,20 @@ func oauthClientID() string {
 		return v
 	}
 	return defaultClientID
+}
+
+func oauthScope() string {
+	if v := strings.TrimSpace(os.Getenv("MINIMAX_OAUTH_SCOPE")); v != "" {
+		return v
+	}
+	return defaultScope
+}
+
+func oauthAudience() string {
+	if v := strings.TrimSpace(os.Getenv("MINIMAX_OAUTH_AUDIENCE")); v != "" {
+		return v
+	}
+	return defaultAudience
 }
 
 // RefreshToken 结果。
@@ -296,6 +323,9 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (*Refreshed, 
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("client_id", oauthClientID())
+	// scope / audience 必填（见 defaultScope 注释的实测契约）；缺了上游直接拒。
+	form.Set("scope", oauthScope())
+	form.Set("audience", oauthAudience())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthURL(), strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
