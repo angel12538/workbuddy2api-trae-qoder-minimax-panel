@@ -4565,16 +4565,24 @@ async function loadCkQoder(quiet) {
     const arr = d.accounts || [];
     // 号池为空但本机有登录态：仍然展示当前号（后端会回退成「签当前账号」）。
     const rows = arr.length ? arr : (cur ? [{ email: cur, name: d.current_name || '当前登录', current: true }] : []);
-    // 今日签到状态：本地日志（号池全量），不打上游。
+    // 今日签到状态：上游核实结果（后端逐号向 Qoder 活动列表确认）。
     const st2 = await api('ide/qoder/checkin-status').catch(() => null);
-    const doneMap = {}, pendMap = {};
+    const doneMap = {}, pendMap = {}, quotaMap = {}, msgMap = {};
     ((st2 && st2.results) || []).forEach(r => {
       if (!r || !r.email) return;
-      doneMap[String(r.email).toLowerCase()] = !!r.checked_in_today;
-      pendMap[String(r.email).toLowerCase()] = (r.phase === 'pending' && !r.checked_in_today);
+      const k = String(r.email).toLowerCase();
+      // checked_in_today 由后端按**上游活动列表**判定（真签到口径）。
+      // ⚠️ 此前这里读的是 checked_in_local（本地记录，可能是旧版误报），
+      //    且顶层 checked_in_today 是「今天整体没有可领的了」的**聚合值**，
+      //    被当成当前登录号的状态用 —— 两个号的签到显示因此整个反了。
+      doneMap[k] = !!r.checked_in_today;
+      pendMap[k] = (r.phase === 'pending' && !r.checked_in_today);
+      quotaMap[k] = !!r.device_quota_used;
+      msgMap[k] = r.msg || '';
     });
-    if (cur && st2 && typeof st2.checked_in_today === 'boolean') {
-      doneMap[cur.toLowerCase()] = !!st2.checked_in_today;
+    // 当前登录号：用 current.checked_in_today（**单号**口径），不用顶层聚合值。
+    if (cur && st2 && st2.current && typeof st2.current.checked_in_today === 'boolean') {
+      doneMap[cur.toLowerCase()] = !!st2.current.checked_in_today;
     }
     const doneCount = rows.filter(a => doneMap[String(a.email || '').toLowerCase()]).length;
     if ($('ckQoderSummary')) {
@@ -4590,15 +4598,20 @@ async function loadCkQoder(quiet) {
     const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
     list.innerHTML = head + rows.map(a => {
       const email = a.email || '';
-      const isDone = !!doneMap[email.toLowerCase()];
-      const noCamp = !!pendMap[String(email).toLowerCase()];
+      const k = String(email).toLowerCase();
+      const isDone = !!doneMap[k];
+      const noCamp = !!pendMap[k];
+      const quota = !!quotaMap[k];
+      const why = msgMap[k] || '';
       const status = isDone
-        ? '<span class="stask ok"><span class="mark">✓</span>今日已签到</span>'
+        ? '<span class="stask ok" title="' + esc(why || '上游活动列表确认今天已领取') + '"><span class="mark">✓</span>今日已签到</span>'
         : (noCamp
-          ? '<span class="stask mute2" title="上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取"><span class="mark">○</span>暂无签到活动</span>'
+          ? (quota
+            ? '<span class="stask mute2" title="' + esc(why || '同设备当天已有别的账号领走唯一名额') + '"><span class="mark">○</span>名额被同设备其它号占用</span>'
+            : '<span class="stask mute2" title="' + esc(why || '上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取') + '"><span class="mark">○</span>暂无签到活动</span>')
           : (a.expired
-            ? '<span class="stask todo"><span class="mark">!</span>凭证过期</span>'
-            : '<span class="stask warn"><span class="mark">○</span>可签到</span>'));
+            ? '<span class="stask todo" title="' + esc(why || '凭证已过期，请重新登录后添加') + '"><span class="mark">!</span>凭证过期</span>'
+            : '<span class="stask warn" title="' + esc(why || '上游活动列表里有今天可领的签到活动') + '"><span class="mark">○</span>可签到</span>'));
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.name || '未命名') +
         (a.current ? '<span class="tag mute" style="margin-left:6px">当前登录</span>' : '') + '</div>' +
@@ -5000,10 +5013,14 @@ async function loadIdeaTasks(quiet) {
         task: '每日签到（api.trae.cn）',
       });
     }
-    if (qd && qd.email) {
+    // ⚠️ checkin-status 的单号信息在 current 里（顶层没有 email 字段），
+    //    此前写 qd.email 永远取不到值 → Qoder 这一行根本不显示。
+    //    done 必须用 current 的**单号**口径（顶层 checked_in_today 是聚合值）。
+    const qc = (qd && qd.current) || null;
+    if (qc && qc.email) {
       rows.push({
-        who: qd.name || '当前登录', sub: qd.email, platform: 'Qoder',
-        done: !!(qd.checked_in_today || qd.phase === 'claimed'),
+        who: qc.name || '当前登录', sub: qc.email, platform: 'Qoder',
+        done: !!(qc.checked_in_today || qc.phase === 'claimed'),
         task: '每日签到（100 Credits）',
       });
     }

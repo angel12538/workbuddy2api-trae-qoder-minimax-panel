@@ -207,20 +207,32 @@ func (p *Panel) qoderCheckinStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 当前登录账号（客户端登录态）的实时状态：供「号池为空但本机已登录」的展示。
+	//
+	// checked_in_today **只认上游**：phase=claimed 表示上游活动列表里今天的
+	// CLAIM_BENEFIT 已是 CLAIMED。此前这里用 CheckedInToday（只比自然日）兜底，
+	// 而本地日志里可能残留旧版写的「纯日期」记录 —— 那会让"根本没签到"的号
+	// 显示成"今日已签到"（2026-10-24 实测：浏览器加的号显示已签，真正领到
+	// 100 Credits 的另一个号反而显示可签，两个号整个反了）。现在只信上游，
+	// 外加**可信**的本地记录（10:05 之后写入的完整时间戳）。
 	cur := map[string]any{}
 	if a, err := ideauth.ReadQoderAuth(); err == nil && a.User.Email != "" {
 		oc := ideauth.QoderScanCurrent()
-		oc["checked_in_today"] = ideauth.CheckedInToday("qoder", a.User.Email) ||
-			oc["phase"] == "claimed"
+		ph, _ := oc["phase"].(string)
+		oc["checked_in_today"] = ph == "claimed" ||
+			(ph != "claimable" && ideauth.CheckinRecordTrusted("qoder", a.User.Email))
 		cur = oc
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"results":          results,
-		"claimed":          claimed,
-		"claimable":        claimable,
-		"pending":          pending,
-		"bad":              bad,
-		"current":          cur,
+		"results":   results,
+		"claimed":   claimed,
+		"claimable": claimable,
+		"pending":   pending,
+		"bad":       bad,
+		"current":   cur,
+		// all_settled：今天**所有**号都没有可领的了（聚合口径，与任何单号无关）。
+		// 顶层 checked_in_today 是历史字段，保留同值兼容 —— 但它**不是**单号状态：
+		// 前端曾把它当成当前登录号的状态用，两个号的签到显示因此整个反了。
+		"all_settled":     bad == 0 && claimable == 0,
 		"checked_in_today": bad == 0 && claimable == 0,
 	})
 }

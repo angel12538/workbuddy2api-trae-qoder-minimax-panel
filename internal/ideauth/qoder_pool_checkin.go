@@ -170,6 +170,23 @@ type QoderScanAccount struct {
 	CheckedInLocal bool   `json:"checked_in_local"`
 	CheckedInAt    string `json:"checked_in_at,omitempty"`
 	Refreshed      bool   `json:"refreshed,omitempty"`
+	// CheckedInToday **该账号今天是否真的签到了** —— 以**上游核实结果**为准
+	// （phase=claimed/already），不采信本地记录。
+	//
+	// 为什么必须与 CheckedInLocal 分开：本地日志里可能残留旧版写的「纯日期」记录
+	// （无时刻信息），按自然日解析会落在当日 00:00，于是"今天签过"为真 —— 而
+	// 上游活动列表里根本没有今天的 CLAIM_BENEFIT。把它当"已签到"展示，就是
+	// 面板凭空说假话。2026-10-24 实测踩坑：浏览器加的号（gmail）挂着这种旧记录，
+	// 面板显示"今日已签到"，而真正领到 100 Credits 的另一个号反而显示"可签到"。
+	CheckedInToday bool `json:"checked_in_today"`
+	// RecordTrusted 本地记录是否可信（今日 10:05 之后写入的完整时间戳）。
+	RecordTrusted bool `json:"record_trusted,omitempty"`
+	// Source 判定来源：upstream = 上游活动列表确认；local = 上游看不到今日活动
+	// （领完即删），但本地有可信记录。
+	Source string `json:"source,omitempty"`
+	// DeviceQuotaUsed 本账号看不到今日活动，是因为同设备已有别的账号领走了
+	// 当天的唯一名额（服务端每设备每日限领一个号）。
+	DeviceQuotaUsed bool `json:"device_quota_used,omitempty"`
 }
 
 // QoderPoolScan 逐账号向**上游**核实签到状态（并发 2，只查不领）。
@@ -248,27 +265,51 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 		// 本地记录的可信判定：10:05 前写入的今日记录是旧版误报（把昨天的陈旧
 		// 已领活动当成了今天的），一律忽略并明确提示。
 		trusted := CheckinRecordTrusted("qoder", email)
+		row.RecordTrusted = trusted
 		if row.CheckedInLocal && !trusted {
 			row.CheckedInLocal = false
 			row.Msg = strings.TrimSpace(row.Msg + "；本地存在 10:05 前的可疑签到记录（旧版误报），已忽略，以上游为准")
 		}
-		// 上游报 pending（未观察到今日活动）而本地确有可信记录：以本地记录为准
-		// 显示已签（活动可能领完即删）；本地也没有 → 如实显示未下发。
-		if res.Phase == "pending" && trusted {
-			row.Msg = "今日已领取（本地记录 " + row.CheckedInAt + "；上游活动列表未见今日活动）"
-		}
-		if res.Phase == "login_required" || res.Phase == "error" {
-			// 上游核实失败：回落本地记录，扫描不至于整行变红。
+		// 「今天到底签没签」的真值判定：**以上游活动列表为准**。
+		//
+		//   claimed   → 上游今天的 CLAIM_BENEFIT 已是 CLAIMED → 真签到
+		//   claimable → 今天还没领（可领）
+		//   pending   → 上游看不到今天的活动（设备名额被占 / 未下发 / 领完即删）
+		//               此时只有「本地可信记录」才能判已签，否则一律未签
+		//   其它      → 上游不可达，本地可信记录兜底
+		//
+		// 关键：绝不能让「本地记录说签过」盖过「上游说没签」。旧版正是这么反的 ——
+		// 浏览器加的号挂着一条旧格式（纯日期）记录，面板显示"今日已签到"，而真正
+		// 领到 100 Credits 的另一个号反而显示"可签到"，两个号整个反了。
+		switch res.Phase {
+		case "claimed":
+			row.CheckedInToday = true
+			row.Source = "upstream"
+		case "claimable":
+			row.CheckedInToday = false
+		case "pending":
+			if trusted {
+				row.CheckedInToday = true
+				row.Source = "local"
+				row.Msg = "今日已领取（本地记录 " + row.CheckedInAt + "；上游活动列表未见今日活动）"
+			} else {
+				row.CheckedInToday = false
+			}
+		default: // login_required / error
+			row.CheckedInToday = false
 			if trusted {
 				row.Phase = "pending"
+				row.CheckedInToday = true
+				row.Source = "local"
 				row.Msg = "上游核实失败（" + res.Msg + "）；本地记录今日已签 " + row.CheckedInAt
 			}
 		}
 		// 设备名额：每台设备每日限领一个账号（服务端规则，2026-10-24 实测：
 		// 第一个号领取后，同设备其余账号的签到活动被隐藏）。本机今天已有其他
 		// 账号可信领取记录、而本账号看不到签到活动时，如实说明而不是笼统的
-		// "活动未下发"。
+		// "活动未下发" —— 这两种情况处理方式完全不同，用户需要分得清。
 		if res.Phase == "pending" && !trusted && UsedDeviceQuotaToday(email) {
+			row.DeviceQuotaUsed = true
 			row.Msg = "本设备今日签到名额已被其他账号使用（每设备每日限领一次，服务端规则）"
 		}
 		out[i] = row
