@@ -484,10 +484,10 @@ func (p *Panel) codeartsClaim(acc *codearts.Account) (phase, msg, sample string,
 		dir = codeartsSlotDir(p, acc.ID)
 	}
 	if dir == "" {
-		return "pending", "这个账号没有本地登录会话，请点「添加账号」重新登录一次", "", nil
+		return "pending", "这个账号没有本地登录会话，请点右上角「添加账号」重新登录一次", "", nil
 	}
 	if st, serr := os.Stat(dir); serr != nil || !st.IsDir() {
-		return "pending", "这个账号的浏览器登录会话已丢失，请点「添加账号」重新登录一次", "", nil
+		return "pending", "这个账号的浏览器登录会话已丢失，请点右上角「添加账号」重新登录一次", "", nil
 	}
 
 	chrome, err := findChrome()
@@ -540,10 +540,19 @@ func (p *Panel) codeartsClaim(acc *codearts.Account) (phase, msg, sample string,
 		return "", "", "", fmt.Errorf("读取页面状态失败")
 	}
 	if !pr.Logged {
-		return "pending", "这个账号的华为云登录已过期，请点「添加账号」重新登录一次",
+		return "pending", "这个账号的华为云登录已过期，请点右上角「添加账号」重新登录一次",
 			trimText(pr.Text, 300), nil
 	}
 
+	// ── 接口优先 ─────────────────────────────────────────────────────────
+	// 契约见 codearts_api.go（从前端 bundle 实测反查，不是猜的）。
+	// 在页面里发 fetch，用的是浏览器**当下**的活会话 —— 与前端自己发请求
+	// 完全等价，比点按钮稳得多。接口走不通才退回下面的 UI 点按钮。
+	if ph, msg, sample, ok := p.codeartsClaimViaAPI(ws); ok {
+		return ph, msg, sample, nil
+	}
+
+	// ── 接口走不通 → 退回 UI 点按钮 ───────────────────────────────────
 	// ① 打开福利面板（用**真实鼠标**点：React 应用合成 click 不触发展开）
 	var steps []string
 	opened := ""
