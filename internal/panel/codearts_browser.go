@@ -556,9 +556,17 @@ func (p *Panel) codeartsClaim(acc *codearts.Account) (phase, msg, sample string,
 		}
 	}
 
+	// 面板若显示「登录参与 / 立即登录 / 解锁更多福利」，说明这份 profile 的
+	// 登录态已经失效（实测未登录时点开活动福利就是这个界面）。
+	hints := caCollectHints(ws)
+	if opened != "" && caPanelNeedsLogin(hints) {
+		return "pending", "这个账号的华为云登录已过期，请点右上角「添加账号」重新登录一次",
+			"steps=" + strings.Join(steps, ",") + " hints=" + strings.Join(hints, "|"), nil
+	}
+
 	// ② 点「每日领取」
 	clicked := ""
-	for _, kw := range []string{"每日领取", "立即签到", "立即领取", "去签到"} {
+	for _, kw := range []string{"每日领取", "立即签到", "去签到", "立即领取"} {
 		if ok, tx, _ := caClickByText(ws, kw, 16); ok {
 			clicked = tx
 			steps = append(steps, "click:"+tx)
@@ -569,27 +577,44 @@ func (p *Panel) codeartsClaim(acc *codearts.Account) (phase, msg, sample string,
 		time.Sleep(4 * time.Second)
 	}
 
-	// ③ 顺手领已完成任务的奖励（只点「领取」类，不碰「去完成」）
+	// ③ 顺手领已完成任务的奖励（**文案完全相等**才算，避免把「每日领取」
+	//    当成任务按钮再点一遍；不碰「去完成」）
 	tasks := 0
 	for i := 0; i < 3; i++ {
-		if ok, _, _ := caClickByText(ws, "领取", 6); ok {
-			tasks++
-			time.Sleep(1200 * time.Millisecond)
-		} else {
+		ok, _, err := caClickExactText(ws, []string{"领取", "立即领取", "去领取", "一键领取"})
+		if err != nil || !ok {
 			break
 		}
+		tasks++
+		time.Sleep(1200 * time.Millisecond)
 	}
 
 	after, _ := caEvalExistingPage(port, "huaweicloud")
 	if after == "" {
 		after = pr.Text
 	}
+	hints = caCollectHints(ws)
 	ph, m := classifyClaim(clicked != "" || tasks > 0, after, tasks)
-	diag := "steps=" + strings.Join(steps, ",")
+	diag := "steps=" + strings.Join(steps, ",") + " hints=" + strings.Join(hints, "|")
 	if opened == "" && clicked == "" {
-		m = "没找到「每日领取」入口（页面可能改版了），请点「添加账号」重新登录并核对入口"
+		m = "没找到「活动福利 / 每日领取」入口（页面可能改版了），请点右上角「添加账号」重新登录并核对入口"
 	}
 	return ph, m, diag + " || " + trimText(after, 1600), nil
+}
+
+// caPanelNeedsLogin 判断活动福利面板是不是停在「未登录」状态。
+//
+// 实测（未登录时点开「活动福利」）：面板底部出现
+// 「解锁更多福利 / 登录即可解锁更多限时福利。/ 立即登录」，
+// 而「立即参与」会变成「登录参与」。登录后才解锁「每日领取」。
+func caPanelNeedsLogin(hints []string) bool {
+	joined := strings.Join(hints, "|")
+	for _, s := range []string{"立即登录", "登录参与", "解锁更多福利"} {
+		if strings.Contains(joined, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // ── 号池接口 ────────────────────────────────────────────────────────────

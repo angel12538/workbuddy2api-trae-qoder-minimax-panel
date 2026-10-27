@@ -291,6 +291,79 @@ func caConnectPage(port int, urlHint string) (*wsConn, error) {
 	return nil, fmt.Errorf("没找到包含 %q 的页面", urlHint)
 }
 
+// caClickExactText 用**真实鼠标**点一个**文案完全相等**的元素（可多个候选，
+// 按候选顺序命中第一个）。
+//
+// 为什么要有精确版：caClickByText 是「包含」匹配，maxLen=6 时「每日领取」
+// 也会被「领取」命中 —— 领任务奖励时会把刚点过的签到按钮再点一遍。
+func caClickExactText(ws *wsConn, labels []string) (bool, string, error) {
+	expr := fmt.Sprintf(`(() => {
+      const labels = %s;
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const norm = e => ((e.innerText || e.textContent || '')).replace(/\s+/g, ' ').trim();
+      const els = [...document.querySelectorAll('a,button,div,span,li,p,[role=button]')];
+      for (const lab of labels) {
+        const cands = els.filter(e => norm(e) === lab && vis(e) && !e.disabled);
+        if (cands.length) {
+          const e = cands[0];
+          e.scrollIntoView({ block: 'center', inline: 'center' });
+          const r = e.getBoundingClientRect();
+          return JSON.stringify({ found: true, text: lab,
+            x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+        }
+      }
+      return JSON.stringify({ found: false });
+    })()`, jsonList(labels))
+	raw, err := caEval(ws, expr)
+	if err != nil {
+		return false, "", err
+	}
+	var loc struct {
+		Found bool    `json:"found"`
+		Text  string  `json:"text"`
+		X     float64 `json:"x"`
+		Y     float64 `json:"y"`
+	}
+	if json.Unmarshal(raw, &loc) != nil || !loc.Found {
+		return false, "", nil
+	}
+	if err := doubaoCDPClick(ws, 62, loc.X, loc.Y); err != nil {
+		return false, loc.Text, err
+	}
+	return true, loc.Text, nil
+}
+
+// jsonList 把字符串数组渲染成 JS 字面量。
+func jsonList(items []string) string {
+	buf, _ := json.Marshal(items)
+	return string(buf)
+}
+
+// caCollectHints 收集页面上所有含「领取/签到/积分/登录」的短文案，
+// 用于诊断「入口长什么样」（面板改版时靠它定位真实按钮文案）。
+func caCollectHints(ws *wsConn) []string {
+	raw, err := caEval(ws, `(() => {
+      const norm = e => ((e.innerText || e.textContent || '')).replace(/\s+/g, ' ').trim();
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const out = [];
+      for (const e of document.querySelectorAll('a,button,div,span,li,p')) {
+        const t = norm(e);
+        if (!t || t.length > 18 || !vis(e)) continue;
+        if (/(领取|签到|积分|登录)/.test(t) && !out.includes(t)) out.push(t);
+        if (out.length >= 40) break;
+      }
+      return JSON.stringify(out);
+    })()`)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	if json.Unmarshal(raw, &out) != nil {
+		return nil
+	}
+	return out
+}
+
 // caClickByText 用**真实鼠标事件**点一个有指定文案的元素。
 //
 // 为什么不用 e.click()：CodeArts 控制台是 React 应用，合成 click 常常不触发

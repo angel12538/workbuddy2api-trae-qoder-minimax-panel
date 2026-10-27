@@ -18,8 +18,9 @@ import (
 //
 // 运行：
 //
-//	CODEARTS_POOL_FILE=D:\WorkBuddy\data\ide_accounts\codearts_accounts.json \
-//	  go test ./internal/panel/ -run TestCodeArtsProbe -v -timeout 300s
+//	$env:CODEARTS_PROBE='1'
+//	$env:CODEARTS_POOL_FILE='D:\WorkBuddy\data\ide_accounts\codearts_accounts.json'
+//	go test ./internal/panel/ -run TestCodeArtsProbe -v -timeout 400s
 func TestCodeArtsProbe(t *testing.T) {
 	if os.Getenv("CODEARTS_PROBE") == "" {
 		t.Skip("设 CODEARTS_PROBE=1 才跑")
@@ -64,39 +65,55 @@ func TestCodeArtsProbe(t *testing.T) {
 	if err := caSetCookies(port, acc.Cookies); err != nil {
 		t.Fatalf("写 Cookie 失败: %v", err)
 	}
-	for _, u := range []string{
-		codeartsConsoleURL,
-		"https://devcloud.cn-north-4.huaweicloud.com/developer/?locale=zh-cn",
-	} {
-		if err := caNavigate(ws, u); err != nil {
-			t.Logf("导航 %s 失败: %v", u, err)
+	if err := caNavigate(ws, codeartsConsoleURL); err != nil {
+		t.Logf("导航失败: %v", err)
+	}
+	time.Sleep(8 * time.Second)
+
+	t.Logf("=== 页面 %s", caPageURL(port, "huaweicloud"))
+	dumpProbe(t, ws, "初始页")
+
+	// 关键：用**真实鼠标**点「活动福利」，把打开后的面板内容 dump 出来
+	//（未登录也能看到面板结构 —— 入口长什么样一目了然）。
+	for _, kw := range []string{"活动福利", "限时福利", "福利中心"} {
+		ok, tx, cerr := caClickByText(ws, kw, 16)
+		t.Logf("点击 %q -> ok=%v text=%q err=%v", kw, ok, tx, cerr)
+		if !ok {
 			continue
 		}
-		time.Sleep(7 * time.Second)
-		t.Logf("=== 页面 %s", caPageURL(port, "huaweicloud"))
-		raw, err := caEval(ws, probeDumpJS)
-		if err != nil {
-			t.Logf("取页面失败: %v", err)
-			continue
-		}
-		var d struct {
-			Text  string   `json:"text"`
-			Items []string `json:"items"`
-			Links []string `json:"links"`
-		}
-		if err := json.Unmarshal(raw, &d); err != nil {
-			t.Logf("解析失败: %v raw=%s", err, string(raw))
-			continue
-		}
-		t.Logf("--- 正文(前2500) ---\n%s", d.Text)
-		t.Logf("--- 可点项(前120) ---\n%v", d.Items)
-		t.Logf("--- 链接(前120) ---\n%v", d.Links)
+		time.Sleep(4 * time.Second)
+		dumpProbe(t, ws, "点开 "+tx+" 后")
+		break
+	}
+}
+
+// dumpProbe 把当前页面的结构打出来。
+func dumpProbe(t *testing.T, ws *wsConn, tag string) {
+	t.Helper()
+	raw, err := caEval(ws, probeDumpJS)
+	if err != nil {
+		t.Logf("[%s] 取页面失败: %v", tag, err)
+		return
+	}
+	var d struct {
+		Text  string   `json:"text"`
+		Items []string `json:"items"`
+		Links []string `json:"links"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		t.Logf("[%s] 解析失败: %v raw=%s", tag, err, string(raw))
+		return
+	}
+	t.Logf("[%s] 正文(前2500) ---\n%s", tag, d.Text)
+	t.Logf("[%s] 可点项(前150) ---\n%v", tag, d.Items)
+	if len(d.Links) > 0 {
+		t.Logf("[%s] 链接(前100) ---\n%v", tag, d.Links)
 	}
 }
 
 // probeDumpJS 把页面结构 dump 出来。
 const probeDumpJS = `(() => {
-  const norm = e => ((e.innerText || e.textContent || '')).replace(/\s+/g,' ').trim();
+  const norm = e => ((e.innerText || e.textContent || '')).replace(/\s+/g, ' ').trim();
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const text = ((document.body && document.body.innerText) || '').replace(/\s+/g,' ').slice(0, 2500);
   const items = [], links = [], seen = new Set();
