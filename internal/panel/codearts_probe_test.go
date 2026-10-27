@@ -45,9 +45,11 @@ func TestCodeArtsProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	if err := launchChromeHeadless(chrome, port, dir); err != nil {
+	cleanup, err := launchChromeHeadless(chrome, port, dir)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer cleanup()
 
 	var ws *wsConn
 	for i := 0; i < 30; i++ {
@@ -134,15 +136,28 @@ const probeDumpJS = `(() => {
   return JSON.stringify({ text, items: items.slice(0,400), links: links.slice(0,200) });
 })()`
 
-func launchChromeHeadless(chrome string, port int, dir string) error {
+// launchChromeHeadless 起一个无头浏览器，返回清理函数。
+//
+// ⚠️ 必须把清理函数用 defer 掉：go test 结束时子进程会被**遗留**（孤儿
+// Chrome），一个个占着 9333-9341 调试端口，还吃内存 —— 实测漏了 97 个
+// 进程，最后把网关自己挤挂了。
+func launchChromeHeadless(chrome string, port int, dir string) (func(), error) {
 	cmd := exec.Command(chrome,
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		"--user-data-dir="+dir, "--no-first-run", "--no-default-browser-check",
 		"--headless=new", "--disable-gpu", "--window-size=1600,1000", "about:blank")
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {
-		return err
+		return nil, err
 	}
-	go func() { _ = cmd.Wait() }()
-	return nil
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		select {
+		case <-exited:
+		case <-time.After(8 * time.Second):
+		}
+	}
+	return cleanup, nil
 }

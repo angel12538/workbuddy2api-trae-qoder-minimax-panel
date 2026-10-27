@@ -155,6 +155,87 @@ func caSetCookies(port int, cookies []codearts.Cookie) error {
 	return fmt.Errorf("写入 Cookie 超时")
 }
 
+// caPageInfo 一个已打开的标签页。
+type caPageInfo struct {
+	URL string
+	WS  string
+}
+
+// caListPages 列出浏览器里**已存在**的页面（不新建）。
+func caListPages(port int) ([]caPageInfo, error) {
+	cl := &http.Client{Timeout: 6 * time.Second}
+	resp, err := cl.Get(fmt.Sprintf("http://127.0.0.1:%d/json/list", port))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	var targets []struct {
+		Type string `json:"type"`
+		URL  string `json:"url"`
+		WS   string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.Unmarshal(raw, &targets); err != nil {
+		return nil, err
+	}
+	out := make([]caPageInfo, 0, len(targets))
+	for _, t := range targets {
+		if t.Type != "page" || t.WS == "" {
+			continue
+		}
+		out = append(out, caPageInfo{URL: t.URL, WS: t.WS})
+	}
+	return out, nil
+}
+
+// caPickPage 选一个**已存在**的页面（绝不新建标签页）。
+//
+// 优先级：① URL 含 /chat 的控制台页；② URL 含 huaweicloud 的任意页；
+// ③ 第一个 page。
+//
+// ⚠️ 这里必须复用已有页面：登录窗口是用户正在操作的页面，轮询时如果每次都
+// 新开一个标签，用户那边看到的现象就是「窗口一直刷新」（而且会开出一堆
+// 标签页）。实测踩过：4 秒一次轮询 → 无限刷新。
+func caPickPage(port int) (*wsConn, string, error) {
+	pages, err := caListPages(port)
+	if err != nil {
+		return nil, "", err
+	}
+	var chat, hw, any *caPageInfo
+	for i := range pages {
+		p := &pages[i]
+		switch {
+		case strings.Contains(p.URL, "/chat"):
+			if chat == nil {
+				chat = p
+			}
+		case strings.Contains(p.URL, "huaweicloud"):
+			if hw == nil {
+				hw = p
+			}
+		default:
+			if any == nil {
+				any = p
+			}
+		}
+	}
+	pick := chat
+	if pick == nil {
+		pick = hw
+	}
+	if pick == nil {
+		pick = any
+	}
+	if pick == nil {
+		return nil, "", fmt.Errorf("浏览器里没有可用的页面")
+	}
+	ws, err := wsDial(pick.WS, 6*time.Second)
+	if err != nil {
+		return nil, "", err
+	}
+	return ws, pick.URL, nil
+}
+
 // caEvalExistingPage 在**已存在的**页面里求值（不新开标签），用于救回
 // 服务重启后丢失句柄的登录窗口。返回页面文本。
 func caEvalExistingPage(port int, urlHint string) (string, error) {

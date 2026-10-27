@@ -40,9 +40,11 @@ func TestCodeArtsAPISmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	if err := launchChromeHeadless(chrome, port, dir); err != nil {
+	cleanup, err := launchChromeHeadless(chrome, port, dir)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer cleanup()
 
 	var ws *wsConn
 	for i := 0; i < 30; i++ {

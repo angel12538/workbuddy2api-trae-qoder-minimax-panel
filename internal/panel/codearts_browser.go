@@ -360,27 +360,48 @@ func codeartsCookiesOf(all []cdpCookie) []codearts.Cookie {
 	return out
 }
 
-// codeartsLoginProbe 读登录窗口当前页面，判定是否已登录，并顺手取昵称。
+// codeartsLoginProbe 读**已打开**的页面，判定是否已登录。
+//
+// ⚠️ 绝不新建标签页：登录窗口就是用户正在操作的那一个，轮询时每次新开一个
+// 标签，用户那边看到的现象就是「窗口一直刷新」，而且会攒出一堆标签页
+// （实测踩过：4 秒一轮询 → 无限刷新）。这里只读**已有**的页面。
+//
+// 华为云登录页常以独立窗口/标签弹出（用户点「登录」后出现二维码或手机号
+// 登录），登录成功后会跳回 /chat/… 并带上会话。所以这里把**所有**页面都
+// 看一遍：任一页面出现登录后的强信号（没有「登录华为云」按钮、且有
+// 「活动福利 / 新建任务 / 工作台」等模块）即算已登录。
 func codeartsLoginProbe(port int) (text, nickname string, logged bool) {
-	ws, err := caOpenTab(port, codeartsConsoleURL)
-	if err != nil {
+	pages, err := caListPages(port)
+	if err != nil || len(pages) == 0 {
 		return "", "", false
 	}
-	defer ws.Close()
-	time.Sleep(3 * time.Second)
-	raw, err := caEval(ws, codeartsProbeJS)
-	if err != nil {
-		return "", "", false
+	var firstText, firstNick string
+	for _, p := range pages {
+		ws, derr := wsDial(p.WS, 6*time.Second)
+		if derr != nil {
+			continue
+		}
+		raw, eerr := caEval(ws, codeartsProbeJS)
+		_ = ws.Close()
+		if eerr != nil {
+			continue // 页面正在跳转（登录中）——这一轮跳过，下一轮再读
+		}
+		var r struct {
+			Text     string `json:"text"`
+			Nickname string `json:"nickname"`
+			Logged   bool   `json:"logged"`
+		}
+		if json.Unmarshal(raw, &r) != nil {
+			continue
+		}
+		if r.Logged {
+			return r.Text, r.Nickname, true
+		}
+		if firstText == "" {
+			firstText, firstNick = r.Text, r.Nickname
+		}
 	}
-	var r struct {
-		Text     string `json:"text"`
-		Nickname string `json:"nickname"`
-		Logged   bool   `json:"logged"`
-	}
-	if json.Unmarshal(raw, &r) != nil {
-		return "", "", false
-	}
-	return r.Text, r.Nickname, r.Logged
+	return firstText, firstNick, false
 }
 
 // codeartsProbeJS 读页面文案 + 判登录。
