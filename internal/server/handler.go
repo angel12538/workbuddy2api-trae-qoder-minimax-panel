@@ -21,6 +21,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/mmapi"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -85,6 +86,9 @@ type Config struct {
 	// Minimax MiniMax Code 模型通道（Anthropic 协议，前缀 "minimax:"）。
 	// nil = 不提供该通道；登录态从 ~/.minimax/auth 读取，与号池无关。
 	Minimax *minimax.Client
+	// MMAPI MiniMax 开放平台通道（OpenAI 兼容 + API Key，按组前缀如 mm: / mms:）。
+	// nil = 未配置密钥。
+	MMAPI *mmapi.Registry
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -480,6 +484,8 @@ func (h *Handler) modelList() []map[string]any {
 	out = append(out, h.traeModels()...)
 	// MiniMax Code 模型名单（前缀 "minimax:"），同样纯动态。
 	out = append(out, h.minimaxModels()...)
+	// MiniMax 开放平台模型名单（前缀 "mm:"）。
+	out = append(out, h.mmModels()...)
 	return out
 }
 
@@ -605,6 +611,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Trae 通道分流：模型名带 "trae:" 前缀时整条链路交给 traechat 中继
 	// （与 WorkBuddy 的选号/粘性/冷却无关，故在读 body 之后、进池之前分流）。
+	// MiniMax 开放平台（API Key）：按配置里的组前缀分流（mm: / mms: …）。
+	// 放在 realm 判断之前，组 id 由配置文件决定，无需改代码。
+	if g, bare, ok := h.cfg.MMAPI.Match(peek.Model); ok {
+		h.mmChat(w, r, body, bare, g, st)
+		return
+	}
+
 	if realm == "trae" {
 		h.traeChat(w, r, body, bareModel, st)
 		return

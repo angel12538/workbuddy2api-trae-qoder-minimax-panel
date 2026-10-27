@@ -1320,6 +1320,7 @@ function openAdd() {
   resetQoderPanel();
   resetMinimaxAddPanel();
   resetDoubaoAddPanel();
+  resetCodeArtsAddPanel();
   stopPoll(); stopTraePoll();
 }
 function switchAddTab(tab) {
@@ -1329,6 +1330,7 @@ function switchAddTab(tab) {
   $('addTabQoder').hidden = tab !== 'qoder';
   $('addTabMinimax').hidden = tab !== 'minimax';
   $('addTabDoubao').hidden = tab !== 'doubao';
+  $('addTabCodearts').hidden = tab !== 'codearts';
   $('addTabImport').hidden = tab !== 'import';
   // 页脚那组按钮只服务 WorkBuddy 设备码流程；其它流程有自己的按钮（在面板内）。
   const wb = tab === 'wb';
@@ -5120,13 +5122,164 @@ async function doMainPoolCheckinAll() {
   return { ok, skip, fail, total: all.length };
 }
 
-/* 总「一键签到」：主号池 → WorkBuddy → Qoder → Trae，全部账号一次签完。
+
+/* ── CodeArts 签到（华为云码道）───────────────────────────────────────
+   凭据是**浏览器 profile**（持久会话）：华为云的网页登录态活不过一小时
+   （SSOTGC / SessionID 是短时票据），把 Cookie 快照存下来第二天注入一律
+   判定未登录（2026-10-27 实测）。所以「添加账号」= 面板用一个全新 profile
+   拉起浏览器，你登录一次；面板把这份 profile 归档到该账号名下，之后每天
+   用它拉一次无头浏览器自动点「活动福利 → 每日领取」。 */
+let caPollTimer = null;
+
+async function loadCkCodeArts(quiet) {
+  const st = $('ckCaState'), list = $('ckCaList');
+  if (!st || !list) return;
+  if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
+  try {
+    const d = await api('ide/codearts/accounts');
+    const arr = (d && d.accounts) || [];
+    const done = arr.filter(a => a.checked_in_today).length;
+    if ($('ckCaSummary')) {
+      $('ckCaSummary').textContent = arr.length ? ('共 ' + arr.length + ' 个 · 已签 ' + done) : '未添加账号';
+    }
+    if (!arr.length) {
+      st.hidden = false; st.className = 'state';
+      st.textContent = '还没有账号。点右上角「添加账号」，在「华为 CodeArts」页签里登录华为云即可。';
+      list.innerHTML = ''; return;
+    }
+    const head = '<div class="thead"><div>账号</div><div>状态</div><div>操作</div></div>';
+    list.innerHTML = head + arr.map(a => {
+      const id = a.id || '';
+      const isDone = !!a.checked_in_today;
+      // has_session=false：本地没有这份浏览器会话（登录过期或被清）→ 必须重登。
+      const alive = a.has_session !== false;
+      const status = isDone
+        ? UI.badge('ok', '✓', '今日已签到')
+        : (alive ? UI.badge('warn', '○', '可签到') : UI.badge('warn', '○', '需重新登录'));
+      const act = isDone
+        ? UI.off('已签到', '今日已签到')
+        : (alive
+          ? UI.act('data-ca-ck', id, '签到', '今天签到')
+          : UI.off('需重登', '本地浏览器会话已失效，点右上角「添加账号」重新登录一次'));
+      return '<div class="trow">' +
+        '<div class="who"><div class="nm">' + esc(a.label || 'CodeArts 账号') + '</div>' +
+        '<div class="id" title="' + esc(id) + '">' + esc(id) + '</div></div>' +
+        '<div>' + status + '</div>' +
+        '<div class="acts">' + act +
+        UI.sub('data-ca-rm', id, '移除') +
+        '</div>' +
+        '</div>';
+    }).join('');
+    st.hidden = true;
+    list.querySelectorAll('button[data-ca-ck]').forEach(b => { b.onclick = () => doCaCheckin(b, b.dataset.caCk); });
+    list.querySelectorAll('button[data-ca-rm]').forEach(b => { b.onclick = () => doCaRemove(b.dataset.caRm); });
+  } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+}
+
+// doCaAdd 拉浏览器 → 轮询登录态（用户登录成功后自动入库）。
+async function doCaAdd() {
+  try {
+    const d = await api('ide/codearts/browser/start', { method: 'POST', body: '{}' });
+    toast(d.message || '浏览器已打开，请登录华为云');
+    const box = $('addCaState'), err = $('addCaErr');
+    if (err) err.hidden = true;
+    if (box) {
+      box.hidden = false; box.className = 'state';
+      box.innerHTML = '<span class="dots">请在弹出的浏览器窗口里登录华为云，登录成功后会自动保存…</span>';
+    }
+    const st = $('ckCaState');
+    if (st) { st.hidden = false; st.className = 'state'; st.textContent = '请在弹出的浏览器窗口里登录华为云，登录成功后会自动保存…'; }
+    if ($('btnCaStop')) $('btnCaStop').hidden = false;
+    if (caPollTimer) clearInterval(caPollTimer);
+    caPollTimer = setInterval(async () => {
+      try {
+        const r = await api('ide/codearts/browser/poll');
+        if (r && r.added !== undefined) {
+          clearInterval(caPollTimer); caPollTimer = null;
+          if ($('btnCaStop')) $('btnCaStop').hidden = true;
+          const done = $('addCaDone');
+          if (done) { done.hidden = false; done.className = 'state ok'; done.textContent = r.message || '已添加账号'; }
+          if (box) box.hidden = true;
+          toast(r.message || '已添加账号', 'ok');
+          loadCkCodeArts(true);
+        } else if (r && r.message) {
+          const b2 = $('addCaState');
+          if (b2) { b2.hidden = false; b2.className = 'state'; b2.textContent = r.message; }
+          const s2 = $('ckCaState');
+          if (s2) { s2.hidden = false; s2.className = 'state'; s2.textContent = r.message; }
+        }
+      } catch (e) { /* 轮询失败继续等 */ }
+    }, 4000);
+  } catch (e) {
+    const err = $('addCaErr');
+    if (err) { err.hidden = false; err.className = 'state err'; err.textContent = e.message; }
+    toast(e.message, 'err');
+  }
+}
+
+// doCaStop 关掉 CodeArts 登录窗口。
+async function doCaStop() {
+  try {
+    await api('ide/codearts/browser/stop', { method: 'POST', body: '{}' });
+    if (caPollTimer) { clearInterval(caPollTimer); caPollTimer = null; }
+    if ($('btnCaStop')) $('btnCaStop').hidden = true;
+    toast('已关闭登录窗口', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// resetCodeArtsAddPanel 重置弹窗里的 CodeArts 页签。
+function resetCodeArtsAddPanel() {
+  if (caPollTimer) { clearInterval(caPollTimer); caPollTimer = null; }
+  const s = $('addCaState'), d = $('addCaDone'), e = $('addCaErr'), b = $('btnCaStop');
+  if (s) s.hidden = true;
+  if (d) d.hidden = true;
+  if (e) e.hidden = true;
+  if (b) b.hidden = true;
+}
+
+// doCaCheckin 签到单个/全部（id 为空 = 全部）。
+async function doCaCheckin(btn, id) {
+  const old = btn ? btn.textContent : '签到';
+  if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
+  try {
+    const body = id ? JSON.stringify({ ids: [id] }) : '{}';
+    const d = await api('ide/codearts/checkin', { method: 'POST', body });
+    const rs = (d && d.results) || [];
+    let text, ok = true;
+    if (rs.length === 1) {
+      const r = rs[0];
+      text = r.phase === 'claimed' ? '签到成功 +1000 积分' : (r.msg || r.phase);
+      ok = r.phase === 'claimed' || r.phase === 'already';
+    } else {
+      text = (d && d.msg) || '完成';
+      ok = !(d && d.failed_accounts > 0);
+    }
+    toast(text, ok ? 'ok' : 'err');
+    if (!viewFrozen()) loadCkCodeArts(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = old || '签到'; } }
+}
+
+async function doCaRemove(id) {
+  if (!confirm('从 CodeArts 号池移除该账号？')) return;
+  try {
+    await api('ide/codearts/remove', { method: 'POST', body: JSON.stringify({ id }) });
+    toast('已移除', 'ok');
+    loadCkCodeArts(true);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+if ($('btnCaAdd')) $('btnCaAdd').onclick = doCaAdd;
+if ($('btnCaStop')) $('btnCaStop').onclick = doCaStop;
+if ($('btnCaCheckinAll')) $('btnCaCheckinAll').onclick = () => doCaCheckin($('btnCaCheckinAll'));
+
+/* 总「一键签到」：主号池 → WorkBuddy → Qoder → MiniMax → Trae → CodeArts，全部账号一次签完。
    各平台失败分别计数（不让某个平台的号失效把整条汇总染红）。 */
 async function doCheckinAll(btn) {
   const old = btn ? btn.textContent : '一键签到';
   if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
   const st = $('ckMasterState');
-  if (st) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">开始签到 主号池 → WorkBuddy → Qoder → Trae</span>'; }
+  if (st) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">开始签到 主号池 → WorkBuddy → Qoder → MiniMax → CodeArts → Trae</span>'; }
   const parts = [];
   let failCount = 0;
   try {
@@ -5172,6 +5325,18 @@ async function doCheckinAll(btn) {
         parts.push('MiniMax ' + mtxt);
       }
     } catch (e) { failCount++; parts.push('MiniMax 失败：' + e.message); }
+
+    try {
+      // CodeArts：网页 Cookie 通道，逐个账号打开控制台点「每日领取」。
+      const ca = await api('ide/codearts/checkin', { method: 'POST', body: '{}' });
+      const car = (ca && ca.results) || [];
+      if (!car.length) {
+        parts.push('CodeArts 无账号');
+      } else {
+        parts.push('CodeArts 成功 ' + (ca.claimed_accounts || 0) + ' · 已签 ' + (ca.already_accounts || 0) +
+          ' · 失败 ' + (ca.failed_accounts || 0));
+      }
+    } catch (e) { parts.push('CodeArts 失败：' + e.message); }
 
     try {
       const t = await api('trae/checkin', { method: 'POST', body: '{}' });

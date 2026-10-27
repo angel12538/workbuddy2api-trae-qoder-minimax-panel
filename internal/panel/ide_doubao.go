@@ -433,7 +433,7 @@ func doubaoRunInBrowser(cookies map[string]string, doClick bool, baseDir string)
 	// 纯站外直连会因缺设备签名被"系统错误"拦下，页内调用不受影响）。
 	if ph, det, ok := doubaoPageStatusFetch(ws, 310); ok {
 		if ph == "claimed" || ph == "already" {
-			return ph, det, sampleOf(last.Sample)
+			return ph, withTasks(det, doubaoTasksIf(doClick, ws)), sampleOf(last.Sample)
 		}
 		if !doClick && ph == "claimable" {
 			return "claimable", "今日可领取（" + det + "）", sampleOf(last.Sample)
@@ -441,7 +441,11 @@ func doubaoRunInBrowser(cookies map[string]string, doClick bool, baseDir string)
 	}
 	if ph, det, ok := doubaoParseNet(doubaoNetResults(ws, 300)); ok {
 		if ph == "claimed" || ph == "already" {
-			return ph, det, sampleOf(last.Sample)
+			// 已签时也顺手领任务奖励（用户要求：不做任务，但能领的都领掉）。
+			//
+			// ⚠️ 只在**点击通道**（doClick=true，即真正的签到流程）里领：
+			// doubaoStatus 是只读扫描，不该去动页面上的按钮。
+			return ph, withTasks(det, doubaoTasksIf(doClick, ws)), sampleOf(last.Sample)
 		}
 		if !doClick && ph == "claimable" {
 			return "claimable", "今日可领取（" + det + "）", sampleOf(last.Sample)
@@ -508,17 +512,17 @@ func doubaoRunInBrowser(cookies map[string]string, doClick bool, baseDir string)
 			time.Sleep(1500 * time.Millisecond)
 			// 点击后优先读 checkin 接口响应（权威）。
 			if ph, det, ok := doubaoParseNet(doubaoNetResults(ws, 500)); ok && ph != "claimable" {
-				return ph, det + "（点击后接口确认）", sampleOf(last.Sample)
+				return ph, withTasks(det+"（点击后接口确认）", doubaoClaimTasks(ws)), sampleOf(last.Sample)
 			}
 			st2, err := doubaoScanPage(ws, 500)
 			if err == nil {
 				if st2.Success {
-					return "claimed", "签到成功", sampleOf(st2.Sample)
+					return "claimed", withTasks("签到成功", doubaoClaimTasks(ws)), sampleOf(st2.Sample)
 				}
 				bodyAlready := st2.Already || st2.cardCheckedIn() ||
 					strings.Contains(st2.Sample, "今日已领取") || strings.Contains(st2.Sample, "明日再来")
 				if bodyAlready {
-					return "already", "今日已签到（点击后页面显示已签）", sampleOf(st2.Sample)
+					return "already", withTasks("今日已签到（点击后页面显示已签）", doubaoClaimTasks(ws)), sampleOf(st2.Sample)
 				}
 			}
 		}
@@ -684,7 +688,7 @@ func (s doubaoScanState) cardCheckedIn() bool {
 
 // doubaoScanJS 页面状态扫描（按钮文案候选与参考实现对齐，豆包改版改这里）。
 const doubaoScanJS = `(() => {
-  const texts = ['立即领取','立即签到','签到领额度','今日签到','立即签到领额度'];
+  const texts = ['立即签到','每日签到','签到领额度','今日签到','立即领取','立即签到领额度'];
   // 已签判据只认「已签到 / 明日再来」：任务行的「已领取」不能当签到完成信号，
   // 否则「做任务领额度」列表里随便一个已完成的任务都会把未签误报成已签。
   const alreadyTexts = ['已签到','明日再来'];
@@ -694,13 +698,22 @@ const doubaoScanJS = `(() => {
   let btn = null;
   const els = [...document.querySelectorAll('button,[role=button],a,div,span')];
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-  outer:
-  for (const tx of texts) {
-    for (const e of els) {
-      const t = (e.innerText || '').trim();
-      if (t === tx && !e.disabled && vis(e)) { btn = tx; break outer; }
+  const pick = (root) => {
+    const pool = root ? [...root.querySelectorAll('button,[role=button],a,div,span')] : els;
+    for (const tx of texts) {
+      for (const e of pool) {
+        const t = (e.innerText || '').trim();
+        if (t === tx && !e.disabled && vis(e)) return tx;
+      }
     }
+    return null;
+  };
+  let cardEl = null;
+  for (const e of els) {
+    const t = (e.innerText || '').trim();
+    if (t && t.includes('每日签到') && t.length < 200) { cardEl = e; break; }
   }
+  btn = (cardEl && pick(cardEl)) || pick(null);
   // 签到卡片区域：包含「每日签到」的最小元素文本（卡片内若已是「已签到」状态，
   // 说明今天签过 —— 页面上其它卡片的「立即领取」按钮会干扰判断）。
   let card = '';
@@ -730,23 +743,36 @@ const doubaoScanJS = `(() => {
 // React 按钮的合成 click 可能触发同步导航把执行上下文销毁（实测），真实鼠标
 // 事件（CDP Input 域）与 playwright 同机制，最稳。
 const doubaoLocateJS = `(async () => {
-  const texts = ['立即领取','立即签到','签到领额度','今日签到','立即签到领额度'];
+  // 顺序很重要：先「立即签到」，再兜底「立即领取」。
+  const texts = ['立即签到','每日签到','签到领额度','今日签到','立即领取','立即签到领额度'];
   const els = [...document.querySelectorAll('button,[role=button],a,div,span')];
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-  for (const tx of texts) {
-    for (const e of els) {
-      const t = (e.innerText || '').trim();
-      if (t === tx && !e.disabled && vis(e)) {
-        // 先滚到视口中央再取坐标：CDP Input 用的是视口坐标，按钮在折叠区外时
-        // 点击会落在空白处（实测"点了没反应"的主因）。
-        e.scrollIntoView({ block: 'center', inline: 'center' });
-        await new Promise(r => setTimeout(r, 500));
-        const r = e.getBoundingClientRect();
-        return JSON.stringify({ text: tx, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+  const pick = (root) => {
+    const pool = root ? [...root.querySelectorAll('button,[role=button],a,div,span')] : els;
+    for (const tx of texts) {
+      for (const e of pool) {
+        const t = (e.innerText || '').trim();
+        if (t === tx && !e.disabled && vis(e)) return { e: e, tx: tx };
       }
     }
+    return null;
+  };
+  // 1) 优先在「每日签到」卡片内部找：页面上方常有别的活动卡也写着「立即领取」，
+  //    全局取第一个会点错卡（用户看到的现象：点了但没签到）。
+  let card = null;
+  for (const e of els) {
+    const t = (e.innerText || '').trim();
+    if (t && t.includes('每日签到') && t.length < 200) { card = e; break; }
   }
-  return null;
+  let hit = card ? pick(card) : null;
+  // 2) 卡片里没找到，再退回全局
+  if (!hit) hit = pick(null);
+  if (!hit) return null;
+  const e = hit.e;
+  e.scrollIntoView({ block: 'center', inline: 'center' });
+  await new Promise(r => setTimeout(r, 500));
+  const r = e.getBoundingClientRect();
+  return JSON.stringify({ text: hit.tx, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
 })()`
 
 // doubaoLocateSignin 找到签到按钮中心坐标（未找到返回 nil）。
@@ -875,4 +901,63 @@ func tailStr(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// doubaoClaimTasksJS 把页面上「已完成待领」的任务奖励点一遍。
+// 只点「领取 / 立即领取 / 去领取 / 一键领取」，不动「去完成」，避免误触发任务流程。
+const doubaoClaimTasksJS = `(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // 豆包活动页是渐进水合：先等任务区渲染出来再找按钮。
+  await sleep(2500);
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const texts = ['领取','立即领取','去领取','一键领取'];
+  let n = 0;
+  for (let round = 0; round < 2; round++) {
+    const btns = [...document.querySelectorAll('button,[role=button],div,span')].filter(e => {
+      const t = (e.innerText || '').trim();
+      return texts.includes(t) && !e.disabled && vis(e);
+    });
+    if (!btns.length) break;
+    for (const b of btns.slice(0, 8)) {
+      try { b.click(); n++; await sleep(1000); } catch (e) {}
+    }
+    await sleep(1200);
+  }
+  return JSON.stringify({ n: n });
+})()`
+
+// doubaoTasksIf 只在点击通道里领任务奖励；只读扫描（doClick=false）不点页面。
+func doubaoTasksIf(doClick bool, ws *wsConn) int {
+	if !doClick {
+		return 0
+	}
+	return doubaoClaimTasks(ws)
+}
+
+// doubaoClaimTasks 执行任务奖励领取，返回成功点击的次数（失败按 0 处理，不阻断签到结果）。
+func doubaoClaimTasks(ws *wsConn) int {
+	if ws == nil {
+		return 0
+	}
+	raw, err := doubaoCDPCall(ws, 777, "Runtime.evaluate", map[string]any{
+		"expression": doubaoClaimTasksJS, "awaitPromise": true, "returnByValue": true,
+	}, 45*time.Second)
+	if err != nil {
+		return 0
+	}
+	var r struct {
+		N int `json:"n"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return 0
+	}
+	return r.N
+}
+
+// withTasks 在结论文案后追加任务奖励数量。
+func withTasks(base string, n int) string {
+	if n > 0 {
+		return fmt.Sprintf("%s（另领 %d 个任务奖励）", base, n)
+	}
+	return base
 }

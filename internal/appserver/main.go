@@ -21,6 +21,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/mmapi"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -34,7 +35,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.14.7-panel"
+const appVersion = "1.15.0-panel"
 
 // traeRateRange 汇总 Trae 目录的消耗倍率区间（启动日志用）。
 func traeRateRange(ms []traechat.ModelInfo) string {
@@ -106,6 +107,12 @@ func Run() {
 	// 与号池无关；handler 与面板共用同一个客户端（模型目录缓存也共用）。
 	// 放在最前面声明：面板在 handler 之前就要注入它。
 	mmClient := minimax.New()
+
+	// MiniMax 开放平台（API Key）：密钥文件与 state 同目录，缺省 data/minimax_api_keys.json。
+	mmAPI, mmErr := mmapi.Load(stateSibling(cfg.StateFile, "minimax_api_keys.json"))
+	if mmErr != nil {
+		log.Printf("MiniMax API Key 配置读取失败（通道关闭）: %v", mmErr)
+	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
@@ -354,6 +361,7 @@ func Run() {
 		// MiniMax Code 模型通道（minimax: 前缀）。
 		// 登录态来自客户端 ~/.minimax/auth（每 30s 重读，客户端续期后自动跟进）。
 		Minimax: mmClient,
+		MMAPI:   mmAPI,
 	})
 
 	// Trae 模型通道（trae: 前缀）：与签到共用 checkin_accounts.json，

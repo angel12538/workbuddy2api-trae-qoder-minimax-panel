@@ -1455,8 +1455,10 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 	// 只拉一次列表：清单型判定与「阶段 0 批量接受」用的是同一份任务，
 	// 分两次拉纯属多打一次上游（端点相同，一次失败即两次都失败，无收益）。
 	tasks, terr := p.cfg.Upstream.ListTasks(a)
+	isChecklist := false
 	if terr == nil {
 		if checklist, pending := checklistSummary(tasks); checklist {
+			isChecklist = true
 			// 清单里若有「已达标未领取」的，先自动领掉（网关做不了行为，但领奖可以）。
 			if cl := p.claimCompletedTasks(a, tasks, false, map[string]bool{}); len(cl) > 0 {
 				return cl
@@ -1548,6 +1550,12 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			continue
 		}
 		if before == nil {
+			// 国际版 checklist 账号跑的是另一套任务码（first_chat/skill_installed…），
+			// 旧国服白名单在这里必然"查无此任务"。以前会输出一屏这句话，
+			// 用户只看到"没有任务"就以为程序坏了——这里直接不输出。
+			if isChecklist {
+				continue
+			}
 			item["status"] = "skipped"
 			item["message"] = "该账号无此任务"
 			out = append(out, item)

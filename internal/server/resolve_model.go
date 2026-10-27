@@ -19,7 +19,7 @@ func resolveModel(model string) (realm, bare string) {
 		return "cn", model
 	}
 	prefix := model[:idx]
-	if prefix != "cn" && prefix != "global" && prefix != "trae" && prefix != "minimax" {
+	if prefix != "cn" && prefix != "global" && prefix != "trae" && prefix != "minimax" && prefix != "mm" {
 		return "cn", model
 	}
 	return prefix, model[idx+1:]

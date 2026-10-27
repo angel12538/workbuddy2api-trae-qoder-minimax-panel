@@ -285,6 +285,15 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/web/poll", p.withAuth(p.qoderWebPoll))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/remove", p.withAuth(p.doubaoRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/checkin", p.withAuth(p.doubaoCheckin))
+
+	// CodeArts（华为云码道）：浏览器登录取 Cookie + 每日领取
+	p.mux.HandleFunc("GET /panel/api/ide/codearts/accounts", p.withAuth(p.codeartsAccounts))
+	p.mux.HandleFunc("POST /panel/api/ide/codearts/remove", p.withAuth(p.codeartsRemove))
+	p.mux.HandleFunc("POST /panel/api/ide/codearts/browser/start", p.withAuth(p.codeartsBrowserStart))
+	p.mux.HandleFunc("POST /panel/api/ide/codearts/browser/stop", p.withAuth(p.codeartsBrowserStop))
+	p.mux.HandleFunc("GET /panel/api/ide/codearts/browser/poll", p.withAuth(p.codeartsBrowserPoll))
+	p.mux.HandleFunc("POST /panel/api/ide/codearts/checkin", p.withAuth(p.codeartsCheckin))
+	p.mux.HandleFunc("POST /panel/api/ide/codearts/add_port", p.withAuth(p.codeartsAddFromPort))
 	p.mux.HandleFunc("GET /panel/api/ide/doubao/status", p.withAuth(p.doubaoStatus))
 
 	// Trae IDE 本地账号（读号池 / 添加 / 切号）

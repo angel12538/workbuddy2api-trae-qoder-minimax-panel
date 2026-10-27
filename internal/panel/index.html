@@ -789,6 +789,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
+          <h3>CodeArts 签到</h3>
+          <span class="grow"></span>
+          <span class="note" id="ckCaSummary"></span>
+          <button class="xs primary" id="btnCaCheckinAll">全部签到</button>
+        </header>
+        <div class="state" id="ckCaState"><span class="dots">加载中</span></div>
+        <div id="ckCaList"></div>
+      </div>
+
+      <div class="box">
+        <header>
           <h3>豆包签到</h3>
           <span class="grow"></span>
           <span class="note" id="ckDbSummary"></span>
@@ -1469,6 +1480,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <button class="tab" data-tab="qoder">Qoder</button>
         <button class="tab" data-tab="minimax">MiniMax</button>
         <button class="tab" data-tab="doubao">豆包</button>
+        <button class="tab" data-tab="codearts">华为 CodeArts</button>
         <button class="tab" data-tab="import">导入 JSON</button>
       </div>
     </header>
@@ -1598,6 +1610,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="hint" style="margin-bottom:6px">粘贴完整 Cookie 串（浏览器 F12 → Network 任意 doubao.com 请求 → Request Headers → Cookie，需含 sessionid）。</div>
           <textarea id="dbCookieInput" rows="4" placeholder="sessionid=...; ttwid=...; msToken=..." style="width:100%;margin-bottom:8px"></textarea>
           <button id="btnDbAddCookie" class="primary">保存账号</button>
+        </div>
+      </div>
+      <!-- 华为云 CodeArts（码道）：浏览器登录，每个号一份独立浏览器会话 -->
+      <div id="addTabCodearts" class="tab-panel" hidden>
+        <div class="state" style="margin-bottom:8px">
+          华为云网页登录态<b>只有约一小时寿命</b>，所以面板不用 Cookie 快照，而是给每个号留一份<b>独立的浏览器会话</b>：你在弹出的窗口里登录一次，这份会话就存在本机，之后每天由面板用它自动点「活动福利 → 每日领取」。
+        </div>
+        <div id="addCaDone" class="state ok" hidden></div>
+        <div id="addCaErr" class="state err" hidden></div>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button id="btnCaAdd" class="primary">打开登录窗口</button>
+          <button id="btnCaStop" hidden>关闭登录窗口</button>
+        </div>
+        <div id="addCaState" class="state" hidden style="margin-top:10px"><span class="dots">等待登录…</span></div>
+        <div class="hint" style="margin-top:10px">
+          要加第二个华为云账号，就再点一次「打开登录窗口」——每次都会用一份全新的浏览器会话，不会和上一个号串号。
         </div>
       </div>
       <!-- 导入 JSON -->

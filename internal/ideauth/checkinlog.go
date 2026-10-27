@@ -170,13 +170,10 @@ func CheckedInAt(kind, key string) (time.Time, bool) {
 	return t, ok
 }
 
-// CheckinRecordTrusted 报告本地签到记录是否「可信」：
-// 今日 10:05（活动刷新 + 5 分钟宽限）之后写入的记录才可信。
+// CheckinRecordTrusted 报告本地签到记录是否「可信」。
 //
-// 背景：Qoder 每日活动 10:00 (UTC+8) 刷新，此前版本会把昨天还没刷新掉的已领
-// 活动误判成"今日已领取"，在 10:00 前写入假记录。带时间戳的记录让我们能把
-// 这些历史假记录自动降级为「可疑」——重试循环会继续巡检，10 点后真活动下发
-// 时照样能补签，旧假记录不再阻塞任何流程。
+// 「可信」的分界线**按平台区分**（见 checkinTrustLine）：各平台活动刷新时刻
+// 不同，用一条线套所有平台会误伤。
 func CheckinRecordTrusted(kind, key string) bool {
 	t, ok := CheckedInAt(kind, key)
 	if !ok {
@@ -185,13 +182,36 @@ func CheckinRecordTrusted(kind, key string) bool {
 	if t.Local().Format("2006-01-02") != time.Now().Format("2006-01-02") {
 		return false // 非今日记录一律不可信（已过期）
 	}
-	return t.After(qoderCheckinTrustLine())
+	return !t.Before(checkinTrustLine(kind))
+}
+
+// checkinTrustLine 本地签到记录的可信分界线（今日本地时间的时刻）。
+//
+// 分平台的原因：
+//   - Qoder：每日活动 10:00 (UTC+8) 刷新。10:05 前写下的记录可能只是**昨天**
+//     那波还没刷新的陈旧活动（旧版把「昨天已领」当成「今天已领」写进记录），
+//     所以要等到 10:05 真活动下发后才可信。带时间戳的记录让我们能把这些历史
+//     假记录自动降级为「可疑」——重试循环会继续巡检，旧假记录不阻塞任何流程。
+//   - 豆包 / WorkBuddy / CodeArts / MiniMax 等：每日签到按**自然日**刷新
+//     （零点起算），上游接口直接给出 checked_in_today / last_checkin_date，
+//     不存在「昨天的活动冒充今天」的问题。对它们套用 10:05 线会让**上午就
+//     签到成功**的号在面板上一整天显示「未签」——用户看到的就是「签到失效」
+//     （2026-10-27 实测：08:47 豆包两个号签到成功，号池列表仍返回
+//     checked_in_today=false，按钮一直是蓝底可点）。
+func checkinTrustLine(kind string) time.Time {
+	now := time.Now()
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "qoder":
+		return time.Date(now.Year(), now.Month(), now.Day(), 10, 5, 0, 0, time.Local)
+	default:
+		// 自然日刷新：今日零点起就算可信。
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	}
 }
 
 // qoderCheckinTrustLine 本地签到记录的可信分界线（今日 10:05 本地时间）。
 func qoderCheckinTrustLine() time.Time {
-	now := time.Now()
-	return time.Date(now.Year(), now.Month(), now.Day(), 10, 5, 0, 0, time.Local)
+	return checkinTrustLine("qoder")
 }
 
 // CheckinDates 返回 kind 下全部 key → 日期 映射（用于批量列表渲染）。
