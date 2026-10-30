@@ -41,12 +41,30 @@
 >
 > Search keywords: `workbuddy` `workbuddy2api` `codebuddy` `codebuddy2api` `trae` `trae2api` `qoder` `qoder2api` `minimax` `minimax code` `doubao` `codearts` `码道` `openai api gateway` `ai account pool` `daily check-in` `auto check-in` `keep-alive` `openai compatible api` `reverse proxy` `admin panel` `golang`
 
+> ### 🆚 和「只做 WorkBuddy」的面板差在哪
+>
+> 多数同类面板只做 WorkBuddy 主号池；本项目把 **Trae、Qoder、MiniMax、豆包、华为云 CodeArts** 也接了进来：
+>
+> | 你会搜的 | 本项目里对应的东西 |
+> |---|---|
+> | **Trae 签到** / Trae 账号池 / Trae 积分 / Trae 切号 | 面板「IDE 账号池」直接管 Trae IDE 账号：切号、签到、积分、客户端提取令牌 |
+> | **Qoder 签到** / Qoder 免费额度 / Qoder 多账号 / Qoder 换号 | 每日额度按账号轮转领取（服务端按人发额度，多号才有意义），凭证自动续期 |
+> | **MiniMax 签到** / MiniMax Code / MiniMax 接入 / minimax 模型 | 浏览器 OAuth 设备码登录（免装客户端），`minimax:` 前缀直通模型 |
+> | **豆包签到** / Doubao 多账号 / doubao 签到 | Cookie 签到池 + 无头浏览器通道，客户端 Cookie 一键提取 |
+> | **CodeArts 签到** / 码道签到 / 华为云码道 / CodeArts 积分 | 每日领取 + **积分总览**（每天能领多少 / 一共还剩多少 / 将过期） |
+>
+> 只想管一个 WorkBuddy 号的话，别的面板更轻；**手上同时有这几种账号的，只有这里是一块面板统管**。
+
 <p align="center">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Single_Binary%20%7C%20Docker-2496ED?style=flat-square">
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
 </p>
+
+> ⭐ **用得上就点个 Star** —— GitHub 仓库搜索的结果排序几乎完全由 Star 数决定，
+> 而 WorkBuddy / Trae / Qoder / MiniMax 这几个词本身都有成千上万个同名项目。
+> 一个 Star 不只是鼓励，更是让搜这些词的人能翻到你。
 
 ---
 
