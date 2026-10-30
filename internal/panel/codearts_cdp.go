@@ -487,15 +487,28 @@ func caClickByText(ws *wsConn, kw string, maxLen int) (bool, string, error) {
 	return true, loc.Text, nil
 }
 
-// caDiscoverPorts 扫描 9333-9433，找出真正在跑 CodeArts 页面的调试端口。
+// caDiscoverPorts 扫描给定端口，找出真正在跑 CodeArts 页面的调试端口。
 //
 // 为什么需要：面板的登录会话存在内存里，服务一重启就丢；此时浏览器窗口还开着，
 // 但 poll 只会说"未启动"，用户以为扫描坏了。这里直接按端口探活，把窗口找回来。
-func caDiscoverPorts() []int {
+//
+// ⚠️ only 传**我们自己起过的**端口（known）：不加限制的话，用户自己日常开的
+// Chrome（调试端口恰好在范围内、页面里也有 devcloud）会被扫进来，
+// 它的 Cookie 会被当成新账号存进号池。
+func caDiscoverPorts(known []int) []int {
+	set := map[int]bool{}
+	for _, p := range known {
+		if p > 0 {
+			set[p] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
 	var mu sync.Mutex
 	var hits []int
 	var wg sync.WaitGroup
-	for p := 9333; p <= 9433; p++ {
+	for port := range set {
 		wg.Add(1)
 		go func(port int) {
 			defer wg.Done()
@@ -511,7 +524,7 @@ func caDiscoverPorts() []int {
 				hits = append(hits, port)
 				mu.Unlock()
 			}
-		}(p)
+		}(port)
 	}
 	wg.Wait()
 	sort.Ints(hits)

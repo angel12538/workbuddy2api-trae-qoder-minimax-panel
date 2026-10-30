@@ -205,26 +205,37 @@ func DomainIDOf(cookies []Cookie) string {
 //
 // 认人顺序（**从准到糊**）：
 //  1. Identity（domain_tag|user_tag）—— 唯一可靠的跨登录身份；
-//  2. ID 相等 —— 老号池没有 Identity 字段时的兼容路径；
-//  3. 同一个调试端口 —— 同一个浏览器窗口必然是同一个人。
+//  2. ID 相等 —— 老号池没有 Identity 字段时的兼容路径。
 //
-// ⚠️ 以前只用 2+3，导致同一个人先后登录两次会被当成两个账号，
-// 而且两条记录还共用同一个 slot → 互相覆盖（实测踩过）。
+// ⚠️ **绝不能用调试端口认人**（2026-10-30 用户实测踩到）：
+// 浏览器窗口一关，端口立刻被回收复用（freePort 永远给第一个空闲端口，
+// 上一个窗口关掉后下一个又拿到 9333）。拿端口认人 = "下一个登录的人被
+// 当成上一个" → **加第二个账号会把第一个顶掉**（号池里只剩一条，
+// 内容换成了新账号）。端口只用来记录"登录窗口在哪"，不参与认人。
 func Upsert(p *Pool, acc *Account) (*Account, bool) {
 	for _, a := range p.Accounts {
 		if a == nil {
 			continue
 		}
-		samePort := acc.Port > 0 && a.Port == acc.Port
 		sameID := acc.ID != "" && a.ID == acc.ID
-		sameIdentity := acc.Identity != "" && a.Identity != "" && a.Identity == acc.Identity
+		sameIdentity := acc.Identity != "" && a.Identity != "" && acc.Identity == a.Identity
 		// 老号池里没有 Identity 字段，用现存的 Cookie 反算一次再比。
 		if !sameIdentity && acc.Identity != "" {
 			if old := IdentityOf(a.Cookies); old != "" && old == acc.Identity {
 				sameIdentity = true
 			}
 		}
-		if !sameIdentity && !sameID && !samePort {
+		// 身份明确且不同，绝不合并，哪怕 ID 撞车。
+		//
+		// 真实故障（2026-10-30 10:49）：号池里老账号的 ID 是历史遗留
+		// （旧算法算的 ca1d671920b4），而新账号的 domain_tag/user_tag
+		// 算出的指纹恰好也是 ca1d671920b4 —— 仅凭 ID 就把两个不同的人
+		// 合并了，老账号的会话被覆盖（面板上只剩一个号）。
+		if sameIdentity == false && acc.Identity != "" && a.Identity != "" &&
+			acc.Identity != a.Identity {
+			continue
+		}
+		if !sameIdentity && !sameID {
 			continue
 		}
 		// 命中同一个人：更新会话，**保留原 ID**（签到记录按 ID 存，改 ID 会丢历史）。
@@ -423,6 +434,10 @@ func CookieHeader(cookies []Cookie) string {
 // Now 统一时间格式。
 func Now() string { return time.Now().Format(time.RFC3339) }
 
+// Seq 把序号转成字符串（导出版本给面板用，避免到处自己写 strconv）。
+func Seq(n int) string { return itoa(n) }
+
+// itoa 小工具：整数转十进制字符串。
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

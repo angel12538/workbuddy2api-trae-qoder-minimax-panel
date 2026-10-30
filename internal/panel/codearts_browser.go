@@ -109,7 +109,8 @@ func (p *Panel) codeartsBrowserStart(w http.ResponseWriter, r *http.Request) {
 	defer codeartsBrowserSession.mu.Unlock()
 	if codeartsBrowserSession.cmd != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "running": true,
-			"message": "浏览器已在运行，请在窗口里登录华为云账号"})
+			"message": "已有一个登录窗口在开着。请先在那个窗口里登录（登录成功会自动保存），" +
+				"或者点「停止」关掉它再重新添加下一个账号"})
 		return
 	}
 	chrome, err := findChrome()
@@ -193,7 +194,12 @@ func (p *Panel) codeartsBrowserPoll(w http.ResponseWriter, r *http.Request) {
 	codeartsBrowserSession.mu.Unlock()
 	if port == 0 {
 		// 服务重启会丢掉内存里的会话，但浏览器窗口通常还开着：先按端口找回来。
-		if ports := caDiscoverPorts(); len(ports) > 0 {
+		//
+		// ⚠️ 只认**我们自己起过的**端口（号池里记着 Port 的那些）。
+		// 不加这个限制的话，会把用户自己日常开的 Chrome 窗口也扫进来，
+		// 把它的 Cookie 当成新账号存进去 —— 相当于凭空多一个号、
+		// 或者把号池搅乱。
+		if ports := caDiscoverPorts(p.codeartsKnownPorts()); len(ports) > 0 {
 			port = ports[0]
 			codeartsBrowserSession.mu.Lock()
 			codeartsBrowserSession.port = port
@@ -337,7 +343,13 @@ func (p *Panel) codeartsSaveLogin(cookies []codearts.Cookie, nick, pendingDir st
 			}
 		}
 		if taken {
-			accID = codearts.Fingerprint([]codearts.Cookie{{Name: "identity", Value: identity}})
+			if identity != "" {
+				accID = codearts.Fingerprint([]codearts.Cookie{{Name: "identity", Value: identity}})
+			} else {
+				// 认不出身份时只能用「指纹 + 序号」保证唯一，
+				// 否则所有认不出身份的账号会拿到**同一个** ID，又会撞车。
+				accID = fp + "-" + codearts.Seq(len(pool.Accounts) + 1)
+			}
 			if accID == fp {
 				accID = accID + "b"
 			}
@@ -352,11 +364,24 @@ func (p *Panel) codeartsSaveLogin(cookies []codearts.Cookie, nick, pendingDir st
 	if nick != "" {
 		acc.Label = nick
 	}
+	// 端口是**独占**的：上一个登录窗口关掉后端口立刻被回收复用，
+	// 这个端口现在属于本次登录。别的账号还留着同一个端口记录的话，
+	// 签到时会连到**别人的窗口**、用别人的会话替它签到（假签到）。
+	// 所以这里把其它账号的同端口记录清掉。
+	for _, a := range pool.Accounts {
+		if a != nil && port > 0 && a.Port == port {
+			a.Port = 0
+		}
+	}
 	saved, added := codearts.Upsert(pool, acc)
 	// Upsert 里命中的老账号要补上 Identity（老号池没这个字段）。
 	if saved.Identity == "" && identity != "" {
 		saved.Identity = identity
 	}
+	// 再跑一遍号池整理：新账号加进来后 slot 可能和老账号撞了
+	// （老账号的 slot 是历史遗留的，新账号的 slot 是按指纹派生的）。
+	// slot 撞车 = 两个账号共用同一个本地目录。
+	codearts.MergePool(pool)
 	if err := codearts.SavePool(pool); err != nil {
 		return nil, false, err
 	}
@@ -556,10 +581,14 @@ func (p *Panel) codeartsCheckin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// codeartsClaim 优先复用「还开着的登录窗口」；窗口没了才退回 profile。
+// codeartsClaim 优先复用「还开着的登录窗口」；窗口没了就只能靠 Cookie 直连。
 func (p *Panel) codeartsClaim(acc *codearts.Account) (phase, msg, sample string, err error) {
 	// ① 登录窗口还在：直接用真实鼠标点（窗口里就是活的会话）。
-	if acc.Port > 0 {
+	//
+	// ⚠️ 用之前必须核对窗口里登录的是**不是这个账号**：端口会被回收复用
+	// （上一个窗口关掉，下一个登录又拿到同一个端口），端口记录可能指向
+	// 别人的窗口 —— 拿别人的会话替这个号签到就是假签到。
+	if acc.Port > 0 && caPortBelongsTo(acc.Port, acc) {
 		if ws, werr := caConnectPage(acc.Port, "chat"); werr == nil {
 			defer ws.Close()
 			var steps []string
@@ -612,6 +641,34 @@ func (p *Panel) codeartsClaim(acc *codearts.Account) (phase, msg, sample string,
 	// 现在唯一的凭据是号池里的 Cookie 快照，靠 keepalive 续命；它一旦失效
 	// 就只能重新登录（右上角「添加账号」）。
 	return "pending", "这个账号的华为云会话已失效，请点右上角「添加账号」重新登录一次", "", nil
+}
+
+// caPortBelongsTo 核对某个调试端口上的浏览器登录的是不是这个账号。
+//
+// 为什么必须核对：调试端口是**独占但会回收**的——上一个登录窗口关掉后，
+// 端口立刻被 freePort 重新分配给下一个登录窗口。号池里旧账号残留的 Port
+// 记录就会指向别人的窗口；不核对就等于**拿别人的会话替这个号签到**
+//（面板显示"签到成功"，实际领的是另一个人的积分）。
+//
+// 判据：窗口里的华为云 Cookie 算出的 Identity 要和账号一致；
+// 拿不到稳定标识时保守地认为**不是**这个人（宁可少签，不可假签）。
+func caPortBelongsTo(port int, acc *codearts.Account) bool {
+	if acc == nil {
+		return false
+	}
+	want := acc.Identity
+	if want == "" {
+		want = codearts.IdentityOf(acc.Cookies)
+	}
+	if want == "" {
+		return false // 认不准就别用这个窗口
+	}
+	all, err := cdpAllCookies(port)
+	if err != nil {
+		return false
+	}
+	got := codearts.IdentityOf(codeartsCookiesOf(all))
+	return got != "" && got == want
 }
 
 // caPanelNeedsLogin 判断活动福利面板是不是停在「未登录」状态。
@@ -680,17 +737,24 @@ func (p *Panel) codeartsAccountItem(a *codearts.Account) map[string]any {
 	// 每日能领多少积分 + 当前余额。
 	daily := a.DailyBonus
 	expired := false
+	// 服务端说今天已领 ⇒ 直接算"已签到"。服务端是权威：
+	// 面板上显示"可签到"但点了才知道其实领过，是最让人困惑的状态。
+	serverClaimed := false
 	if camps, cerr := codearts.Campaigns(a); cerr == nil {
 		if c, ok := codearts.DailyCampaign(camps); ok {
 			daily = float64(c.BenefitAmount)
 			a.DailyBonus = daily
-			item["daily_claimed"] = c.Claimed() || !c.Claimable
+			serverClaimed = c.Claimed() || !c.Claimable
+			item["daily_claimed"] = serverClaimed
 		}
 	} else if errors.Is(cerr, codearts.ErrSessionExpired) {
 		expired = true
 	}
 	if daily > 0 {
 		item["daily_bonus"] = daily
+	}
+	if serverClaimed {
+		item["checked_in_today"] = true
 	}
 
 	if ci, cerr := codearts.Credits(a); cerr == nil && ci != nil {
@@ -1180,6 +1244,24 @@ func (p *Panel) codeartsRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "refreshed": true,
 		"id": acc.ID, "message": msg})
+}
+
+// codeartsKnownPorts 号池里记着的浏览器调试端口（我们自己起过的那些）。
+func (p *Panel) codeartsKnownPorts() []int {
+	pool, err := codearts.LoadPool()
+	if err != nil {
+		return nil
+	}
+	var out []int
+	seen := map[int]bool{}
+	for _, a := range pool.Accounts {
+		if a == nil || a.Port <= 0 || seen[a.Port] {
+			continue
+		}
+		seen[a.Port] = true
+		out = append(out, a.Port)
+	}
+	return out
 }
 
 // codeartsMigratePool 启动时整理号池：合并"同一个人被拆成多条"的记录、
