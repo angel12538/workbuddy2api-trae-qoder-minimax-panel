@@ -23,6 +23,7 @@ package upstream
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -439,14 +440,14 @@ func (c *Client) marketExpertQuery(a *auth.Auth, body map[string]any) ([]MarketE
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	conversationID = desktopUUID()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
 			map[string]any{"role": "system", "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
-			map[string]any{"role": "user", "content": "1+1等于几？直接回答。"},
+			map[string]any{"role": "user", "content": "帮我用一句话描述今天的天气适合做什么，随意发挥就行。"},
 		},
-		"agent":          "cli",
+		"agent":          "craft",
 		"temperature":    1,
 		"stream":         true,
 		"stream_options": map[string]any{"include_usage": true},
@@ -468,7 +469,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+	h.Set("X-Request-ID", desktopUUID())
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
@@ -607,4 +608,16 @@ func desktopExpertActualUse(e MarketExpert, conversationID, requestID string) De
 		"conversationId": conversationID, "requestId": requestID, "messageId": "msg-" + requestID[len(requestID)-8:],
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 	}
+}
+
+// desktopUUID 生成标准 UUID v4：官方客户端的会话/请求 id 就是这种形态，
+// 用 "wb2api-conv-<纳秒>" 会被上游风控识别（11128 Request blocked）。
+func desktopUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

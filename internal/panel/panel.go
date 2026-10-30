@@ -182,6 +182,11 @@ func New(cfg Config) *Panel {
 		mmLogins: map[string]*minimax.DeviceSession{},
 	}
 	p.routes()
+	// CodeArts 号池整理（合并"同一个人被拆成多条"的重复账号）。
+	// 同步做：保活紧接着就要读号池，不能读到整理前的旧数据。
+	p.codeartsMigratePool()
+	// CodeArts 会话保活（华为云会话是空闲超时型，定时打一次能显著延长有效期）。
+	go p.codeartsKeepalive()
 	return p
 }
 
@@ -294,6 +299,10 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/ide/codearts/browser/poll", p.withAuth(p.codeartsBrowserPoll))
 	p.mux.HandleFunc("POST /panel/api/ide/codearts/checkin", p.withAuth(p.codeartsCheckin))
 	p.mux.HandleFunc("POST /panel/api/ide/codearts/add_port", p.withAuth(p.codeartsAddFromPort))
+	p.mux.HandleFunc("GET /panel/api/ide/codearts/api_probe", p.withAuth(p.codeartsAPIProbe))
+	p.mux.HandleFunc("GET /panel/api/ide/codearts/api_test", p.withAuth(p.codeartsAPITest))
+	p.mux.HandleFunc("GET /panel/api/ide/codearts/sniff", p.withAuth(p.codeartsSniffHeaders))
+	p.mux.HandleFunc("POST /panel/api/ide/codearts/refresh", p.withAuth(p.codeartsRefresh))
 	p.mux.HandleFunc("GET /panel/api/ide/doubao/status", p.withAuth(p.doubaoStatus))
 
 	// Trae IDE 本地账号（读号池 / 添加 / 切号）

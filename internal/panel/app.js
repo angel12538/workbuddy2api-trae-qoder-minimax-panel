@@ -2377,7 +2377,13 @@ async function loadTraeStatus(quiet) {
         '<div class="who"><div class="nm" title="' + esc(a.name || '') + '">' + esc(a.name || '未命名') + '</div>' +
         '<div class="id" title="' + esc(idTitle) + '">' + esc(a.user_id || '') + '</div></div>' +
         '<div class="credits" title="当前积分">' + esc(credits) + '</div>' +
-        '<div>' + status + '</div>' +
+        '<div>' + status +
+        (a.credits !== undefined && a.credits !== null
+          ? '<div class="note" style="margin-top:4px">积分 ' + Number(a.credits).toFixed(0) +
+            (a.credits_used ? ' · 已用 ' + Number(a.credits_used).toFixed(0) : '') +
+            (a.today_gain ? ' · 今日 +' + Number(a.today_gain).toFixed(0) : '') +
+            (a.credits_expiring > 0 ? ' · 将过期 ' + Number(a.credits_expiring).toFixed(0) : '') + '</div>'
+          : '') + '</div>' +
         '<div class="acts">' + ckBtn + renewBtn + '</div>' +
         (a.error ? '<div class="err">' + esc(a.error) + '</div>' : '') +
         '</div>';
@@ -4705,7 +4711,9 @@ async function loadCheckinPool(quiet) {
   if (ckPoolLoading) return;
   ckPoolLoading = true;
   try {
-    await Promise.all([loadCkWorkBuddy(quiet), loadCkQoder(quiet), loadCkMiniMax(quiet), loadCkDoubao(quiet)]);
+    // CodeArts 必须在这里调用：漏了它，卡片就永远停在初始的「加载中」。
+    await Promise.all([loadCkWorkBuddy(quiet), loadCkQoder(quiet), loadCkMiniMax(quiet),
+      loadCkDoubao(quiet), loadCkCodeArts(quiet)]);
   } finally { ckPoolLoading = false; }
 }
 
@@ -5151,8 +5159,10 @@ async function loadCkCodeArts(quiet) {
     list.innerHTML = head + arr.map(a => {
       const id = a.id || '';
       const isDone = !!a.checked_in_today;
-      // has_session=false：本地没有这份浏览器会话（登录过期或被清）→ 必须重登。
-      const alive = a.has_session !== false;
+      // 判活只看**会话 Cookie 还能不能调通接口**（login_expired 由后端探测
+      // 积分/活动接口得出）。以前还看"本地有没有浏览器 profile"，但实测
+      // 归档 profile 恢复不了登录态，拿它判活会把好号误判成僵尸。
+      const alive = !a.login_expired;
       const status = isDone
         ? UI.badge('ok', '✓', '今日已签到')
         : (alive ? UI.badge('warn', '○', '可签到') : UI.badge('warn', '○', '需重新登录'));
@@ -5160,11 +5170,23 @@ async function loadCkCodeArts(quiet) {
         ? UI.off('已签到', '今日已签到')
         : (alive
           ? UI.act('data-ca-ck', id, '签到', '今天签到')
-          : UI.off('需重登', '本地浏览器会话已失效，点右上角「添加账号」重新登录一次'));
+          : UI.off('需重登', '华为云会话已失效，点右上角「添加账号」重新登录一次'));
+      // 积分行：每天能领多少 + 一共还剩多少。
+      let credits = '';
+      if (a.credits !== undefined && a.credits !== null) {
+        let s = '剩余 ' + fmtNum(a.credits) + ' 积分';
+        if (a.daily_bonus) s += ' · 每天可领 ' + fmtNum(a.daily_bonus);
+        if (a.credits_used) s += ' · 已用 ' + fmtNum(a.credits_used);
+        if (a.credits_expiring > 0) s += ' · 将过期 ' + fmtNum(a.credits_expiring);
+        if (a.today_gain) s += ' · 今日 +' + fmtNum(a.today_gain);
+        credits = '<div class="note" style="margin-top:4px">' + esc(s) + '</div>';
+      } else if (!alive) {
+        credits = '<div class="note" style="margin-top:4px">会话已失效，积分查不到</div>';
+      }
       return '<div class="trow">' +
         '<div class="who"><div class="nm">' + esc(a.label || 'CodeArts 账号') + '</div>' +
         '<div class="id" title="' + esc(id) + '">' + esc(id) + '</div></div>' +
-        '<div>' + status + '</div>' +
+        '<div>' + status + credits + '</div>' +
         '<div class="acts">' + act +
         UI.sub('data-ca-rm', id, '移除') +
         '</div>' +

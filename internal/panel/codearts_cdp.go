@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/codearts"
+	"bytes"
+	"sort"
+	"sync"
 )
 
 // codearts_cdp.go CodeArts 通道用的 CDP 小工具（打开标签页 / 导航 / 写 Cookie）。
@@ -482,4 +485,70 @@ func caClickByText(ws *wsConn, kw string, maxLen int) (bool, string, error) {
 		return false, loc.Text, err
 	}
 	return true, loc.Text, nil
+}
+
+// caDiscoverPorts 扫描 9333-9433，找出真正在跑 CodeArts 页面的调试端口。
+//
+// 为什么需要：面板的登录会话存在内存里，服务一重启就丢；此时浏览器窗口还开着，
+// 但 poll 只会说"未启动"，用户以为扫描坏了。这里直接按端口探活，把窗口找回来。
+func caDiscoverPorts() []int {
+	var mu sync.Mutex
+	var hits []int
+	var wg sync.WaitGroup
+	for p := 9333; p <= 9433; p++ {
+		wg.Add(1)
+		go func(port int) {
+			defer wg.Done()
+			cl := &http.Client{Timeout: 400 * time.Millisecond}
+			resp, err := cl.Get(fmt.Sprintf("http://127.0.0.1:%d/json/list", port))
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			if bytes.Contains(raw, []byte("devcloud")) && bytes.Contains(raw, []byte("chat")) {
+				mu.Lock()
+				hits = append(hits, port)
+				mu.Unlock()
+			}
+		}(p)
+	}
+	wg.Wait()
+	sort.Ints(hits)
+	return hits
+}
+
+// caGracefulClose 让 Chrome 自己退出（CDP Browser.close），确保 Cookie 落盘。
+//
+// 为什么要这一步：直接 Process.Kill 时 Chrome 来不及把 Cookie 写进
+// Network/Cookies（有写缓存），归档出来的 profile 就是"空壳"——
+// 下次打开页面仍显示「登录华为云」，签到便报"登录已过期"。
+func caGracefulClose(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	cl := &http.Client{Timeout: 3 * time.Second}
+	resp, err := cl.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var v struct {
+		WS string `json:"webSocketDebuggerUrl"`
+	}
+	if json.Unmarshal(raw, &v) != nil || v.WS == "" {
+		return false
+	}
+	ws, err := wsDial(v.WS, 4*time.Second)
+	if err != nil {
+		return false
+	}
+	defer ws.Close()
+	buf, _ := json.Marshal(map[string]any{"id": 1, "method": "Browser.close"})
+	if err := ws.writeText(buf); err != nil {
+		return false
+	}
+	time.Sleep(800 * time.Millisecond) // 给落盘留时间
+	return true
 }
