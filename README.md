@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/social-preview.png" alt="WorkBuddy2API Panel — WorkBuddy / CodeBuddy / Trae / Qoder / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道 多账号合集 → 统一 OpenAI 兼容网关" width="100%">
+  <img src="assets/social-preview.png" alt="WorkBuddy2API Panel — WorkBuddy / CodeBuddy / Trae / Qoder / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道 多账号合集 → 统一 OpenAI 兼容网关" width="100%">
 </p>
 
 <h1 align="center">WorkBuddy2API Panel</h1>
