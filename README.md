@@ -5,8 +5,13 @@
 <h1 align="center">WorkBuddy2API Panel</h1>
 
 <p align="center">
-  <b>一个面板，统管 WorkBuddy / Trae / Qoder / MiniMax 全部账号 → 统一 OpenAI 兼容网关</b><br>
+  <b>一个面板，统管 WorkBuddy / CodeBuddy / Trae / Qoder / MiniMax / 豆包 / 华为云 CodeArts 全部账号 → 统一 OpenAI 兼容网关</b><br>
   Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
+</p>
+
+<p align="center">
+  <b>Multi-platform AI account hub: WorkBuddy · CodeBuddy · Trae · Qoder · MiniMax · Doubao · Huawei Cloud CodeArts — one OpenAI-compatible gateway + web panel.</b><br>
+  Account pool rotation · circuit breaker · session stickiness · daily check-in / keep-alive for every platform · one-click growth tasks.
 </p>
 
 > ### 🧩 平台覆盖（这是一个合集，不只是 CodeBuddy）
@@ -19,11 +24,22 @@
 > | **Qoder** | IDE 账号池 | 账号管理、切号、签到（**每台设备每日限领一个号**）、积分、凭证自动续期 |
 > | **MiniMax Code** | 账号池 | **浏览器登录**（OAuth 设备码 + S256 PKCE，无需本机客户端）、签到、积分、**凭证自动续期**（1h token / 轮换 RT 双向同步客户端）、模型通道（`minimax:` 前缀） |
 > | **豆包（Doubao）** | Cookie 签到池 | 签到（CDP 无头浏览器通道）、多账号、客户端 Cookie 一键提取 / 手动粘贴 |
+> | **华为云 CodeArts（码道）** | Cookie 签到池 | 浏览器登录抓取会话、每日领取签到、**积分总览**（每天可领 / 剩余 / 将过期）、多账号各自独立会话 |
 >
 > - 面板左侧「**IDE 账号池**」视图统管 Qoder / Trae IDE / WorkBuddy 三套客户端账号（添加、切号、移除、积分、签到）。
 > - 面板「**签到池**」视图的「**一键签到**」一个按钮覆盖 **主号池 + WorkBuddy + Qoder + MiniMax + Trae + 豆包** 全部平台，并按平台分别统计成功 / 已签 / 失败。
 > - 模型按 **realm 前缀**分流：`cn:`（国服 CodeBuddy）、`global:`（国际版）、`trae:`（Trae 通道）、`minimax:`（MiniMax 通道）—— 同一套 `/v1/chat/completions` 与 `/v1/responses` 端点即可调用全部平台的模型。
 > - 账号凭证（`accessToken` / `refreshToken`）只落在本机 `auths/`、`data/`，**不入库**。
+
+> ### 🔎 这个仓库能做什么（关键词索引）
+>
+> - **WorkBuddy / CodeBuddy 账号池**、**Trae IDE 账号**、**Qoder 账号**、**MiniMax Code 账号**、**豆包 Doubao 签到**、**华为云 CodeArts 码道签到**
+> - **多账号合集 / 账号池轮转 / 一键切号 / 断路冷却 / 会话粘性**
+> - **每日签到 / 自动签到 / 批量签到 / 保活 / 积分查看**
+> - **OpenAI 兼容网关**、**OpenAI 兼容 API**、`/v1/chat/completions`、`/v1/responses`、**SSE 流式**
+> - **Go 实现**、**单文件部署**、**Docker**、**Web 管理面板**
+>
+> Search keywords: `workbuddy` `workbuddy2api` `codebuddy` `codebuddy2api` `trae` `trae2api` `qoder` `qoder2api` `minimax` `minimax code` `doubao` `codearts` `码道` `openai api gateway` `ai account pool` `daily check-in` `auto check-in` `keep-alive` `openai compatible api` `reverse proxy` `admin panel` `golang`
 
 <p align="center">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
