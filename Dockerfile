@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.23-alpine AS build
+# go.mod 要求 go 1.26.0，基础镜像必须跟上（用 1.23 会直接报 "go.mod requires go >= 1.26.0"）
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download

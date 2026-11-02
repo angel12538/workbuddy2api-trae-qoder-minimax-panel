@@ -4,6 +4,8 @@ data/
 .git/
 .gitignore
 docs/
+# 归档目录（原各平台独立项目的历史源码）：不参与镜像构建，避免 30MB+ 上下文拖慢 CI
+archive/
 scripts/__pycache__/
 # 根目录已提交/未提交的二进制产物不进构建上下文（与 .gitignore 对齐）
 /login

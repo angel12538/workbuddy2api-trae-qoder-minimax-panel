@@ -1,3 +1,5 @@
+//go:build windows
+
 // Command launcher 是 WorkBuddy2API 面板的一键启动器。
 //
 // 双击后：检查 7863 端口 -> 未运行则在后台拉起 wb2api.exe（无控制台窗口）
@@ -6,6 +8,10 @@
 // 编译（隐藏控制台窗口）：
 //
 //	go build -trimpath -ldflags "-s -w -H=windowsgui" -o 打开面板.exe ./cmd/launcher
+//
+// 启动器依赖 Windows 专有 API（syscall.NewLazyDLL / SysProcAttr.HideWindow），
+// 因此带 //go:build windows 约束；非 Windows 平台由 main_stub.go 提供占位实现，
+// 保证 `go build ./...` / `go test ./...` 在 Linux CI 上不失败。
 package main
 
 import (
