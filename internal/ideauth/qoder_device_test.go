@@ -12,6 +12,13 @@ import (
 // runtime-info 指纹（machineToken/machineCode/machineId 三件套）；每设备每日
 // 限领一个账号是服务端硬规则，由扫描结果如实说明。
 func TestQoderDeviceRealFingerprint(t *testing.T) {
+	// 「真实指纹」来自本机装的 Qoder 客户端（runtime-info）。CI / 无客户端的机器上
+	// 取不到，这时断言真实指纹没有意义（会误报失败），直接跳过；
+	// 开发机上有客户端时，下面这些断言照常生效。
+	if info := QoderDeviceInfo(); info == nil || info.MachineToken == "" || info.MachineID == "" {
+		t.Skip("本机没有可用的 Qoder 客户端指纹（runtime-info），跳过真实设备断言")
+	}
+
 	a := &QoderAuth{User: QoderUser{ID: "uid-a", Email: "a@test.com"}}
 	b := &QoderAuth{User: QoderUser{ID: "uid-b", Email: "b@test.com"}}
 

@@ -56,8 +56,13 @@ func TestCheckinRecordTrustedRequiresPost1005(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("IDEAUTH_POOL_DIR", dir)
 
+	// 日期一律按 Qoder 的 UTC+8 基准取「今天」——判定逻辑也是这个口径
+	// （见 checkinDayLoc）。用机器本地日期会让本测试在非 UTC+8 机器上
+	// （CI 是 UTC）随运行时刻漂移：跨过 CST 零点就整条判错。
+	today := time.Now().In(qoderCST).Format("2006-01-02")
+
 	// 今日 09:00 的记录：旧版误报形态 → 不可信
-	writeLog(t, dir, "qoder:a@x.com", time.Now().Format("2006-01-02")+"T09:00:00+08:00")
+	writeLog(t, dir, "qoder:a@x.com", today+"T09:00:00+08:00")
 	if CheckinRecordTrusted("qoder", "a@x.com") {
 		t.Fatal("10:05 前写入的记录不可信")
 	}
@@ -66,13 +71,13 @@ func TestCheckinRecordTrustedRequiresPost1005(t *testing.T) {
 	}
 
 	// 今日 11:00 的记录：可信
-	writeLog(t, dir, "qoder:b@x.com", time.Now().Format("2006-01-02")+"T11:00:00+08:00")
+	writeLog(t, dir, "qoder:b@x.com", today+"T11:00:00+08:00")
 	if !CheckinRecordTrusted("qoder", "b@x.com") {
 		t.Fatal("10:05 后写入的记录应可信")
 	}
 
 	// 旧格式（纯日期）兼容读取；但无时刻信息 → 落在线前 → 不可信
-	writeLog(t, dir, "qoder:c@x.com", time.Now().Format("2006-01-02"))
+	writeLog(t, dir, "qoder:c@x.com", today)
 	if !CheckedInToday("qoder", "c@x.com") {
 		t.Fatal("旧格式纯日期记录应按当日解析")
 	}
@@ -81,7 +86,7 @@ func TestCheckinRecordTrustedRequiresPost1005(t *testing.T) {
 	}
 
 	// 昨天的记录：既不是今日，也不可信
-	writeLog(t, dir, "qoder:d@x.com", time.Now().AddDate(0, 0, -1).Format(time.RFC3339))
+	writeLog(t, dir, "qoder:d@x.com", time.Now().In(qoderCST).AddDate(0, 0, -1).Format(time.RFC3339))
 	if CheckedInToday("qoder", "d@x.com") || CheckinRecordTrusted("qoder", "d@x.com") {
 		t.Fatal("昨天的记录不应算今日已签")
 	}

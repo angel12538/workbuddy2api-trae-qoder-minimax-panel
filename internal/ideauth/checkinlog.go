@@ -174,13 +174,13 @@ func parseCheckinStamp(v string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// CheckedInToday 报告某签到对象今日是否已签到（本地时区的自然日）。
+// CheckedInToday 报告某签到对象今日是否已签到（按平台时区基准的自然日）。
 func CheckedInToday(kind, key string) bool {
 	t, ok := CheckedInAt(kind, key)
 	if !ok {
 		return false
 	}
-	return t.Local().Format("2006-01-02") == time.Now().Format("2006-01-02")
+	return sameCheckinDay(kind, t)
 }
 
 // CheckedInAt 返回最近一次签到记录的时刻。历史纯日期记录回落为当日 00:00。
@@ -200,22 +200,37 @@ func CheckinRecordTrusted(kind, key string) bool {
 	// 活动）时写入，是硬证据；Entries 那条时刻线只是防「昨天的陈旧活动被当成今天
 	// 已领」的保守判据，本机时钟一慢就会把真领到的号误杀（实测这台机器钟慢 8 小时：
 	// 真领到的那次被记成 04:39，落在 10:05 线前 → 面板整天显示「没签上」）。
-	if c, ok := LastClaimedAt(kind, key); ok && sameLocalDay(c) {
+	if c, ok := LastClaimedAt(kind, key); ok && sameCheckinDay(kind, c) {
 		return true
 	}
 	t, ok := CheckedInAt(kind, key)
 	if !ok {
 		return false
 	}
-	if !sameLocalDay(t) {
+	if !sameCheckinDay(kind, t) {
 		return false // 非今日记录一律不可信（已过期）
 	}
 	return !t.Before(checkinTrustLine(kind))
 }
 
-// sameLocalDay 这条时刻是否落在「今天」（本地自然日）。
-func sameLocalDay(t time.Time) bool {
-	return t.Local().Format("2006-01-02") == time.Now().Format("2006-01-02")
+// checkinDayLoc 该平台的「今天」用哪个时区基准。
+//
+// Qoder 的每日活动按 **UTC+8** 刷新（campaignId 每日本地 10:00 才下发），所以
+// 「今天」与「10:05 可信线」都必须按 UTC+8 判定。原先统一用机器本地时区：在
+// 本机（UTC+8）恰好正确，问题被完全掩盖；换到 UTC 机器（CI / 海外服务器）上
+// 整条线会偏 8 小时——11:00 (UTC+8) 写下的**真实**记录会被判成「线前」→ 不可信。
+// 其余平台按自然日刷新，继续用本地时区。
+func checkinDayLoc(kind string) *time.Location {
+	if strings.EqualFold(strings.TrimSpace(kind), "qoder") {
+		return qoderCST
+	}
+	return time.Local
+}
+
+// sameCheckinDay 这条时刻是否落在该平台的「今天」（按平台时区基准的自然日）。
+func sameCheckinDay(kind string, t time.Time) bool {
+	loc := checkinDayLoc(kind)
+	return t.In(loc).Format("2006-01-02") == time.Now().In(loc).Format("2006-01-02")
 }
 
 // checkinTrustLine 本地签到记录的可信分界线（今日本地时间的时刻）。
@@ -232,17 +247,20 @@ func sameLocalDay(t time.Time) bool {
 //     （2026-10-27 实测：08:47 豆包两个号签到成功，号池列表仍返回
 //     checked_in_today=false，按钮一直是蓝底可点）。
 func checkinTrustLine(kind string) time.Time {
-	now := time.Now()
+	loc := checkinDayLoc(kind)
+	now := time.Now().In(loc)
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "qoder":
-		return time.Date(now.Year(), now.Month(), now.Day(), 10, 5, 0, 0, time.Local)
+		// Qoder 的活动 10:00 (UTC+8) 刷新 → 可信线是 UTC+8 的 10:05（不是机器本地时间，
+		// 否则 UTC 机器上整条线偏 8 小时，见 checkinDayLoc 注释）。
+		return time.Date(now.Year(), now.Month(), now.Day(), 10, 5, 0, 0, loc)
 	default:
 		// 自然日刷新：今日零点起就算可信。
-		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	}
 }
 
-// qoderCheckinTrustLine 本地签到记录的可信分界线（今日 10:05 本地时间）。
+// qoderCheckinTrustLine Qoder 本地签到记录的可信分界线（今日 10:05 UTC+8）。
 func qoderCheckinTrustLine() time.Time {
 	return checkinTrustLine("qoder")
 }
