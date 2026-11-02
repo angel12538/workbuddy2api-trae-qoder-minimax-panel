@@ -14,6 +14,28 @@
   Account pool rotation · circuit breaker · session stickiness · daily check-in / keep-alive for every platform · one-click growth tasks.
 </p>
 
+> ### ⚠️ 用 Qoder 签到前先看这条：一台电脑不要登两个人的号
+>
+> Qoder 的每日 100 Credits 由服务端**按归属发放**，判定码是
+> `SAME_PERSON_ALREADY_CLAIMED` —— 一旦两个账号被服务端归到**同一份归属**下，
+> 当天就**只能领到一份**，另一个号领不到（面板会如实显示"今天没签上"，
+> **不会**假报已签到）。
+>
+> - **一台电脑上不要登录两个人的 Qoder 账号**：省得白折腾，两个号会共用一份额度。
+> - **同一个人的多个号**放在一台电脑上，也一样只有一份（服务端就发一份，先打先得）。
+> - 想让每个号各领各的：用**不同身份注册的账号**，并**分开在不同机器 / 不同环境**上登录。
+>
+> 实测边界（2026-11-02 真打上游，别被传言带偏）：
+>
+> | 尝试 | 结果 |
+> |---|---|
+> | 伪造整套 `Cosy-MachineToken` / `Cosy-MachineCode` / `Cosy-MachineId` | 判定**一字不变**（grantId 相同、仍回 `SAME_PERSON_ALREADY_CLAIMED`）→ 请求头里的设备指纹**不参与**判定 |
+> | 完全不带 `Cosy-*` 设备头 | 判定仍然**一字不变** → 同上 |
+> | 两个账号的 `agentAccountScope` | **不同**（`7c3816b4…` vs `9ecb3ca9…`）却照样共享一份额度 → scope 也不是分组键 |
+> | 换浏览器登录（网页控制台） | 与客户端**同一套接口、同一个 uid** → 拿不到第二份额度 |
+>
+> 也就是说：**客户端侧没有任何开关能绕开它** —— 只能靠"换身份 + 换环境"。
+
 > ### 🧩 平台覆盖（这是一个合集，不只是 CodeBuddy）
 >
 > | 平台 | 接入形态 | 面板能力 |
@@ -21,7 +43,7 @@
 > | **CodeBuddy / WorkBuddy 国内版** | 主号池（`auths/*.json`） | 聊天网关、签到、余额、成长任务一键完成、模型与档位 |
 > | **WorkBuddy 国际版** | 主号池（`realm=global`） | 同上（国际版无签到 / 成长体系） |
 > | **Trae** | IDE 账号池 | 账号管理、切号、签到、积分、客户端提取令牌 |
-> | **Qoder** | IDE 账号池 | 账号管理、切号、签到（**每日额度按「人」发，同一人的多个号共享一份**）、积分、凭证自动续期 |
+> | **Qoder** | IDE 账号池 | 账号管理、切号、签到（**每日额度按服务端归属发，同一归属的多个号共享一份**）、积分、凭证自动续期 |
 > | **MiniMax Code** | 账号池 | **浏览器登录**（OAuth 设备码 + S256 PKCE，无需本机客户端）、签到、积分、**凭证自动续期**（1h token / 轮换 RT 双向同步客户端）、模型通道（`minimax:` 前缀） |
 > | **豆包（Doubao）** | Cookie 签到池 | 签到（CDP 无头浏览器通道）、多账号、客户端 Cookie 一键提取 / 手动粘贴 |
 > | **华为云 CodeArts（码道）** | Cookie 签到池 | 浏览器登录抓取会话、每日领取签到、**积分总览**（每天可领 / 剩余 / 将过期）、多账号各自独立会话 |
@@ -48,7 +70,7 @@
 > | 你会搜的 | 本项目里对应的东西 |
 > |---|---|
 > | **Trae 签到** / Trae 账号池 / Trae 积分 / Trae 切号 | 面板「IDE 账号池」直接管 Trae IDE 账号：切号、签到、积分、客户端提取令牌 |
-> | **Qoder 签到** / Qoder 免费额度 / Qoder 多账号 / Qoder 换号 | 每日额度按**人**发（服务端判定码 `SAME_PERSON_ALREADY_CLAIMED`），同一人的多个号共享一份，凭证自动续期 |
+> | **Qoder 签到** / Qoder 免费额度 / Qoder 多账号 / Qoder 换号 | 每日额度按**服务端归属**发（判定码 `SAME_PERSON_ALREADY_CLAIMED`），同一归属的多个号共享一份，凭证自动续期 |
 > | **MiniMax 签到** / MiniMax Code / MiniMax 接入 / minimax 模型 | 浏览器 OAuth 设备码登录（免装客户端），`minimax:` 前缀直通模型 |
 > | **豆包签到** / Doubao 多账号 / doubao 签到 | Cookie 签到池 + 无头浏览器通道，客户端 Cookie 一键提取 |
 > | **CodeArts 签到** / 码道签到 / 华为云码道 / CodeArts 积分 | 每日领取 + **积分总览**（每天能领多少 / 一共还剩多少 / 将过期） |
@@ -1036,17 +1058,23 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 **为什么「N 个号各签各的」在 Qoder 上做不到（2026-11-02 实测钉死）**
 
-每日 100 Credits 是发给**一个人**的，不是发给一个账号、也不是发给一台设备。实测证据：
+每日 100 Credits 发给**一份归属**（服务端判定码 `SAME_PERSON_ALREADY_CLAIMED`），不是发给一个账号、也不是发给一次请求。实测证据：
 
-1. **服务端自己就是这么判的**：同一个人的另一个号去查那条活动实例，服务端回
-   `{"status":"BLOCKED","failureCode":"SAME_PERSON_ALREADY_CLAIMED"}`，而且给它**单独建了一条 grant**（grantId 与本人的不同）—— 这是对「人」的判定。
-2. **两个号的 `agentAccountScope` 其实不同**（`qq=7c3816b4…`、`gmail=9ecb3ca9…`，用客户端数据里的 `serverRuntimeId` 与服务端 `GET /api/v1/agents` 交叉验证得到），却照样共享同一份额度 ⇒ **scope 不是分组键**。
-3. **设备完全无关**：两个号的 `machine_id` / `device_id` 都不同；伪造整套 `Cosy-*` 头也改不了判定（设备头只是「有没有设备」的开关）。
+1. **服务端自己就是这么判的**：同一归属下的另一个号去查那条活动实例，服务端回
+   `{"status":"BLOCKED","failureCode":"SAME_PERSON_ALREADY_CLAIMED"}`，而且给它**单独建了一条 grant**（grantId 与本人的不同）。
+2. **请求头的设备指纹完全无关**：伪造整套 `Cosy-MachineToken` / `Cosy-MachineCode` / `Cosy-MachineId`，甚至完全不带 `Cosy-*`，判定与 grantId **一字不变**。
+3. **两个号的 `agentAccountScope` 其实不同**（`qq=7c3816b4…`、`gmail=9ecb3ca9…`，用客户端数据里的 `serverRuntimeId` 与服务端 `GET /api/v1/agents` 交叉验证得到），却照样共享同一份额度 ⇒ **scope 不是分组键**。
 4. **网页登录也不是另一份额度**：把成长页的前端 JS 拉下来看，它用的接口与客户端**完全一样**（`/sash/api/v1/me/campaigns`、其下的 `/claim` 与 `/reward`），只是认证方式不同（Cookie vs Bearer token），身份还是同一个 uid。所以「换浏览器登录就能多领一份」**不成立**。
 
-> 想要**更多份**每日额度，只有这两条路（都跟换设备、换登录方式无关）：
+> **实践口径（照着做，别踩坑）**：
 >
-> 1. **换一个身份注册的账号**（另一个实名 / 另一个人）—— 服务端按人发，不同人各拿各的；
+> - **一台电脑上不要登两个人的 Qoder 账号** —— 会被归到同一份归属，两个号只领得到一份；
+> - **同一个人的多个号**放一台电脑，一天也只有一份（面板会按「最久没领到的号优先」自动轮转）；
+> - **想各领各的**：用**不同身份注册的账号**，并**分开在不同机器 / 不同环境**上登录。
+
+> 想要**更多份**每日额度，除此之外只有这两条路（都跟换设备、换登录方式无关）：
+>
+> 1. **换一个身份注册的账号**（另一个实名 / 另一个人）—— 不同归属各拿各的；
 > 2. **国内版 Qoder**（`qoder.com.cn` / `openapi.qoder.com.cn`）—— 实测那是**独立部署的独立租户**（连鉴权体系都不同，global 的 token 在那边一律 `401 TOKEN_EXPIRE`），活动与额度池跟国际版不是一套。
 
 之后每天就是后台一键：每个号用自己的 token 直接打接口，不需要再登录任何东西。
