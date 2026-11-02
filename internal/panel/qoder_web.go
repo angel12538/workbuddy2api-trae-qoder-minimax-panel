@@ -1,15 +1,17 @@
 // qoder_web.go Qoder「网页登录并签到」——每个号一个独立浏览器 profile。
 //
-// 为什么走网页而不是桌面客户端（2026-10-24 修正）：
+// 为什么保留网页通道（2026-11-02 实测修正）：
 // 官方活动页写明「Claim 100 Credits Daily，**只能在 Qoder 桌面客户端领取**」，
 // 但**网页控制台（qoder.com/account/usage）同样能领**——它的成长页
 // （openapi.qoder.sh/growth-page/activity-iframe）就是同一个领取入口。
-// 之前面板写成「Qoder 的可用状态只存在于桌面客户端」，这是**错的**，已更正。
 //
-// 关键收益：**每个号一份独立浏览器 profile = 一份独立的网页会话**。
-// 服务端把每日额度按"人"发（实测 failureCode=SAME_PERSON_ALREADY_CLAIMED），
-// 而网页端的会话身份与浏览器 profile 绑定 —— 于是每个号都能领自己那份，
-// 不再互相抢同一个名额。
+// ⚠️ 但网页**不是**另一份额度：把成长页的前端 JS 拉下来看，它用的接口与客户端
+// **完全一样**（GET /sash/api/v1/me/campaigns、POST /sash/api/v1/me/campaigns/{id}/claim、
+// GET /sash/api/v1/me/campaigns/{id}/reward），认证方式不同（Cookie vs Bearer token），
+// 身份也一样（同一个 uid）。所以：
+//   · 换网页登录**不能**让一个号多领一份每日额度（额度按**人**发，见 qoder_person.go）；
+//   · 但它仍有价值：① 客户端没装/没登录时也能签；② 每个号一份独立 profile，
+//     互不串登录态；③ 会话过期时可以用同一 profile 再起一次浏览器续上。
 //
 // 流程：
 //  1. 每号一个 profile 目录 data/qoder-web/<账号哈希>/，启动浏览器打开
@@ -165,6 +167,7 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		st.done = true
 		st.ok = false
 		st.message = "等待登录超时，请重新开始"
+		qoderWebClose(st)
 		qoderWebSessions.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "expired": true, "message": st.message})
 		return
@@ -195,6 +198,7 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		st.done = true
 		st.ok = false
 		st.message = "这个浏览器会话拿不到 openapi 的授权（HTTP " + fmt.Sprint(status) + "）。请在窗口里确认登录的是 Qoder 账号后重试。"
+		qoderWebClose(st)
 		qoderWebSessions.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": false, "message": st.message})
 		return
@@ -261,7 +265,7 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		ok = true
 		msg = fmt.Sprintf("今天已领取（+%.0f Credits）", amount)
 	default:
-		msg = "这个号今天没有可领的每日额度（可能已被同额度组/同一实名的另一账号领走）"
+		msg = "这个号今天服务端没有下发可领的每日额度（可能是同一个人的另一个账号已经领走了那一份）"
 	}
 
 	// 会话存进该账号的 profile 目录（cookies.json）：之后每天后台直接用，
@@ -271,6 +275,8 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 			log.Printf("panel: Qoder 网页会话落盘失败 %s: %v", email, err)
 		}
 	}
+	// 浏览器用完就关：留着窗口既占内存又让用户以为"还有事没做完"。
+	qoderWebClose(st)
 	qoderWebSessions.mu.Lock()
 	st.done = true
 	st.ok = ok
@@ -278,6 +284,23 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	qoderWebSessions.mu.Unlock()
 	log.Printf("panel: Qoder 网页登录 %s -> %s", email, msg)
 	writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": ok, "message": msg, "email": email})
+}
+
+// qoderWebClose 关掉这次登录用的浏览器进程（幂等）。
+//
+// 为什么必须有：网页登录是「起一个浏览器窗口让人登录」的交互，一次流程结束后
+// 浏览器还开着 —— 一个个窗口攒起来既占内存，也会让人以为流程没结束。
+func qoderWebClose(st *qoderWebState) {
+	if st == nil || st.proc == nil {
+		return
+	}
+	p := st.proc
+	st.proc = nil
+	if p.Process == nil {
+		return
+	}
+	_ = p.Process.Kill()
+	_, _ = p.Process.Wait()
 }
 
 // saveQoderWebCookies 把网页会话 Cookie 落到该账号的 profile 目录（0600）。

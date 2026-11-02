@@ -113,10 +113,15 @@ func QoderDeviceID() (string, error) {
 	return extractJSONString(b, "deviceId"), nil
 }
 
-// QoderScope 从 qoder-data.v1.json 读取 agentAccountScope（账号绑定标识）。
+// QoderScope 从 qoder-data.v1.json 读取 agentAccountScope。
 //
-// ⚠️ 这是**服务端按账号归属（实名/租户）下发**的额度组标识：同一 scope 下的多个
-// 账号共享同一份每日签到额度（2026-11-02 实测，见 QoderQuotaGroupKey）。
+// ⚠️ 注意这是**主文件**（主账号）的 scope，不是「当前登录的那个号」的 scope ——
+// 客户端把主账号的数据放在主文件里，其余账号的数据放在 qoder-data.v1.ext.json 的
+// accounts 映射里（键就是各账号的 scope）。号池要存某个账号自己的 scope，
+// 要用 QoderAccountScope（按服务端 runtime id 交叉验证，见 qoder_scope_owner.go）。
+//
+// 另外：scope **不是**每日额度的分组键（实测两个 scope 不同的号共享同一份额度，
+// 见 QoderQuotaGroupKey）。
 func QoderScope() (string, error) {
 	b, err := os.ReadFile(filepath.Join(QoderDataDir(), "qoder-data.v1.json"))
 	if err != nil {
@@ -158,7 +163,14 @@ func CaptureQoderSnapshot() (*QoderSnapshot, error) {
 	}
 	mid, _ := QoderMachineID()
 	did, _ := QoderDeviceID()
-	scope, _ := QoderScope()
+	// scope 取**这个账号自己的**（按服务端 runtime id 交叉验证），不能直接读
+	// 主文件：主文件里放的是主账号的数据，2026-11-02 实测正是这里把 gmail 的
+	// scope 存成了 qq 的（两个号 scope 其实不同）。
+	// 解不出来就留空 —— 空代表「未知」，比存一个错的强。
+	scope, ok := qoderAccountScopeByRuntime(a, qoderDeviceForAccount(a), currentQoderScope())
+	if !ok {
+		scope = ""
+	}
 	return &QoderSnapshot{
 		Email:     a.User.Email,
 		UserID:    a.User.ID,

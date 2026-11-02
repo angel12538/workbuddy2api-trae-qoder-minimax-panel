@@ -27,15 +27,29 @@ import (
 // 「可信」（今日 10:05 之后写入的完整时间戳）时用于兜底。
 
 // fakeQoderUpstream 假的活动列表服务：按 Authorization 里的 token 决定返回什么。
+//
+// 也兼做**奖励查询**（GET .../campaigns/{cid}/reward，只读）：实例主人查 →
+// CLAIMED；别的号查 → BLOCKED + SAME_PERSON_ALREADY_CLAIMED（2026-11-02 实测
+// 上游就是这个形状）。
 func fakeQoderUpstream(t *testing.T, campaignsByToken map[string]string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/reward") {
+			body, ok := campaignsByToken[tok]
+			if ok && strings.Contains(body, "CLAIM_BENEFIT") {
+				_, _ = w.Write([]byte(`{"grantId":"grant-` + tok + `","status":"CLAIMED","benefit":{"amount":100}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"grantId":"grant-` + tok +
+				`","status":"BLOCKED","failureCode":"SAME_PERSON_ALREADY_CLAIMED","benefit":{"amount":100}}`))
+			return
+		}
 		body, ok := campaignsByToken[tok]
 		if !ok {
 			body = `{"campaigns":[]}`
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
@@ -205,10 +219,10 @@ func TestQoderScanDeviceQuotaExplained(t *testing.T) {
 		t.Error("b@x.com：上游没有今日活动，不该判已签到")
 	}
 	if !b.DeviceQuotaUsed {
-		t.Error("b@x.com：同设备其它号已领名额，应标记 device_quota_used")
+		t.Error("b@x.com：服务端判定同一个人的另一个号已领名额，应标记 same_person_taken")
 	}
-	if !strings.Contains(b.Msg, "同额度组") {
-		t.Errorf("b@x.com：msg 应说明额度被同额度组（同一实名）的账号领走，实际 %q", b.Msg)
+	if !strings.Contains(b.Msg, "同一个人") {
+		t.Errorf("b@x.com：msg 应说明额度被同一个人的另一个账号领走，实际 %q", b.Msg)
 	}
 	if b.QuotaTakenBy != "a@x.com" {
 		t.Errorf("b@x.com：应点名 a@x.com 领到了额度，实际 %q", b.QuotaTakenBy)

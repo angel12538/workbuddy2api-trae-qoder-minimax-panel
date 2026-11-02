@@ -321,13 +321,12 @@ type QoderCheckinResult struct {
 	ClaimedToday bool `json:"claimed_today,omitempty"`
 	// CheckedInToday 面板观察到该账号今天已完成领取。
 	CheckedInToday bool `json:"checked_in_today,omitempty"`
-	// Scope 该账号归属的额度组（服务端下发的 agentAccountScope）。
+	// Scope 该账号的 agentAccountScope（agent 租户位标识）。
 	//
-	// 2026-11-02 实测：每日 100 Credits 按**账号归属的 scope** 发，不是按设备。
-	// 同 scope 的多个账号共享同一份额度，所以「一个设备只能签一个号」的真相是
-	// 「一个实名（scope）只能签一个号」。
+	// ⚠️ 它不是每日额度的分组键：2026-11-02 实测两个号的 scope 其实**不同**，
+	// 却照样共享同一份每日额度（服务端按人发）。
 	Scope string `json:"scope,omitempty"`
-	// QuotaGroup 本账号所在额度组里的账号数（含自己）。>1 = 与别的号共享每日额度。
+	// QuotaGroup 本账号所在**同一人组**里的账号数（含自己）。>1 = 与别的号同一人。
 	QuotaGroup int `json:"quota_group,omitempty"`
 	// QuotaTakenBy 同组里今天领到每日额度的账号（空 = 组里还没人领）。
 	QuotaTakenBy string `json:"quota_taken_by,omitempty"`
@@ -1126,10 +1125,10 @@ func qoderCampaignsOf(raw []byte) []QoderCampaign {
 // 2026-11-02 实测再修正：设备指纹只是「有没有设备」的开关，**不是每日额度的归属键**。
 // 伪造整套 Cosy-* 头（machineToken/machineCode/machineId 全换）服务端照样返回同一
 // 条活动；刷新 device token 的响应里更是没有任何 scope/设备字段。真正的归属键是
-// **账号归属的 scope（同一实名/租户）** —— 同 scope 的账号共享一份每日额度。
-// 详见 QoderQuotaGroupKey。
+// **人**（服务端判定码 SAME_PERSON_ALREADY_CLAIMED），与账号、scope 都无关。
+// 详见 QoderQuotaGroupKey 与 qoder_person.go。
 //
-// 所以这里发真实指纹（保证活动会被下发），额度归属交给 scope 分组处理。
+// 所以这里发真实指纹（保证活动会被下发），额度归属交给「同一人」判定处理。
 func qoderDeviceForAccount(auth *QoderAuth) *QoderDevice {
 	dev := QoderDeviceInfo()
 	if dev == nil {

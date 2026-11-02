@@ -1,7 +1,6 @@
 package ideauth
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -19,8 +18,9 @@ import (
 // 之前的实现只调 QoderCheckin()（读磁盘上的当前登录态），于是面板里明明有两个号，
 // 签到池也只显示/只能签当前那一个。本文件补上「按账号批量签到」的能力。
 //
-// ⚠️ 每日额度不是每个号一份（2026-11-02 实测）：服务端按**账号归属的 scope**
-// （同一实名/租户）发，同 scope 的多个账号共享**一份**。详见 QoderQuotaGroupKey。
+// ⚠️ 每日额度不是每个号一份（2026-11-02 实测）：服务端按**人**发 —— 同一个人的
+// 多个账号共享**一份**（判定码 SAME_PERSON_ALREADY_CLAIMED），与设备、账号、
+// agentAccountScope 都无关。详见 QoderQuotaGroupKey 与 qoder_person.go。
 
 // QoderCheckinPoolResult 一次多号签到的汇总（面板直接展示）。
 type QoderCheckinPoolResult struct {
@@ -31,6 +31,9 @@ type QoderCheckinPoolResult struct {
 	// Blocked 今天**没签上**的账号数：服务端判定「同一个人另一账号已领走每日额度」。
 	// 这不是失败（重试也没用），也不是"已签到"（本号根本没领到）—— 单列一栏。
 	Blocked int `json:"blocked_accounts"`
+	// Pending 今天服务端**没有给本号下发**每日额度的账号数（与"被别人领走"不同：
+	// 被领走的是同一个人；pending 是这个号本来就不在当天活动名单里）。
+	Pending int `json:"pending_accounts"`
 	// Credits 本次**新增**的积分（只累加 claimed）；AlreadyCredits 是今日已领账号的额度，
 	// 单独返回，避免把「今日已领」误报成「本次又赚了」。
 	Credits        float64 `json:"credits_total"`
@@ -118,35 +121,26 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 	baseDev := QoderDeviceInfo()
 	out.NoDevice = baseDev == nil || baseDev.MachineToken == ""
 
-	// 额度组：同一 scope 的账号共享**同一份**每日额度（2026-11-02 实测）。
-	// 组内只有一个人能领到今天的 100 Credits；组与组之间互不影响。
-	groupOf := map[string]string{} // 邮箱(小写) → 组键
-	groupSize := map[string]int{}  // 邮箱(小写) → 组内账号数
-	for _, a := range pool.Accounts {
-		em := strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a)))
-		if em == "" {
-			continue
-		}
-		groupOf[em] = QoderQuotaGroupKey(a)
-	}
-	for _, ems := range QoderQuotaGroups(pool.Accounts) {
-		for _, em := range ems {
-			groupSize[strings.ToLower(em)] = len(ems)
-		}
-	}
+	// 「同一人」分组：**只认服务端判定过的关系**。
+	//
+	// 2026-11-02 实测推翻了上一版的做法：两个号的 agentAccountScope 其实**不同**
+	// （qq=7c3816b4…、gmail=9ecb3ca9…，用客户端数据里的 serverRuntimeId 与服务端
+	// /api/v1/agents 交叉验证得到），可它们照样共享同一份每日额度 —— 服务端对
+	// gmail 明确回了 failureCode=SAME_PERSON_ALREADY_CLAIMED。
+	// ⇒ scope 不是额度分组键；「是不是同一个人」只能问服务端（见 qoder_person.go）。
+	groupSize := QoderSamePersonGroupSizes(pool.Accounts)
 
 	changed := false
 	// 本次运行里已知的活动实例 id（账号 → cid）：先领到的号会贡献自己的 cid，
-	// 后面的号就拿它去探「同一人是否已领」。
+	// 后面的号就拿它去**只读**问一次「我是不是同一个人」。
 	knownCID := map[string]string{}
-	// 需要二次探测的账号（自己的列表里没有今天的活动）。
+	// 需要二次判定的账号（自己的列表里没有今天的活动）。
 	type pendingProbe struct {
 		snap  *QoderSnapshot
 		email string
 		res   *QoderCheckinResult
 		auth  *QoderAuth
 		dev   *QoderDevice
-		group string
 	}
 	var probes []pendingProbe
 
@@ -177,12 +171,9 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			}
 		}
 		if res.Phase == "pending" {
-			// 自己的列表里没有今天的活动：交给下面的二次探测（那里才是这类账号的
-			// 归宿 —— 要么拿**同额度组**兄弟号的实例 id 问出 SAME_PERSON 判定，
-			// 要么用本地可信记录兜底成「今日已领取」）。
+			// 自己的列表里没有今天的活动：交给下面的二次判定（只读地问服务端）。
 			probes = append(probes, pendingProbe{
 				snap: snap, email: email, res: res, auth: auth, dev: dev,
-				group: groupOf[strings.ToLower(strings.TrimSpace(email))],
 			})
 			continue
 		}
@@ -209,95 +200,141 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		out.Results = append(out.Results, *res)
 	}
 
-	// 二次探测：自己的列表里没有今天的活动 → 拿**同一额度组**另一个账号的活动实例
-	// id 去领一次，向服务端要一个真实判定（而不是含糊地说"暂无活动"）。
+	// 二次判定：自己的列表里没有今天的活动 → **只读**地问服务端「我是不是那个人」。
 	//
-	// 实测（2026-10-24）：同组另一个账号领过之后，服务端回
-	// status=BLOCKED / failureCode=SAME_PERSON_ALREADY_CLAIMED —— 说明这个号
-	// 今天的每日额度已经被「同一个人」的另一个账号领走了，本号确实无需再领。
-	// 若这次反而领成功（服务端放行），那就是真·领到，按 claimed 计。
+	// 做法：拿号池里另一个账号今天那条活动实例 id，用**只读**接口
+	// GET /sash/api/v1/me/campaigns/{cid}/reward 问两次 —— 一次用本号凭证，
+	// 一次用实例主人的凭证，然后比 grantId / failureCode：
 	//
-	// ⚠️ 只能取**同额度组**的 cid（2026-11-02 修正）。额度组 = 服务端 scope，
-	// 同组共享一份每日额度；不同组的账号各有各的额度，拿别的组的实例 id 去领，
-	// 服务端回的就不再是 SAME_PERSON 判定，而本号可能**自己就能领** —— 拿错
-	// 会把一个本来能领的号误判成「额度已被领走」。
+	//	grantId 相同                    → 本号就是主人（今天这份在本号账上）
+	//	BLOCKED + SAME_PERSON_ALREADY_… → 服务端判定**同一个人**，对方已领走
+	//	其它                            → 不是同一个人（本号今天只是没被发额度）
+	//
+	// ⚠️ 为什么改成只读（2026-11-02）：上一版是拿别人的实例 id 去 POST claim，
+	// 那是**写操作** —— 万一两个号不是同一个人，就可能把别人的额度领走。
+	// 只读判定拿到的结论一样（服务端同样回 SAME_PERSON_ALREADY_CLAIMED），
+	// 但绝不碰别人的额度。
+	//
+	// ⚠️ 为什么候选不再按 scope 过滤：实测两个号的 scope **不同**却共享同一份
+	// 额度（scope 不是分组键），按 scope 过滤会把真正的「同一人」排除掉。
 	for i := range probes {
 		p := &probes[i]
-		cid := ""
-		// 同组候选按邮箱排序，保证每次挑到的是同一个（map 遍历顺序随机）。
+		// 候选按邮箱排序，保证每次挑到的是同一个（map 遍历顺序随机）。
 		var candidates []string
 		for em := range knownCID {
 			if strings.EqualFold(em, p.email) {
 				continue
 			}
-			if groupOf[strings.ToLower(em)] != p.group {
-				continue
-			}
 			candidates = append(candidates, em)
 		}
 		sort.Strings(candidates)
-		if len(candidates) > 0 {
-			cid = knownCID[strings.ToLower(candidates[0])]
+		// 号池快照里可能已存着别的号的实例 id（上次扫描记下的）。
+		var snapCands []string
+		for _, o := range pool.Accounts {
+			if o == nil || o.ClaimCID == "" {
+				continue
+			}
+			if strings.EqualFold(o.Email, p.email) {
+				continue
+			}
+			snapCands = append(snapCands, strings.TrimSpace(o.Email))
 		}
-		if cid == "" {
-			// 号池快照里可能已存着别的号的实例 id（上次扫描记下的）。
-			for _, o := range pool.Accounts {
-				if o == nil || o.ClaimCID == "" {
-					continue
-				}
-				if strings.EqualFold(o.Email, p.email) {
-					continue
-				}
-				if groupOf[strings.ToLower(strings.TrimSpace(o.Email))] != p.group {
-					continue
-				}
-				cid = o.ClaimCID
+		sort.Strings(snapCands)
+
+		verdict := QoderVerdictUnknown
+		holder := ""
+		amount := 0.0
+		claimedAt := ""
+		for _, em := range candidates {
+			cid := knownCID[strings.ToLower(em)]
+			holderAuth := qoderPoolAuth(pool.Accounts, em)
+			if cid == "" || holderAuth == nil {
+				continue
+			}
+			ownerProbe := qoderProbeReward(p.auth, p.dev, cid, QoderQuotaScopeKey(p.snap))
+			holderProbe := qoderProbeReward(holderAuth, baseDev, cid, QoderQuotaScopeKey(p.snap))
+			v := qoderPersonVerdict(ownerProbe, holderProbe)
+			if v == QoderVerdictSamePerson || v == QoderVerdictOwner {
+				verdict, holder = v, em
+				amount = ownerProbe.Credits
+				claimedAt = ownerProbe.ClaimedAt
 				break
 			}
-		}
-		if cid == "" {
-			// 同组里没有别的号的活动实例可比 → 只能按"活动未下发"如实说。
-			if CheckinRecordTrusted("qoder", p.email) {
-				p.res.Phase = "already"
-				p.res.Msg = "今日已领取（本地记录）"
-				p.res.CheckedInToday = true
-				out.Already++
-				out.AlreadyCredits += p.res.Credits
-				_ = MarkCheckedIn("qoder", p.email)
-			} else {
-				out.Failed++
+			if v == QoderVerdictOther && verdict == QoderVerdictUnknown {
+				// 明确判定「不是同一个人」：本号今天没被发额度，与对方无关。
+				verdict = QoderVerdictOther
 			}
-			out.Results = append(out.Results, *p.res)
-			continue
 		}
-		ph, amt, detail, claimedAt := qoderClaimInstance(p.auth, p.dev, cid, QoderQuotaScopeKey(p.snap))
-		switch ph {
-		case "claimed":
-			p.res.Phase = "claimed"
-			p.res.Msg = fmt.Sprintf("签到成功 +%.0f Credits", amt)
-			p.res.Credits = amt
-			p.res.Claimed = 1
-			p.res.CheckedInToday = true
-			// 用兄弟号的实例 id 反而领成功了 = 服务端放行了，本号今天真领到。
-			p.res.ClaimedAt = claimedAt
-			p.res.ClaimedToday = true
-			out.Claimed++
-			out.Credits += amt
-			_ = MarkClaimedAt("qoder", p.email, claimStamp(p.res))
-			_ = MarkCheckedIn("qoder", p.email)
-		case "blocked":
-			// 服务端明确答复：**同一个人**今天已经领过了（同组另一账号领走），
-			// 也就是说**本号今天并没有签到**，今天的 100 积分也没进它的账。
+		if verdict == QoderVerdictUnknown && len(snapCands) > 0 {
+			// 本次运行没拿到 cid（别的号今天还没领），退回号池快照里存的实例 id。
+			for _, em := range snapCands {
+				var cid string
+				for _, o := range pool.Accounts {
+					if o != nil && strings.EqualFold(o.Email, em) {
+						cid = o.ClaimCID
+						break
+					}
+				}
+				holderAuth := qoderPoolAuth(pool.Accounts, em)
+				if cid == "" || holderAuth == nil {
+					continue
+				}
+				ownerProbe := qoderProbeReward(p.auth, p.dev, cid, QoderQuotaScopeKey(p.snap))
+				holderProbe := qoderProbeReward(holderAuth, baseDev, cid, QoderQuotaScopeKey(p.snap))
+				v := qoderPersonVerdict(ownerProbe, holderProbe)
+				if v == QoderVerdictSamePerson || v == QoderVerdictOwner {
+					verdict, holder = v, em
+					amount = ownerProbe.Credits
+					claimedAt = ownerProbe.ClaimedAt
+					break
+				}
+			}
+		}
+
+		switch verdict {
+		case QoderVerdictSamePerson:
+			// 服务端明确答复：**同一个人**今天已经领过了 —— 也就是说**本号今天
+			// 并没有签到**，今天的 100 积分也没进它的账。
 			//
 			// ⚠️ 这里绝不能写 MarkCheckedIn —— 那是"假签到"：本号压根没领到。
 			// 也不能算进 Already（那也是"今天签过了"的意思）。单列 blocked，
 			// 并把之前可能存在的误记清掉（Unmark）。
 			p.res.Phase = "blocked"
-			p.res.Msg = "今天没签上：同一额度组（同一实名）另一账号已领走每日额度（服务端判定 " + detail + "）"
+			p.res.Msg = "今天没签上：服务端判定本号与 " + holder +
+				" 是同一个人（" + "SAME_PERSON_ALREADY_CLAIMED" + "），今天那份每日额度已由对方领走"
 			p.res.CheckedInToday = false
+			p.res.QuotaTakenBy = holder
+			if amount > 0 {
+				p.res.Credits = amount
+			}
+			saveQoderPersonLink(p.email, holder)
 			out.Blocked++
 			_ = UnmarkCheckedIn("qoder", p.email)
+		case QoderVerdictOwner:
+			// 本号就是这条实例的主人（列表没显示，但服务端账上有）。
+			p.res.Phase = "already"
+			p.res.Msg = "今日已领取（服务端奖励记录）"
+			p.res.CheckedInToday = true
+			if amount > 0 {
+				p.res.Credits = amount
+			}
+			if claimedAt != "" {
+				p.res.ClaimedAt = claimedAt
+				p.res.ClaimedToday = true
+			}
+			out.Already++
+			out.AlreadyCredits += p.res.Credits
+			_ = MarkClaimedAt("qoder", p.email, claimStamp(p.res))
+			_ = MarkCheckedIn("qoder", p.email)
+		case QoderVerdictOther:
+			// 服务端明确说：本号与对方**不是同一个人**，今天这份额度不归本号，
+			// 也不是被对方抢走 —— 就是「服务端今天没给本号下发」。
+			p.res.Phase = "pending"
+			p.res.Msg = "服务端今天没有给本号下发每日额度（与号池里其它号不是同一个人）"
+			p.res.CheckedInToday = false
+			out.Pending++
 		default:
+			// 问不出结论：只能按本地可信记录兜底，否则如实说"没观察到"。
 			if CheckinRecordTrusted("qoder", p.email) {
 				p.res.Phase = "already"
 				p.res.Msg = "今日已领取（本地记录）"
@@ -305,32 +342,18 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 				out.Already++
 				_ = MarkCheckedIn("qoder", p.email)
 			} else {
-				out.Failed++
+				p.res.Phase = "pending"
+				p.res.Msg = "未观察到今日签到活动（Qoder 每天 10:00 后下发；后台会自动重试）"
+				out.Pending++
 			}
 		}
 		out.Results = append(out.Results, *p.res)
 	}
 
-	// 额度组归属：标出每组里今天**谁**领到了那份每日额度，让面板能说清
-	// 「这个号为什么没签上」而不是只丢一句"被同一人领走了"。
-	groupHolder := map[string]string{}
-	for _, r := range out.Results {
-		if r.Phase != "claimed" || !r.ClaimedToday {
-			continue
-		}
-		g := groupOf[strings.ToLower(strings.TrimSpace(r.Email))]
-		if _, ok := groupHolder[g]; !ok {
-			groupHolder[g] = r.Email
-		}
-	}
-	for i := range out.Results {
-		r := &out.Results[i]
-		g := groupOf[strings.ToLower(strings.TrimSpace(r.Email))]
-		if h, ok := groupHolder[g]; ok && !strings.EqualFold(h, r.Email) {
-			r.QuotaTakenBy = h
-			if r.Phase == "blocked" {
-				r.Msg = r.Msg + "；今日额度由同组账号 " + h + " 领走"
-			}
+	// 判定出「同一人」关系后重算组大小（组是**判定**出来的，不是按 scope 猜的）。
+	if sizes := QoderSamePersonGroupSizes(pool.Accounts); len(sizes) > 0 {
+		for i := range out.Results {
+			out.Results[i].QuotaGroup = sizes[strings.ToLower(strings.TrimSpace(out.Results[i].Email))]
 		}
 	}
 
@@ -376,12 +399,29 @@ func QoderPoolStatuses() []map[string]any {
 	return out
 }
 
-// QuotaHolderInGroup 返回**同一额度组**里今天已领到每日额度的账号邮箱。
+// qoderPoolAuth 按邮箱取号池里某个账号的登录态（找不到返回 nil）。
+func qoderPoolAuth(accounts []*QoderSnapshot, email string) *QoderAuth {
+	ex := strings.ToLower(strings.TrimSpace(email))
+	if ex == "" {
+		return nil
+	}
+	for _, a := range accounts {
+		if a == nil || a.Auth == nil {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a))) == ex {
+			return a.Auth
+		}
+	}
+	return nil
+}
+
+// QuotaHolderInGroup 返回**与指定账号同一个人**的账号里，今天已领到每日额度的那一个。
 //
-// 2026-11-02 修正：每日额度按账号归属的 scope（服务端认定的实名/租户）发，**不是
-// 按设备**（实测伪造整套 Cosy-* 设备头也不影响判定，刷新 token 的响应里更是没有
-// 任何设备字段）。不同 scope 的账号各有各的每日额度 —— 拿**别的组**的领取记录
-// 去解释本号「没签上」是错的，会把一个本来能领的号说成额度被占。
+// 2026-11-02 修正：每日额度按**人**发（实测 failureCode=SAME_PERSON_ALREADY_CLAIMED），
+// 不是按设备、也不是按账号、也不是按 agentAccountScope —— 两个号 scope 不同却共享
+// 同一份额度。所以这里只认**服务端判定过**的「同一人」关系（见 qoder_person.go），
+// 没有判定记录时返回 false（不知道就说不知道，不能默认"被占用了"）。
 //
 // 同组多号时按邮箱排序取第一个，保证结果稳定。
 func QuotaHolderInGroup(excludeEmail string) (string, bool) {
@@ -390,31 +430,15 @@ func QuotaHolderInGroup(excludeEmail string) (string, bool) {
 		return "", false
 	}
 	ex := strings.ToLower(strings.TrimSpace(excludeEmail))
-	group := ""
-	for _, a := range pool.Accounts {
-		if a == nil {
-			continue
-		}
-		if strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a))) == ex {
-			group = QoderQuotaGroupKey(a)
-			break
-		}
+	if ex == "" {
+		return "", false
 	}
-	if group == "" {
+	peers := QoderSamePersonPeers(ex)
+	if len(peers) == 0 {
 		return "", false
 	}
 	var holders []string
-	for _, a := range pool.Accounts {
-		if a == nil {
-			continue
-		}
-		em := strings.TrimSpace(qoderSnapshotEmail(a))
-		if em == "" || strings.EqualFold(em, excludeEmail) {
-			continue
-		}
-		if QoderQuotaGroupKey(a) != group {
-			continue
-		}
+	for _, em := range peers {
 		if CheckedInToday("qoder", em) && CheckinRecordTrusted("qoder", em) {
 			holders = append(holders, em)
 		}
@@ -426,10 +450,10 @@ func QuotaHolderInGroup(excludeEmail string) (string, bool) {
 	return holders[0], true
 }
 
-// UsedDeviceQuotaToday 报告**同一额度组**里今天是否已有其它账号写入可信的 Qoder
-// 签到记录（用于向看不到今日活动的账号解释原因）。
+// UsedDeviceQuotaToday 报告**同一个人的另一个账号**今天是否已领走每日额度
+// （用于向看不到今日活动的账号解释原因）。
 //
-// 名字保留是为了不破坏既有调用点，语义已从「同设备」改成「同额度组」。
+// 名字保留是为了不破坏既有调用点，语义已从「同设备」改成「同一人」。
 func UsedDeviceQuotaToday(excludeEmail string) bool {
 	_, ok := QuotaHolderInGroup(excludeEmail)
 	return ok
@@ -459,15 +483,18 @@ type QoderScanAccount struct {
 	// Source 判定来源：upstream = 上游活动列表确认；local = 上游看不到今日活动
 	// （领完即删），但本地有可信记录。
 	Source string `json:"source,omitempty"`
-	// DeviceQuotaUsed 本账号看不到今日活动，是因为**同一额度组**（同一 scope /
-	// 同一实名）的另一账号已领走了当天唯一一份每日额度（服务端按人给，先打先得）。
+	// DeviceQuotaUsed 本账号看不到今日活动，是因为**同一个人的另一个账号**已领走了
+	// 当天唯一一份每日额度（服务端按人发，先打先得；判定码 SAME_PERSON_ALREADY_CLAIMED）。
 	DeviceQuotaUsed bool `json:"same_person_taken,omitempty"`
-	// Scope 本账号归属的额度组标识（服务端下发的 agentAccountScope）。
+	// Scope 本账号的 agentAccountScope（agent 租户位标识；⚠️ 不是额度分组键）。
 	Scope string `json:"scope,omitempty"`
-	// QuotaGroup 本账号所在额度组里的账号数（含自己）。>1 = 与别的号共享每日额度。
+	// QuotaGroup 本账号所在**同一人组**里的账号数（含自己）。>1 = 与别的号同一人。
 	QuotaGroup int `json:"quota_group,omitempty"`
-	// QuotaTakenBy 同组里今天领到每日额度的账号（空 = 组里还没人领）。
+	// QuotaTakenBy 同一人组里今天领到每日额度的账号（空 = 还没人领）。
 	QuotaTakenBy string `json:"quota_taken_by,omitempty"`
+	// ClaimCID 今天这条 CLAIM_BENEFIT 活动的实例 id（号池里别的号靠它去只读地问
+	// 服务端「我是不是同一个人」）。
+	ClaimCID string `json:"claim_cid,omitempty"`
 }
 
 // QoderPoolScan 逐账号向**上游**核实签到状态（并发 2，只查不领）。
@@ -505,8 +532,8 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 		jobs = append(jobs, job{snap: snap})
 	}
 	out := make([]QoderScanAccount, len(jobs))
-	// 额度组信息：同一 scope 的账号共享同一份每日额度，扫描时要按组解释。
-	groupSize := QoderQuotaGroupSizes(pool.Accounts)
+	// 同一人组信息：服务端判定过「同一人」的账号共享同一份每日额度，扫描时要按组解释。
+	groupSize := QoderSamePersonGroupSizes(pool.Accounts)
 	sem := make(chan struct{}, 2)
 	var wg sync.WaitGroup
 	for i, j := range jobs {
@@ -547,6 +574,7 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 		}
 		row.Phase = res.Phase
 		row.Msg = res.Msg
+		row.ClaimCID = res.ClaimCID
 		// 记下今天这条活动实例 id：号池里其它号（看不到这条活动的）要靠它去
 		// 向服务端要一个真实判定。
 		if res.ClaimCID != "" && snap.ClaimCID != res.ClaimCID {
@@ -595,43 +623,95 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 				row.Msg = "上游核实失败（" + res.Msg + "）；本地记录今日已签 " + row.CheckedInAt
 			}
 		}
-		// 每日额度按**账号归属的 scope**（同一实名/租户）给，不按设备
-		// （实测 2026-11-02：伪造整套 Cosy-* 设备头也不改变判定；同组另一个账号
-		// 领过后，服务端回 failureCode=SAME_PERSON_ALREADY_CLAIMED）。
-		// **同一额度组**里今天已有其它账号的可信领取记录、而本账号看不到签到活动时，
-		// 如实说明并点名是谁领的 —— 这与笼统的"活动未下发"是两回事，用户需要分得清。
+		// 每日额度按**人**给，不按设备、也不按账号（实测 2026-11-02：服务端回
+		// failureCode=SAME_PERSON_ALREADY_CLAIMED，且两个号的 agentAccountScope
+		// 其实不同）。所以只能问服务端本人，不能拿 scope 猜。
+		// 已知「同一人」关系里今天已有其它账号领走额度时，如实说明并点名是谁领的 ——
+		// 这与笼统的"活动未下发"是两回事，用户需要分得清。
 		if res.Phase == "pending" && !trusted {
 			if holder, ok := QuotaHolderInGroup(email); ok {
 				row.DeviceQuotaUsed = true
 				row.QuotaTakenBy = holder
-				row.Msg = "今日每日额度已被同额度组（同一实名）的账号 " + holder +
-					" 领取（服务端按账号归属的实名给，同组一天只有一份、先打先得）"
+				row.Msg = "今日每日额度已被同一个人的另一个账号 " + holder +
+					" 领取（服务端按人发，同一人一天只有一份、先打先得）"
 			}
 		}
 		out[i] = row
 		}(i, j)
 	}
 	wg.Wait()
-	// 额度组归属：标出每组里今天**谁**领到了那份每日额度（同组其它号的
-	// QuotaTakenBy 一并补上，面板就能说清「这个号为什么没签上」）。
-	holder := map[string]string{}
+
+	// 还不知道「是不是同一人」的号：拿号池里另一个号今天那条活动实例 id，
+	// **只读**地问一次服务端（GET .../campaigns/{cid}/reward），拿真实判定。
+	// 问出 SAME_PERSON_ALREADY_CLAIMED 就记下「这两个号是同一个人」，
+	// 以后面板直接能说清「为什么这个号签不上」。
+	cidOf := make(map[string]string, len(out))
 	for _, r := range out {
-		if r.Phase != "claimed" || !r.CheckedInToday {
-			continue
-		}
-		g := qoderQuotaGroupKeyOf(r.Scope)
-		if _, ok := holder[g]; !ok {
-			holder[g] = r.Email
+		if r.ClaimCID != "" {
+			cidOf[strings.ToLower(strings.TrimSpace(r.Email))] = r.ClaimCID
 		}
 	}
+	for i := range out {
+		r := &out[i]
+		if r.Phase != "pending" || r.RecordTrusted {
+			continue
+		}
+		em := strings.ToLower(strings.TrimSpace(r.Email))
+		var peers []string
+		for other, cid := range cidOf {
+			if other == em || cid == "" {
+				continue
+			}
+			peers = append(peers, other)
+		}
+		sort.Strings(peers)
+		for _, other := range peers {
+			cid := cidOf[other]
+			ownerAuth := qoderPoolAuth(pool.Accounts, other)
+			myAuth := qoderPoolAuth(pool.Accounts, em)
+			if ownerAuth == nil || myAuth == nil {
+				continue
+			}
+			ownerProbe := qoderProbeReward(myAuth, QoderDeviceInfo(), cid, r.Scope)
+			holderProbe := qoderProbeReward(ownerAuth, QoderDeviceInfo(), cid, r.Scope)
+			switch qoderPersonVerdict(ownerProbe, holderProbe) {
+			case QoderVerdictSamePerson:
+				r.DeviceQuotaUsed = true
+				r.QuotaTakenBy = other
+				r.Msg = "今日每日额度已被同一个人的另一个账号 " + other +
+					" 领取（服务端按人发，同一人一天只有一份、先打先得）"
+				saveQoderPersonLink(em, other)
+			case QoderVerdictOther:
+				r.Msg = "服务端今天没有给本号下发每日额度（与号池里其它号不是同一个人）"
+			}
+			break
+		}
+	}
+
+	// 同一人归属：把「今天谁领走了那份额度」补到同一人组的其它号上，
+	// 面板就能说清「这个号为什么没签上」。
 	for i := range out {
 		r := &out[i]
 		if r.QuotaTakenBy != "" {
 			continue
 		}
-		g := qoderQuotaGroupKeyOf(r.Scope)
-		if h, ok := holder[g]; ok && !strings.EqualFold(h, r.Email) {
-			r.QuotaTakenBy = h
+		for _, peer := range QoderSamePersonPeers(r.Email) {
+			for _, o := range out {
+				if strings.EqualFold(o.Email, peer) && o.Phase == "claimed" && o.CheckedInToday {
+					r.QuotaTakenBy = peer
+					break
+				}
+			}
+			if r.QuotaTakenBy != "" {
+				break
+			}
+		}
+	}
+	// 判定出「同一人」关系后重算组大小：组是**判定**出来的，不是按 scope 猜的，
+	// 所以必须等判定完成再统计。
+	if sizes := QoderSamePersonGroupSizes(pool.Accounts); len(sizes) > 0 {
+		for i := range out {
+			out[i].QuotaGroup = sizes[strings.ToLower(strings.TrimSpace(out[i].Email))]
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Email < out[j].Email })

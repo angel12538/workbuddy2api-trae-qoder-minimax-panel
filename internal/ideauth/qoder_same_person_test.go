@@ -56,6 +56,14 @@ func TestQoderCheckinPoolSamePersonProbe(t *testing.T) {
 			}
 			// B 号去领 A 的实例 → 服务端判定同一人已领。
 			_, _ = w.Write([]byte(`{"status":"BLOCKED","failureCode":"SAME_PERSON_ALREADY_CLAIMED","benefit":{"amount":100}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/sash/api/v1/me/campaigns/c1/reward":
+			// 奖励查询（只读）：实例主人查 → CLAIMED；同一人查 → BLOCKED。
+			// 2026-11-02 实测上游就是这个形状（服务端还会给同一人单独建一条 grant）。
+			if tok == "tok-a" {
+				_, _ = w.Write([]byte(`{"grantId":"grant-a","status":"CLAIMED","campaignId":"c1","benefit":{"amount":100}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"grantId":"grant-b","status":"BLOCKED","failureCode":"SAME_PERSON_ALREADY_CLAIMED","campaignId":"c1","benefit":{"amount":100}}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
