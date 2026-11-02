@@ -1,0 +1,75 @@
+# Build
+dist/
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/.cargo/
+
+# Logs
+*.log
+logs/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 逆向分析工作数据（严禁提交）
+.analysis/
+
+# WorkBuddy 自动产物（严禁提交）
+.workbuddy/
+
+# 运行时数据（证书、账号状态等）
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Embedded Python runtime under src-python/ (build-time prerequisite for bundling;
+# extracted into place, not source — git에서만 제외, 디스크는 빌드에 필요)
+src-python/.extracted
+src-python/DLLs/
+src-python/Lib/
+src-python/Scripts/
+src-python/include/
+src-python/libs/
+src-python/python.exe
+src-python/python3.cmd
+src-python/python3.dll
+src-python/python3.exe
+src-python/python313.dll
+src-python/pythonw.exe
+src-python/vcruntime140.dll
+src-python/vcruntime140_1.dll
+src-python/LICENSE.txt
+
+# Packaging outputs (installers) — disk에 보관(배포용), git에는 제외
+release/
+
+# MSI/NSIS 빌드 중 생성되는 WiX 소스
+*.wxs
+
+# WorkBuddy 산출물
+overview.md
+
+# license-guard 实验性许可证系统（不随仓库开源）
+license-guard/
+.pytest_cache/
+
+# Playwright Chromium 二进制（随安装包/便携版打包，排除在 git 之外）
+resources/browser/*
+!resources/browser/.gitkeep
+
+# Complete release runtime staging (downloaded/generated, never account data).
+resources/python/
+resources/ps/
+
+# 本 fork 不分发作者的专有授权实现（license-guard）
+src-tauri/src/license_guard/public_key.pem
+
+# 根目录的构建安装包（不入库；发布件走 Release 资产）
+/Trae-Work-Assistant-*.exe
+/Trae-Work-Assistant-*.msi

@@ -1,0 +1,11 @@
+# Keep the production build context reproducible and free of credentials,
+# account state, probes, reverse-engineering artifacts, and old release files.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!src/
+!src/**
+!web_login.py
+!start_auth.bat
+!start_auth.sh

@@ -1,0 +1,32 @@
+# Optional source-build overlay:
+# docker compose -f docker-compose.yml -f docker-compose.redis.yml up -d --build
+# This is not applied automatically to any running cluster deployment.
+services:
+  qoder-proxy:
+    image: qoder2api-hub:redis-local
+    build: .
+    environment:
+      - QD_SESSION_CACHE=redis
+      - QD_SESSION_REDIS_URL=redis://qoder-redis:6379/0
+      - QD_SESSION_CACHE_TTL=3600
+      - QD_SESSION_REDIS_TIMEOUT=0.4
+    depends_on:
+      qoder-redis:
+        condition: service_healthy
+
+  qoder-redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # Internal compose network only: deliberately no published Redis port.
+    command: [redis-server, --appendonly, "yes", --maxmemory, 64mb,
+              --maxmemory-policy, allkeys-lru]
+    volumes:
+      - qoder-session-redis-data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  qoder-session-redis-data:
