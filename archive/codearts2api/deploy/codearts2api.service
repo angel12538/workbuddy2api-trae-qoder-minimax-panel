@@ -1,0 +1,19 @@
+[Unit]
+Description=CodeArts2API - OpenAI compatible proxy for CodeArts Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/codearts2api
+EnvironmentFile=/opt/codearts2api/.env
+ExecStart=/opt/codearts2api/bin/codearts2api -config /opt/codearts2api/config.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/codearts2api/auths /opt/codearts2api/data
+
+[Install]
+WantedBy=multi-user.target

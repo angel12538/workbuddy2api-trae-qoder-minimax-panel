@@ -1151,6 +1151,22 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 静态模型表含 `deepseek-v4-flash` 等 | `internal/upstream/model.json`（`deepseek-v4-flash` 条目） |
 | `/v1/responses` 协议适配层 | `internal/server/responses.go`（请求/响应翻译）、`internal/server/responses_stream.go`（SSE 事件翻译）、注册 `internal/server/handler.go` |
 
+## 📦 归档：原各平台独立项目
+
+本仓库早期按平台拆成多个独立仓库，现已**全部合并回本仓库**：源码原样收进 `archive/` 目录，原独立仓库已删除，账号下只保留这一个合集仓库。
+
+| 归档目录 | 原独立仓库 | 内容 |
+|---|---|---|
+| `archive/qoder2api/` | qoder2api | Qoder → OpenAI / Claude / Codex 兼容网关，附注册链路与风控逆向研究（`docs/registration-research/`：bundle 快照、阿里云验证码 / baxia 处罚页分析、注册自动化脚本） |
+| `archive/qoder2api-hub/` | qoder2api-hub | Qoder 本地多账号网关（Python）：账号池、模型目录、定价、i18n、任务调度、面板 |
+| `archive/codearts2api/` | codearts2api | 华为云 CodeArts 码道 → OpenAI 兼容层，附接口逆向文档 |
+| `archive/Trae2api-cn/` | Trae2api-cn | Trae 国内版中转（Python），附发布记录与原生辅助组件 |
+| `archive/workbuddy2api-panel/` | workbuddy2api-panel | 面板的早期 Go 版实现（`cmd/server` / `internal/upstream` / `internal/pool` / `internal/panel`），当前实现由它演进而来 |
+| `archive/TraeWorkAssistant/` | TraeWorkAssistant | 桌面端完整实现（Tauri + Rust + React），附产品设计 / 已完成 / 待办文档全集 |
+| `archive/Trae-workbuddyAssistant/` | Trae-workbuddyAssistant | 更早的 Tauri + React 桌面端实现，附设计与实施计划 |
+
+归档内容不再维护，只作历史实现与研究资料留存；各目录保留自己的 `go.mod` / `pyproject.toml` / `Cargo.toml`，不参与主工程的构建、测试与发布（Go 自动跳过嵌套 module）。归档中不含任何真实凭据（`.env`、私钥、账号数据在归档时已剔除）。详见 [`archive/README.md`](archive/README.md)。
+
 ## 免责声明
 
 本项目仅供学习和研究使用。使用者需遵守 CodeBuddy 服务条款，自行承担使用风险（包括账号封禁、条款违约等）。作者不对任何因使用本项目产生的直接或间接损失负责。

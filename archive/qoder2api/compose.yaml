@@ -1,0 +1,17 @@
+services:
+  qoder2api:
+    # 发布后可按需替换为 ghcr.io/<仓库所有者>/qoder2api:latest
+    image: qoder2api:local
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3588:3588"
+      - "8963:8963"
+      - "8964:8964"
+    environment:
+      QODER2API_CONSOLE_PASSWORD: ${QODER2API_CONSOLE_PASSWORD:-}
+    volumes:
+      - qoder2api-data:/data
+
+volumes:
+  qoder2api-data:

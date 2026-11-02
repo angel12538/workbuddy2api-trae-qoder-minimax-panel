@@ -45,3 +45,15 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# 归档目录：原各平台独立仓库的内容（已合并回本仓库），整体纳入版本库
+!archive/
+!archive/**
+# 归档内容里仍排除凭据类文件
+archive/**/.env
+archive/**/*.env
+archive/**/*.pem
+archive/**/*.key
+archive/**/config.json
+archive/**/auths/
+archive/**/credentials/
