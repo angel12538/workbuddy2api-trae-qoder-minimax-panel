@@ -151,12 +151,14 @@ type QoderAccountView struct {
 	SavedAt   string `json:"saved_at"`
 	MachineID string `json:"machine_id"`
 	DeviceID  string `json:"device_id"`
-	// Scope 该账号归属的额度组标识（服务端下发的 agentAccountScope）。
-	// 同一 scope 的多个账号共享**同一份**每日签到额度。
+	// Scope 该账号的 agentAccountScope（服务端在登录时下发的 agent 租户位标识）。
+	// ⚠️ 它**不是**每日额度的分组键（实测：两个 scope 不同的账号照样共享一份
+	// 每日额度，见 QoderQuotaGroupKey 的注释）。
 	Scope string `json:"scope,omitempty"`
 	// ScopeLabel scope 的短标签，给人看。
 	ScopeLabel string `json:"scope_label,omitempty"`
-	// QuotaGroup 该账号所在额度组里的账号数（含自己）。>1 = 与别的号共享每日额度。
+	// QuotaGroup 该账号所在**同一人组**里的账号数（含自己）。
+	// >1 = 服务端已判定它与别的号是同一个人，每天只有一份每日额度。
 	QuotaGroup int `json:"quota_group,omitempty"`
 }
 
@@ -207,26 +209,34 @@ func expAt(a *QoderSnapshot) string {
 }
 
 // ---------------------------------------------------------------------------
-// 额度组（scope）
+// 每日额度分组：**按人**，不按 scope / 不按设备 / 不按账号
 //
-// 2026-11-02 实测（真打上游）：Qoder 的每日 100 Credits **不是按设备发的**，而是按
-// **账号归属的 scope**（服务端认定的实名/租户）发的。同一个 scope 下的多个账号共享
-// **同一份**每日额度：服务端只给其中一个下发当天的 CLAIM_BENEFIT，其余账号的活动
-// 列表里连这条都没有，跨号去领会被回 SAME_PERSON_ALREADY_CLAIMED。
+// 2026-11-02 实测（真打上游，见 qoder_person.go 的完整证据）：
 //
-// 三条独立证据：
-//  1. 伪造整套 Cosy-* 设备头（machineToken / machineCode / machineId 全换）服务端
-//     照样返回同一条活动 → 设备头只是「有没有设备」的开关，不参与额度判定；
-//     唯一例外是**一个 Cosy 头都不带**时活动列表整体为空。
-//  2. POST /api/v1/deviceToken/refresh 的响应里没有任何 scope/设备字段 → 账号与
-//     额度组的绑定发生在登录/注册阶段，不在请求头上，改设备头没用。
-//  3. 两个账号各自登录后拿到的 agentAccountScope 完全一致（qoder-data.v1.json 的
-//     agentAccountScope），而 user id 不同 → 关联键是 scope，不是账号、也不是设备。
+//	服务端把当天的每日 100 Credits 发给**一个人**，而不是一个账号。
+//	两个账号拿到的是同一条活动实例（campaignId 相同），先领的那份记在
+//	grantId 上；另一个账号去领/去查，服务端明确回
+//	failureCode=SAME_PERSON_ALREADY_CLAIMED（还会给它单独建一条 grant）。
 //
-// 结论：想要两个号**各领一份**每日额度，唯一办法是第二个号归属到**另一个 scope**
-// （即用不同身份注册的账号）；同一 scope 下多号只能轮流领同一份。
+//	三个**不是**分组键的维度（都实测过）：
+//	  1. 设备：两个号的 machine_id / device_id 都不同，照样共享一份；
+//	     伪造整套 Cosy-* 设备头也不改变判定。
+//	  2. 账号：两个号 uid 不同，照样共享一份。
+//	  3. agentAccountScope：**两个号的 scope 其实不同**（qq=7c3816b4…、
+//	     gmail=9ecb3ca9…，用客户端数据里的 serverRuntimeId 与服务端
+//	     /api/v1/agents 交叉验证得到），却照样共享同一份额度 —— 所以
+//	     拿 scope 分组是错的（上一版就是错的，会把「不是同一人」的号也说成被占）。
+//
+// 结论：只能问服务端本人（只读接口 GET /sash/api/v1/me/campaigns/{cid}/reward），
+// 判定为「同一人」的账号归为一组；判不出来的就归为**未知**（不是「独立」，
+// 也不是「被占用」）。
 // ---------------------------------------------------------------------------
-// QoderQuotaScopeKey 返回账号归属的 scope（服务端下发的 agentAccountScope）。
+
+// QoderQuotaScopeKey 返回账号的 agentAccountScope（服务端在登录时下发的
+// agent 租户位标识）。
+//
+// ⚠️ 它**不是**每日额度的分组键（见上面的实测结论）：两个 scope 不同的账号
+// 可能共享同一份每日额度。
 func QoderQuotaScopeKey(a *QoderSnapshot) string {
 	if a == nil {
 		return ""
@@ -234,27 +244,26 @@ func QoderQuotaScopeKey(a *QoderSnapshot) string {
 	return strings.TrimSpace(a.Scope)
 }
 
-// QoderQuotaGroupKey 返回该账号的额度组键。
+// QoderQuotaGroupKey 返回该账号的**同一人组**键。
 //
-// scope 相同 = 同一组（共享一份每日额度）。
-//
-// scope 未知（老号池快照没存）时**全部未知账号归为一组**：是不是「同一个人」
-// 不由我们猜，而是**让服务端回答** —— 只有它对探测请求回
-// SAME_PERSON_ALREADY_CLAIMED，才认定同组共用一份额度。拆成各自成组会让
-// 老号池（以及上游还没下发 scope 的情况）永远问不出这个判定。
+// 组键来自「服务端判定过同一人」的关系（见 qoder_person.go）；没有判定记录
+// 的账号各自成组（键 = 自己的邮箱），**不猜**。
 func QoderQuotaGroupKey(a *QoderSnapshot) string {
 	if a == nil {
 		return ""
 	}
-	return qoderQuotaGroupKeyOf(QoderQuotaScopeKey(a))
-}
-
-// qoderQuotaGroupKeyOf 由 scope 算组键（scan 里只有 scope 这个字段可用）。
-func qoderQuotaGroupKeyOf(scope string) string {
-	if s := strings.TrimSpace(scope); s != "" {
-		return "scope:" + s
+	em := strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a)))
+	if em == "" {
+		return "unknown"
 	}
-	return "unknown"
+	peers := QoderSamePersonPeers(em)
+	if len(peers) == 0 {
+		return "person:" + em
+	}
+	group := []string{em}
+	group = append(group, peers...)
+	sort.Strings(group)
+	return "person:" + strings.Join(group, "|")
 }
 
 // qoderSnapshotEmail 取快照的账号邮箱。
@@ -271,7 +280,10 @@ func qoderSnapshotEmail(a *QoderSnapshot) string {
 	return ""
 }
 
-// QoderQuotaGroups 按额度组分组：组键 → 组内账号邮箱列表。
+// QoderQuotaGroups 按**同一人组**分组：组键 → 组内账号邮箱列表。
+//
+// 组内账号都是服务端判定过「同一个人」的（见 qoder_person.go）；没判定过的
+// 账号各自成组 —— **不猜**。
 func QoderQuotaGroups(accounts []*QoderSnapshot) map[string][]string {
 	out := map[string][]string{}
 	for _, a := range accounts {
@@ -285,7 +297,7 @@ func QoderQuotaGroups(accounts []*QoderSnapshot) map[string][]string {
 	return out
 }
 
-// QoderQuotaGroupSizes 返回每个账号所在的额度组大小（含自己）。
+// QoderQuotaGroupSizes 返回每个账号所在的**同一人组**大小（含自己）。
 func QoderQuotaGroupSizes(accounts []*QoderSnapshot) map[string]int {
 	groups := QoderQuotaGroups(accounts)
 	out := map[string]int{}
@@ -312,43 +324,37 @@ func QoderQuotaScopeLabel(scope string) string {
 	return s
 }
 
-// QoderScopePeers 返回号池里与指定账号**同 scope**的其它账号邮箱。
+// QoderScopePeers 返回号池里与指定账号**同一个人**的其它账号邮箱。
 //
-// 用途：判定「这个号是不是独立的额度组」——比问上游更硬。上游答复还受「今天
-// 谁先领」影响（还没人领时谁都看不到差别），而 scope 是服务端在登录时按账号
-// 归属（实名/租户）下发的，**同 scope 就一定共享一份每日额度**。
+// ⚠️ 语义已改（2026-11-02）：以前按 agentAccountScope 分组，那是**错的** ——
+// 实测两个号的 scope 不同却共享同一份每日额度。现在只认**服务端判定过**
+// 的同一人关系（见 qoder_person.go）。
 //
-// scope 为空时返回空（无法判定），调用方要按"未知"处理，不要当成"独立"。
+// 没有判定记录时返回空（无法判定），调用方要按"未知"处理，不要当成"独立"。
 func QoderScopePeers(email string) []string {
+	ex := strings.ToLower(strings.TrimSpace(email))
+	if ex == "" {
+		return nil
+	}
+	peers := QoderSamePersonPeers(ex)
+	if len(peers) == 0 {
+		return nil
+	}
 	pool, err := LoadQoderPool()
 	if err != nil || pool == nil {
 		return nil
 	}
-	ex := strings.ToLower(strings.TrimSpace(email))
-	target := ""
+	inPool := map[string]bool{}
 	for _, a := range pool.Accounts {
 		if a == nil {
 			continue
 		}
-		if strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a))) == ex {
-			target = QoderQuotaGroupKey(a)
-			break
-		}
-	}
-	if target == "" {
-		return nil
+		inPool[strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a)))] = true
 	}
 	var out []string
-	for _, a := range pool.Accounts {
-		if a == nil {
-			continue
-		}
-		em := strings.TrimSpace(qoderSnapshotEmail(a))
-		if em == "" || strings.EqualFold(em, email) {
-			continue
-		}
-		if QoderQuotaGroupKey(a) == target {
-			out = append(out, em)
+	for _, p := range peers {
+		if inPool[p] {
+			out = append(out, p)
 		}
 	}
 	sort.Strings(out)

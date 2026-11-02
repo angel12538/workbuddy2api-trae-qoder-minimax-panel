@@ -82,7 +82,7 @@ function esc(s) {
    规则：**同一个动作在不同平台必须是同一个外观**。
      · 还没签到 → 蓝底「签到」，可点
      · 已经签到 → 灰底「已签到」，禁用（点击无效）
-   状态徽章 `.stask` 另外讲上游核实的细节（例如"额度被同额度组另一账号领走"），
+   状态徽章 `.stask` 另外讲上游核实的细节（例如"额度被同一个人另一个号领走"），
    与按钮分工：按钮管"能不能点"，徽章管"到底怎么回事"。
 
    用法：
@@ -4386,7 +4386,7 @@ async function doQoderCheckin(btn, email) {
   try {
     // 点某一行 = 「今天让这个号先打」，但**仍然把池里所有号都打一遍**
     // （用户要求：一键领完所有号，不切号）。emails 留空 = 号池全部（后端语义）；
-    // 服务端每日额度按账号归属的实名（额度组）给、一组一份、先打先得，所以顺序决定那 100 积分落到谁头上。
+    // 服务端每日额度按**人**给、同一人一天只有一份、先打先得，所以顺序决定那 100 积分落到谁头上。
     const body = email ? JSON.stringify({ emails: [], priority: email }) : '{}';
     const d = await api('ide/qoder/checkin', { method: 'POST', body });
     const results = (d && d.results) || [];
@@ -4742,7 +4742,7 @@ async function loadCkWorkBuddy(quiet) {
           : (a.hasRefresh ? UI.badge('warn', '○', '可签到')
             : UI.badge('todo', '!', '缺 refresh token')));
       // 签到按钮：未签 = 蓝底可点；已签 = 灰底禁用（文案也变成"已签到"）。
-      // 状态徽章另说（徽章讲的是上游核实的细节，比如"额度被同额度组另一账号领走"）。
+      // 状态徽章另说（徽章讲的是上游核实的细节，比如"额度被同一个人另一个号领走"）。
       const btn = doneToday
         ? UI.off('已签到', '今日已签到（点击可重新签到并刷新余额）')
         : UI.act('data-ck-wb', uid, '签到', '今天签到');
@@ -4813,10 +4813,10 @@ async function loadCkQoder(quiet) {
       doneMap[cur.toLowerCase()] = !!st2.current.checked_in_today;
     }
     const doneCount = rows.filter(a => doneMap[String(a.email || '').toLowerCase()]).length;
-    // 额度组数：同一 scope（同一实名）的账号共享一份每日额度，组数才是"能领几份"。
+    // 「人」组数：服务端判定为同一个人的账号共享一份每日额度，组数才是"能领几份"。
     const groups = new Set();
     rows.forEach(a => {
-      const g = a.scope || ('solo:' + String(a.email || '').toLowerCase());
+      const g = a.quota_group > 1 ? (a.quota_taken_by || 'same:' + String(a.email || '').toLowerCase()) : ('solo:' + String(a.email || '').toLowerCase());
       groups.add(g);
     });
     const sharedGroups = rows.filter(a => (a.quota_group || 0) > 1).length;
@@ -4827,7 +4827,7 @@ async function loadCkQoder(quiet) {
       if (rows.length > 1) {
         s += ' · ' + groups.size + ' 个额度组';
         if (sharedGroups > 0) {
-          s += '（同一实名的 ' + sharedGroups + ' 个号共享一份每日额度）';
+          s += '（服务端判定为同一个人的 ' + sharedGroups + ' 个号共享一份每日额度）';
         }
       }
       $('ckQoderSummary').textContent = s;
@@ -4845,18 +4845,18 @@ async function loadCkQoder(quiet) {
       const noCamp = !!pendMap[k];
       const quota = !!quotaMap[k];
       const why = msgMap[k] || '';
-      // 同额度组（同一 scope / 同一实名）：这组的号共享**一份**每日额度。
+      // 同一个人组：服务端判定为同一个人的号共享**一份**每日额度。
       // 谁领到了就点名，避免用户以为是自己这个号没签成功。
       const holder = holderMap[k] || '';
       const gsize = a.quota_group || 0;
       const groupTag = gsize > 1
-        ? '<span class="tag mute" style="margin-left:6px" title="同额度组（同一实名）的 ' + gsize +
-          ' 个账号共享一份每日签到额度">同额度组 ' + gsize + ' 号</span>'
+        ? '<span class="tag mute" style="margin-left:6px" title="服务端判定为同一个人的 ' + gsize +
+          ' 个账号共享一份每日签到额度">同一人 ' + gsize + ' 号</span>'
         : '';
       const quotaTip = quota
         ? (holder
-          ? '今日每日额度已被同额度组账号 ' + holder + ' 领取（服务端按账号归属的实名给，同组一天只有一份）'
-          : '今日每日额度已被同额度组的另一账号领取（服务端按账号归属的实名给，同组一天只有一份、先打先得）')
+          ? '今日每日额度已被同一个人的另一个账号 ' + holder + ' 领取（服务端按人给，同一人一天只有一份）'
+          : '今日每日额度已被同一个人的另一个账号领取（服务端按人给，同一人一天只有一份、先打先得）')
         : '';
       const status = isDone
         ? UI.badge('ok', '✓', '今日已签到', why || '上游活动列表确认今天已领取')

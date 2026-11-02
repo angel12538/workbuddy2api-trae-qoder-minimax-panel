@@ -173,8 +173,12 @@ func (p *Panel) qoderCheckin(w http.ResponseWriter, r *http.Request) {
 	msg := fmt.Sprintf("本次签到 %d 个 · 今日已领 %d 个 · 失败 %d 个", out.Claimed, out.Already, out.Failed)
 	if out.Blocked > 0 {
 		// 这档不是失败（重试没用），也不是"已签到"（本号根本没领到）——
-		// 服务端把这两个账号判成同一个人，今天这一份额度只给了其中一个。
-		msg += fmt.Sprintf("，%d 个今天没签上（同额度组/同一实名的另一账号已领走每日额度）", out.Blocked)
+		// 服务端判定这两个账号是**同一个人**，今天这一份额度只给了其中一个。
+		msg += fmt.Sprintf("，%d 个今天没签上（服务端判定与另一个号是同一个人，那份额度已被对方领走）", out.Blocked)
+	}
+	if out.Pending > 0 {
+		// 这档是"服务端今天没给这个号下发"（不是被别人抢的），单列避免被当成失败。
+		msg += fmt.Sprintf("，%d 个服务端今天未下发额度", out.Pending)
 	}
 	if out.Credits > 0 {
 		msg += fmt.Sprintf("，新增 +%.0f Credits", out.Credits)
@@ -184,7 +188,7 @@ func (p *Panel) qoderCheckin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "results": out.Results,
 		"claimed_accounts": out.Claimed, "already_accounts": out.Already, "failed_accounts": out.Failed,
-		"blocked_accounts": out.Blocked,
+		"blocked_accounts": out.Blocked, "pending_accounts": out.Pending,
 		"credits":          out.Credits, "credits_already": out.AlreadyCredits, "msg": msg,
 		"no_device":        out.NoDevice,
 		"checked_in_today": out.Failed == 0 && out.Blocked == 0,

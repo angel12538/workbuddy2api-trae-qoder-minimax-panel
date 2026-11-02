@@ -36,9 +36,11 @@ import (
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 //
-// 1.15.4-panel：Qoder 每日签到按**账号归属的 scope（额度组）**分组 —— 同一实名的
-// 多个账号共享一份每日额度，跨额度组不再互相误判；面板显示额度组与今日名额归属。
-const appVersion = "1.15.4-panel"
+// 1.15.5-panel：Qoder 每日额度改按**人**判定（服务端 SAME_PERSON_ALREADY_CLAIMED
+// 实测）—— 不再拿 agentAccountScope 猜分组（实测两个号 scope 不同却共享一份额度）；
+// 跨号判定改成**只读**（GET .../campaigns/{cid}/reward），不会动到别人的额度；
+// 号池里的 scope 改为按账号自身解析（原来读的是主文件的 scope，会记错号）。
+const appVersion = "1.15.5-panel"
 
 // traeRateRange 汇总 Trae 目录的消耗倍率区间（启动日志用）。
 func traeRateRange(ms []traechat.ModelInfo) string {
