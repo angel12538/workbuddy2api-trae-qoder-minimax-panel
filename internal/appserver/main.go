@@ -35,7 +35,10 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.15.3-panel"
+//
+// 1.15.4-panel：Qoder 每日签到按**账号归属的 scope（额度组）**分组 —— 同一实名的
+// 多个账号共享一份每日额度，跨额度组不再互相误判；面板显示额度组与今日名额归属。
+const appVersion = "1.15.4-panel"
 
 // traeRateRange 汇总 Trae 目录的消耗倍率区间（启动日志用）。
 func traeRateRange(ms []traechat.ModelInfo) string {
