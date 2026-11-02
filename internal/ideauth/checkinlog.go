@@ -81,30 +81,51 @@ func saveCheckinLogFile(f checkinLog) error {
 
 // MarkCheckedIn 记录某签到对象今日已签到。kind ∈ {workbuddy, qoder, doubao}。
 func MarkCheckedIn(kind, key string) error {
+	return MarkCheckedInAt(kind, key, time.Now())
+}
+
+// MarkCheckedInAt 同 MarkCheckedIn，但由调用方给时刻（上游返回的真实领取时刻）。
+//
+// 为什么需要带时刻：可信判定要看"这条记录是不是今天活动下发之后写的"，用本机时钟
+// 写的记录，在时钟不准的机器上会把**真领到的那次**判成旧版误报（实测这台机器钟慢
+// 8 小时：12:39 真领到，本地记成 04:39 → 落在 10:05 线前 → 面板整天说没签上）。
+// 上游给的时刻不受本机时钟影响。
+func MarkCheckedInAt(kind, key string, at time.Time) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil
 	}
+	if at.IsZero() {
+		at = time.Now()
+	}
 	checkinLogMu.Lock()
 	defer checkinLogMu.Unlock()
 	f := loadCheckinLogFile()
-	f.Entries[kind+":"+key] = time.Now().Format(time.RFC3339)
+	f.Entries[kind+":"+key] = at.Format(time.RFC3339)
 	return saveCheckinLogFile(f)
 }
 
 // MarkClaimed 记录某账号**真正领到**积分的时刻（phase=claimed，不是 already）。
+func MarkClaimed(kind, key string) error {
+	return MarkClaimedAt(kind, key, time.Now())
+}
+
+// MarkClaimedAt 同 MarkClaimed，时刻由调用方给（上游返回的 claimedAt 优先）。
 //
 // 用途：Qoder 的每日额度服务端按「人」给，同一人的多个账号一天只有一份，
-// 谁先打谁拿到。轮换策略据此排序，保证两个号都能轮到。
-func MarkClaimed(kind, key string) error {
+// 谁先打谁拿到。轮换排序与可信判定都用这个时刻，所以它必须是真实时刻。
+func MarkClaimedAt(kind, key string, at time.Time) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil
 	}
+	if at.IsZero() {
+		at = time.Now()
+	}
 	checkinLogMu.Lock()
 	defer checkinLogMu.Unlock()
 	f := loadCheckinLogFile()
-	f.Claims[kind+":"+key] = time.Now().Format(time.RFC3339)
+	f.Claims[kind+":"+key] = at.Format(time.RFC3339)
 	return saveCheckinLogFile(f)
 }
 
@@ -175,14 +196,26 @@ func CheckedInAt(kind, key string) (time.Time, bool) {
 // 「可信」的分界线**按平台区分**（见 checkinTrustLine）：各平台活动刷新时刻
 // 不同，用一条线套所有平台会误伤。
 func CheckinRecordTrusted(kind, key string) bool {
+	// **真领到**的记录优先：Claims 只在领取成功（phase=claimed，且领的是今天下发的
+	// 活动）时写入，是硬证据；Entries 那条时刻线只是防「昨天的陈旧活动被当成今天
+	// 已领」的保守判据，本机时钟一慢就会把真领到的号误杀（实测这台机器钟慢 8 小时：
+	// 真领到的那次被记成 04:39，落在 10:05 线前 → 面板整天显示「没签上」）。
+	if c, ok := LastClaimedAt(kind, key); ok && sameLocalDay(c) {
+		return true
+	}
 	t, ok := CheckedInAt(kind, key)
 	if !ok {
 		return false
 	}
-	if t.Local().Format("2006-01-02") != time.Now().Format("2006-01-02") {
+	if !sameLocalDay(t) {
 		return false // 非今日记录一律不可信（已过期）
 	}
 	return !t.Before(checkinTrustLine(kind))
+}
+
+// sameLocalDay 这条时刻是否落在「今天」（本地自然日）。
+func sameLocalDay(t time.Time) bool {
+	return t.Local().Format("2006-01-02") == time.Now().Format("2006-01-02")
 }
 
 // checkinTrustLine 本地签到记录的可信分界线（今日本地时间的时刻）。

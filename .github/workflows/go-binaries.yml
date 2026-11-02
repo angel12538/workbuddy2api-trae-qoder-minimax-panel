@@ -93,7 +93,7 @@ jobs:
       - name: 打包（windows=zip 三件套，其余=tar.gz）
         run: |
           V="${{ steps.ver.outputs.v }}"
-          V="${V%-panel}"   # 文件名不带 -panel 后缀（wb2api-panel-v1.2.3-... 既有惯例）
+          # 资产名保留 -panel 后缀，与历史 Release 命名一致（wb2api-panel-v1.15.3-panel-*.zip）
           case "${{ matrix.goos }}" in
             windows)
               NAME="wb2api-panel-v${V}-windows-amd64.zip"
@@ -132,6 +132,7 @@ jobs:
           fi
           SRC="${SRC%-panel}"   # appVersion 带 -panel 后缀，比对前剥掉
           TAG="${GITHUB_REF_NAME#v}"
+          TAG="${TAG%-panel}"   # tag 也可能带 -panel 后缀（历史惯例 v1.15.3-panel），一并剥掉再比
           if [[ "$GITHUB_REF_NAME" != *-ci ]]; then
             if [[ "$TAG" != "$SRC" ]]; then
               echo "::error::tag $GITHUB_REF_NAME 与源码 appVersion=$SRC 不一致（先提交版本号再打 tag）"
@@ -153,9 +154,11 @@ jobs:
           echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}-panel
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-ci') }}
           body: |
+            WorkBuddy / CodeBuddy / Trae / Qoder / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道 多账号合集 / 每日签到 / OpenAI 兼容网关。
+
             CI 自动构建发布（五平台二进制 + checksums）。
 
             完整变更：https://github.com/${{ github.repository }}/compare/${{ steps.prev.outputs.prev }}...${{ github.ref_name }}
