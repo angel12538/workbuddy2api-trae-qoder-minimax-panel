@@ -114,12 +114,21 @@ func QoderDeviceID() (string, error) {
 }
 
 // QoderScope 从 qoder-data.v1.json 读取 agentAccountScope（账号绑定标识）。
+//
+// ⚠️ 这是**服务端按账号归属（实名/租户）下发**的额度组标识：同一 scope 下的多个
+// 账号共享同一份每日签到额度（2026-11-02 实测，见 QoderQuotaGroupKey）。
 func QoderScope() (string, error) {
 	b, err := os.ReadFile(filepath.Join(QoderDataDir(), "qoder-data.v1.json"))
 	if err != nil {
 		return "", err
 	}
 	return extractJSONString(b, "agentAccountScope"), nil
+}
+
+// currentQoderScope 返回当前登录账号的 scope（读不到就是空，不报错）。
+func currentQoderScope() string {
+	s, _ := QoderScope()
+	return s
 }
 
 // QoderSnapshot 是切号时保存的账号快照。

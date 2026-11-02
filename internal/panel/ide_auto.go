@@ -98,18 +98,21 @@ func (p *Panel) ideCheckinAll(ctx context.Context) {
 	// （服务端 failureCode=SAME_PERSON_ALREADY_CLAIMED），跟「这个号有没有在客户端
 	// 登录过」无关 —— 切号并不会让同一个人的另一个号领到额度，只会把客户端反复
 	// 重启（每号一次）。所以这里改成：每个号都用它自己的 token 直接打接口，
-	// 领不到就如实报「同一人另一账号已领」。
+	// 领不到就如实报「同额度组另一账号已领」。
 }
 
 // ideQoderCheckinAll Qoder 号池逐号签到。
 func (p *Panel) ideQoderCheckinAll() {
+	// 顺序由 QoderCheckinPoolOrdered 内部按「最久没真领到的先打」排 ——
+	// 每日额度按账号归属的实名（额度组）给、一组一份，先打的号拿到，其余号服务端一律回
+	// SAME_PERSON_ALREADY_CLAIMED（blocked）。不排的话永远是号池里第一个赢。
 	res, err := ideauth.QoderCheckinPool(nil) // nil = 号池全部账号
 	if err != nil {
 		log.Printf("panel: Qoder 自动签到失败: %v", err)
 		return
 	}
-	log.Printf("panel: Qoder 自动签到完成：成功 %d / 已签 %d / 失败 %d",
-		res.Claimed, res.Already, res.Failed)
+	log.Printf("panel: Qoder 自动签到完成：成功 %d / 已签 %d / 同额度组另号已领 %d / 失败 %d（新增 %.0f Credits）",
+		res.Claimed, res.Already, res.Blocked, res.Failed, res.Credits)
 }
 
 // ideWorkBuddyCheckinAll WorkBuddy 号池逐号签到。

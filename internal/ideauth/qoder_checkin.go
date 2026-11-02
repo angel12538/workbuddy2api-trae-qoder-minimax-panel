@@ -312,8 +312,25 @@ type QoderCheckinResult struct {
 	// 某个号的列表里看不到活动时，用**另一个号**的实例 id 去试一次就能拿到
 	// 服务端的真实判定（SAME_PERSON_ALREADY_CLAIMED），而不是含糊地说"暂无活动"。
 	ClaimCID string `json:"claim_cid,omitempty"`
+	// ClaimedAt 服务端给的领取时刻（RFC3339，**UTC**）。空 = 这次没领到/上游没给。
+	// 本地签到记录用它落时间戳，这样"今天签没签"不再依赖本机时钟。
+	ClaimedAt string `json:"claimed_at,omitempty"`
+	// ClaimedToday 本次领到的那条活动是**今天下发**的（qoderCampaignIsToday）。
+	// 昨天那波如果还挂着 CLAIMABLE，领它同样给积分，但那是补领，不是今天的每日
+	// 额度 —— 不能据此把"今天已签"写进记录（否则今天真活动下发时反而被跳过）。
+	ClaimedToday bool `json:"claimed_today,omitempty"`
 	// CheckedInToday 面板观察到该账号今天已完成领取。
 	CheckedInToday bool `json:"checked_in_today,omitempty"`
+	// Scope 该账号归属的额度组（服务端下发的 agentAccountScope）。
+	//
+	// 2026-11-02 实测：每日 100 Credits 按**账号归属的 scope** 发，不是按设备。
+	// 同 scope 的多个账号共享同一份额度，所以「一个设备只能签一个号」的真相是
+	// 「一个实名（scope）只能签一个号」。
+	Scope string `json:"scope,omitempty"`
+	// QuotaGroup 本账号所在额度组里的账号数（含自己）。>1 = 与别的号共享每日额度。
+	QuotaGroup int `json:"quota_group,omitempty"`
+	// QuotaTakenBy 同组里今天领到每日额度的账号（空 = 组里还没人领）。
+	QuotaTakenBy string `json:"quota_taken_by,omitempty"`
 }
 
 // qoderOpenAPIBaseList 返回候选 base（按优先级）。默认国际服优先、国内兜底；
@@ -325,9 +342,44 @@ func qoderOpenAPIBaseList() []string {
 	return []string{qoderOpenAPIINTL, qoderOpenAPICN}
 }
 
+// qoderOpenAPIBaseListForScope 按账号归属的 scope 排 base 顺序：
+// global 账号先打国际服（openapi.qoder.sh），其余先打国内服。
+//
+// 排错顺序的代价是实打出来的：global 账号先打国内服会拿到 401 TOKEN_EXPIRE
+// （"token is not active"），而它其实有**完全有效**的凭证 —— 401 极易被误读成
+// "token 失效"，面板于是显示"需要重新登录"，用户白折腾。
+func qoderOpenAPIBaseListForScope(scope string) []string {
+	if v := strings.TrimSpace(os.Getenv("QODER_OPENAPI_BASE")); v != "" {
+		return []string{strings.TrimRight(v, "/")}
+	}
+	if strings.Contains(strings.ToLower(scope), ":global") {
+		return []string{qoderOpenAPIINTL, qoderOpenAPICN}
+	}
+	return []string{qoderOpenAPICN, qoderOpenAPIINTL}
+}
+
 // qoderDo 发一次带鉴权与设备头的请求。
+//
+// 网络层失败会**原地重试一次**：本机默认走 HTTP_PROXY（127.0.0.1:10808 的本地
+// 代理），那个代理偶尔拒连，一次网络错误就判「token 失效」是冤枉。实测：同一秒
+// 探针脚本能通、服务进程却报连接失败，重试一次就稳了。
 func qoderDo(base, path, method, token string, body []byte, dev *QoderDevice) (int, []byte, error) {
 	url := strings.TrimRight(base, "/") + path
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(1500 * time.Millisecond)
+		}
+		st, raw, err := qoderDoOnce(url, method, token, body, dev)
+		if err == nil {
+			return st, raw, nil
+		}
+		lastErr = err
+	}
+	return 0, nil, lastErr
+}
+
+func qoderDoOnce(url, method, token string, body []byte, dev *QoderDevice) (int, []byte, error) {
 	var rdr io.Reader
 	if len(body) > 0 {
 		rdr = bytes.NewReader(body)
@@ -368,7 +420,7 @@ func QoderCheckin() (*QoderCheckinResult, error) {
 		return &QoderCheckinResult{Phase: "login_required", Msg: "读取 Qoder 登录态失败: " + err.Error()}, nil
 	}
 	dev := qoderDeviceForAccount(auth)
-	res, at, rt := qoderCheckinAuth(auth, dev)
+	res, at, rt := qoderCheckinAuth(auth, dev, currentQoderScope())
 	if at != "" || rt != "" {
 		// 当前登录号：token 轮换必须写回客户端登录态，否则下次续期会失败。
 		_ = writeBackQoderTokens(auth, at, rt)
@@ -384,7 +436,7 @@ func QoderCheckin() (*QoderCheckinResult, error) {
 //
 // 返回的 newAccess/newRefresh 非空表示本次 401 后续期成功，由调用方负责持久化：
 // 当前登录号写回客户端登录态，号池账号写回号池文件（绝不能互相串写）。
-func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResult, newAccess, newRefresh string) {
+func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice, scope string) (res *QoderCheckinResult, newAccess, newRefresh string) {
 	if auth == nil || (auth.Token == "" && auth.RefreshToken == "") {
 		return &QoderCheckinResult{Phase: "login_required", Msg: "该账号没有可用凭证（token/refresh_token 均为空）"}, "", ""
 	}
@@ -411,7 +463,7 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 	// 不是 401——以前循环在第一个 200 就 break，于是永远"暂无可领取活动"，
 	// 而且永远不会触发续期。表现就是：明明有活动，面板却一直签不了。
 	if qoderAuthExpired(auth) {
-		if nt, nrt, ok := qoderRefreshToken(auth, qoderOpenAPIBaseList()[0], dev); ok {
+		if nt, nrt, ok := qoderRefreshToken(auth, qoderOpenAPIBaseListForScope(scope)[0], dev); ok {
 			token = nt
 			res.Refreshed = true
 			newAccess, newRefresh = nt, nrt
@@ -421,7 +473,7 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 
 	authorized := false
 	emptyOK := false // 拿到过滤 200 但没有活动：作为"确实没有活动"的兜底证据
-	for _, b := range qoderOpenAPIBaseList() {
+	for _, b := range qoderOpenAPIBaseListForScope(scope) {
 		st, rw, err := qoderDo(b, qoderPathCampaigns, http.MethodGet, token, nil, dev)
 		if err != nil {
 			lastErr = err.Error()
@@ -527,9 +579,17 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 			fails = append(fails, c.CampaignID+":"+err.Error())
 			continue
 		}
-		amount, ok := parseClaimResult(s2, r2)
+		amount, claimedAt, ok := parseClaimResult(s2, r2)
 		if ok {
 			claimed++
+			// 只有「今天下发的活动」才算今天的签到；补领昨天那波也给积分，但不能
+			// 写成「今日已领取」—— 那会让今天真活动下发时被可信线跳过。
+			if qoderCampaignIsToday(c) {
+				res.ClaimedToday = true
+				if claimedAt != "" {
+					res.ClaimedAt = claimedAt
+				}
+			}
 			if amount > 0 {
 				got += amount
 			} else {
@@ -568,21 +628,21 @@ func qoderCheckinAuth(auth *QoderAuth, dev *QoderDevice) (res *QoderCheckinResul
 // 而不是含糊的"暂无签到活动" —— 前者是事实，后者会让人以为没签上。
 //
 // 返回：phase ∈ {"claimed"（真领到了）, "blocked"（同一人已领）, ""（无结论）}；
-// detail 是服务端的 failureCode（blocked 时）。
-func qoderClaimInstance(auth *QoderAuth, dev *QoderDevice, cid string) (phase string, amount float64, detail string) {
+// detail 是服务端的 failureCode（blocked 时）；claimedAt 是服务端给的领取时刻。
+func qoderClaimInstance(auth *QoderAuth, dev *QoderDevice, cid, scope string) (phase string, amount float64, detail string, claimedAt string) {
 	if auth == nil || cid == "" {
-		return "", 0, ""
+		return "", 0, "", ""
 	}
 	if dev == nil {
 		dev = &QoderDevice{}
 	}
 	token := auth.Token
 	if qoderAuthExpired(auth) {
-		if nt, _, ok := qoderRefreshToken(auth, qoderOpenAPIBaseList()[0], dev); ok {
+		if nt, _, ok := qoderRefreshToken(auth, qoderOpenAPIBaseListForScope(scope)[0], dev); ok {
 			token = nt
 		}
 	}
-	for _, b := range qoderOpenAPIBaseList() {
+	for _, b := range qoderOpenAPIBaseListForScope(scope) {
 		st, raw, err := qoderDo(b, fmt.Sprintf(qoderPathClaim, cid), http.MethodPost, token, []byte("{}"), dev)
 		if err != nil || st != http.StatusOK {
 			continue
@@ -591,6 +651,7 @@ func qoderClaimInstance(auth *QoderAuth, dev *QoderDevice, cid string) (phase st
 			Status      string `json:"status"`
 			FailureCode string `json:"failureCode"`
 			ErrorCode   string `json:"errorCode"`
+			ClaimedAt   string `json:"claimedAt"`
 			Benefit     struct {
 				Amount float64 `json:"amount"`
 			} `json:"benefit"`
@@ -600,16 +661,16 @@ func qoderClaimInstance(auth *QoderAuth, dev *QoderDevice, cid string) (phase st
 		}
 		switch r.Status {
 		case "CLAIMED", "SUCCESS":
-			return "claimed", r.Benefit.Amount, ""
+			return "claimed", r.Benefit.Amount, "", r.ClaimedAt
 		case "BLOCKED":
 			code := r.FailureCode
 			if code == "" {
 				code = r.ErrorCode
 			}
-			return "blocked", 0, code
+			return "blocked", 0, code, ""
 		}
 	}
-	return "", 0, ""
+	return "", 0, "", ""
 }
 
 // QoderCheckinStatus 查询当前账号的签到状态（不领取）。phase：
@@ -625,7 +686,7 @@ func QoderCheckinStatus() *QoderCheckinResult {
 		return &QoderCheckinResult{Phase: "login_required", Msg: "未登录或无法读取登录态"}
 	}
 	dev := qoderDeviceForAccount(auth)
-	res := qoderScanAuth(auth, dev)
+	res := qoderScanAuth(auth, dev, currentQoderScope())
 	if at, rt := res.newAccess, res.newRefresh; at != "" || rt != "" {
 		// 当前登录号：续期结果必须写回客户端登录态。
 		_ = writeBackQoderTokens(auth, at, rt)
@@ -640,7 +701,7 @@ func QoderScanCurrent() map[string]any {
 	if err != nil {
 		return map[string]any{"phase": "login_required", "msg": "未登录或无法读取登录态"}
 	}
-	oc := qoderScanAuth(auth, qoderDeviceForAccount(auth))
+	oc := qoderScanAuth(auth, qoderDeviceForAccount(auth), currentQoderScope())
 	if oc.newAccess != "" || oc.newRefresh != "" {
 		_ = writeBackQoderTokens(auth, oc.newAccess, oc.newRefresh)
 	}
@@ -663,7 +724,7 @@ type qoderScanOutcome struct {
 }
 
 // qoderScanAuth 用指定登录态做一次「只查不领」的上游核实（多 base + 续期重试）。
-func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
+func qoderScanAuth(auth *QoderAuth, dev *QoderDevice, scope string) qoderScanOutcome {
 	out := qoderScanOutcome{result: &QoderCheckinResult{
 		Email: auth.User.Email, Name: auth.User.Name, UID: auth.User.ID,
 	}}
@@ -680,7 +741,7 @@ func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
 	token := auth.Token
 	// 过期先续期（别等 401：国际服对过期 token 返回 200 + 空列表）。
 	if qoderAuthExpired(auth) {
-		if nt, nrt, ok := qoderRefreshToken(auth, qoderOpenAPIBaseList()[0], dev); ok {
+		if nt, nrt, ok := qoderRefreshToken(auth, qoderOpenAPIBaseListForScope(scope)[0], dev); ok {
 			token = nt
 			out.result.Refreshed = true
 			out.newAccess, out.newRefresh = nt, nrt
@@ -692,10 +753,14 @@ func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
 	authorized := false
 	emptyOK := false
 	var campaigns []QoderCampaign
-	for _, b := range qoderOpenAPIBaseList() {
+	// 每个 base 的失败原因都要留档：只留最后一个会把「国际服网络失败」显示成
+	// 「国内服 401 token 失效」，把用户引到完全错误的方向上。
+	var baseErrs []string
+	for _, b := range qoderOpenAPIBaseListForScope(scope) {
 		st, raw, err := qoderDo(b, qoderPathCampaigns, http.MethodGet, token, nil, dev)
 		if err != nil {
 			lastErr = err.Error()
+			baseErrs = append(baseErrs, b+" 连接失败: "+err.Error())
 			continue
 		}
 		if st == http.StatusUnauthorized {
@@ -712,12 +777,12 @@ func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
 				}
 			}
 			lastErr = "401 @ " + b
+			baseErrs = append(baseErrs, b+" HTTP 401（token 失效）")
 			continue
 		}
 		if st != http.StatusOK {
-			out.result.Phase = "error"
-			out.result.Msg = fmt.Sprintf("查询活动失败 HTTP %d: %s", st, truncateStr(string(raw), 120))
-			return out
+			baseErrs = append(baseErrs, fmt.Sprintf("%s HTTP %d: %s", b, st, truncateStr(string(raw), 120)))
+			continue
 		}
 		// 200：空列表也接受（可能领完即删 / 未下发），但要继续试下一个 base 是否有货。
 		cs := qoderCampaignsOf(raw)
@@ -737,10 +802,11 @@ func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
 	}
 	if !authorized {
 		out.result.Phase = "login_required"
-		if lastErr == "" {
-			lastErr = "无可用的 openapi base"
+		if len(baseErrs) > 0 {
+			out.result.Msg = "上游不可达或凭证失效：" + strings.Join(baseErrs, "；")
+		} else {
+			out.result.Msg = "token 无效或无法连接（" + lastErr + "）"
 		}
-		out.result.Msg = "token 无效或无法连接（" + lastErr + "）"
 		return out
 	}
 
@@ -775,33 +841,39 @@ func qoderScanAuth(auth *QoderAuth, dev *QoderDevice) qoderScanOutcome {
 	return out
 }
 
-// parseClaimResult 解析 claim 响应，判断是否 CLAIMED。
-func parseClaimResult(status int, raw []byte) (float64, bool) {
+// parseClaimResult 解析 claim 响应，判断是否 CLAIMED，并取回**服务端给的**领取时刻。
+//
+// 为什么要把 claimedAt 带回去：本地签到记录的可信判定要看"这条记录是不是今天
+// 活动下发之后写的"。用本机时钟判，本机时钟一错（这台机器实测钟慢 8 小时）就把
+// 真领到的记录当成旧版误报，面板整天显示"没签上"。服务端给的时刻没有这个问题。
+func parseClaimResult(status int, raw []byte) (float64, string, bool) {
 	if status != http.StatusOK {
-		return 0, false
+		return 0, "", false
 	}
 	var wrap struct {
-		Status  string       `json:"status"`
-		Benefit QoderBenefit `json:"benefit"`
-		Data    *struct {
-			Status  string       `json:"status"`
-			Benefit QoderBenefit `json:"benefit"`
+		Status    string       `json:"status"`
+		ClaimedAt string       `json:"claimedAt"`
+		Benefit   QoderBenefit `json:"benefit"`
+		Data      *struct {
+			Status    string       `json:"status"`
+			ClaimedAt string       `json:"claimedAt"`
+			Benefit   QoderBenefit `json:"benefit"`
 		} `json:"data"`
 	}
 	if json.Unmarshal(raw, &wrap) != nil {
-		return 0, false
+		return 0, "", false
 	}
 	if wrap.Data != nil && wrap.Data.Status == "CLAIMED" {
-		return wrap.Data.Benefit.Amount, true
+		return wrap.Data.Benefit.Amount, wrap.Data.ClaimedAt, true
 	}
 	if wrap.Status == "CLAIMED" {
-		return wrap.Benefit.Amount, true
+		return wrap.Benefit.Amount, wrap.ClaimedAt, true
 	}
 	// 有些返回把 status 放在 data 里但结构不同，退而求其次
 	if bytes.Contains(raw, []byte(`"CLAIMED"`)) {
-		return 0, true
+		return 0, "", true
 	}
-	return 0, false
+	return 0, "", false
 }
 
 // qoderRefreshToken 刷新 accessToken，返回 (accessToken, refreshToken, ok)。
@@ -891,11 +963,11 @@ func QoderUsage() *QoderUsageResult {
 	if err != nil {
 		return &QoderUsageResult{Phase: "login_required", Msg: "未登录或无法读取登录态"}
 	}
-	return qoderUsageAuth(auth, QoderDeviceInfo())
+	return qoderUsageAuth(auth, QoderDeviceInfo(), currentQoderScope())
 }
 
 // qoderUsageAuth 用指定登录态查额度（号池多号查询复用，见 QoderUsageFor）。
-func qoderUsageAuth(auth *QoderAuth, dev *QoderDevice) *QoderUsageResult {
+func qoderUsageAuth(auth *QoderAuth, dev *QoderDevice, scope string) *QoderUsageResult {
 	if auth == nil {
 		return &QoderUsageResult{Phase: "login_required", Msg: "账号登录态为空"}
 	}
@@ -904,7 +976,7 @@ func qoderUsageAuth(auth *QoderAuth, dev *QoderDevice) *QoderUsageResult {
 	}
 	res := &QoderUsageResult{Email: auth.User.Email, Name: auth.User.Name, UID: auth.User.ID}
 	lastErr := ""
-	for _, base := range qoderOpenAPIBaseList() {
+	for _, base := range qoderOpenAPIBaseListForScope(scope) {
 		st, raw, derr := qoderDo(base, qoderPathUsage, http.MethodGet, auth.Token, nil, dev)
 		if derr != nil {
 			lastErr = derr.Error()
@@ -987,7 +1059,7 @@ func QoderRenew(force bool) *QoderRenewResult {
 	}
 	dev := QoderDeviceInfo()
 	lastErr := ""
-	for _, base := range qoderOpenAPIBaseList() {
+	for _, base := range qoderOpenAPIBaseListForScope(currentQoderScope()) {
 		at, rt, exp, rtexp, ok := qoderRefreshTokenFull(auth, base, dev)
 		if !ok {
 			lastErr = "刷新失败 @ " + base
@@ -1051,9 +1123,13 @@ func qoderCampaignsOf(raw []byte) []QoderCampaign {
 // runtime-info 指纹（machineToken/machineCode/machineId 三件套）后活动正常
 // 出现并可领取（+100 Credits 实测到账）。
 //
-// 代价：每台物理设备每日只能领一个账号（第一个领取后，同设备其他账号的
-// 签到活动被服务端隐藏，claimable=false）——这是服务端硬规则，扫描结果里
-// 会如实说明。
+// 2026-11-02 实测再修正：设备指纹只是「有没有设备」的开关，**不是每日额度的归属键**。
+// 伪造整套 Cosy-* 头（machineToken/machineCode/machineId 全换）服务端照样返回同一
+// 条活动；刷新 device token 的响应里更是没有任何 scope/设备字段。真正的归属键是
+// **账号归属的 scope（同一实名/租户）** —— 同 scope 的账号共享一份每日额度。
+// 详见 QoderQuotaGroupKey。
+//
+// 所以这里发真实指纹（保证活动会被下发），额度归属交给 scope 分组处理。
 func qoderDeviceForAccount(auth *QoderAuth) *QoderDevice {
 	dev := QoderDeviceInfo()
 	if dev == nil {

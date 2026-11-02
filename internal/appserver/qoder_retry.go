@@ -77,7 +77,8 @@ func startQoderAutoCheckin(ctx context.Context) {
 }
 
 func qoderRetrySummary(res *ideauth.QoderCheckinPoolResult) string {
-	s := fmt.Sprintf("本次签到 %d 个 · 今日已领 %d 个 · 失败 %d 个", res.Claimed, res.Already, res.Failed)
+	s := fmt.Sprintf("本次签到 %d 个 · 今日已领 %d 个 · 同额度组另号已领 %d 个 · 失败 %d 个",
+		res.Claimed, res.Already, res.Blocked, res.Failed)
 	if res.Credits > 0 {
 		s += fmt.Sprintf("，新增 +%.0f Credits", res.Credits)
 	}

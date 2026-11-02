@@ -211,25 +211,50 @@ func (p *Panel) qoderLoginPoll(w http.ResponseWriter, r *http.Request) {
 	if s, err := ideauth.QoderScope(); err == nil {
 		scope = s
 	}
+	// 「是否独立额度组」的**硬依据**是 scope：服务端在登录时按账号归属（实名/
+	// 租户）下发 scope，同 scope 就一定共享同一份每日额度（2026-11-02 实测：
+	// 伪造设备头无效、刷新 token 不带设备字段、两个号的 scope 完全一致）。
+	// 上游 phase 只反映"今天谁先领"，没被领过时看不出差别，所以两处分开说：
+	// scope 定「是不是一组」，phase 定「今天这组的名额在谁手上」。
 	independent := false
-	detail := ""
+	var notes []string
+	peers := ideauth.QoderScopePeers(email)
+	switch {
+	case scope != "" && len(peers) == 0:
+		independent = true
+		notes = append(notes, "已拿到独立额度组（scope "+ideauth.QoderQuotaScopeLabel(scope)+
+			"）：这个号的每日 100 积分归它自己，不再与号池里其它号共享")
+	case len(peers) > 0:
+		notes = append(notes, "仍与号池里的 "+strings.Join(peers, "、")+
+			" 同属一个额度组（同一实名），每天只有一份 100 积分。"+
+			"要让每个号各领一份，需要在 Qoder 客户端里用这个号**重新登录一次**"+
+			"（面板「添加账号 → Qoder → 浏览器登录并添加」并勾选「先退出当前账号再登录」），"+
+			"服务端才会给它下发新的 scope")
+	}
 	if err == nil {
 		for _, row := range ideauth.QoderPoolScan([]string{email}) {
 			switch row.Phase {
 			case "claimable":
-				independent = true
-				detail = "这个号现在是独立身份，今天的 100 积分在它名下（回上游核实：可领取）"
+				if scope == "" {
+					independent = true
+				}
+				notes = append(notes, "今天这份 100 积分在它名下（回上游核实：可领取）")
 			case "claimed":
-				independent = true
-				detail = "这个号已是独立身份，且今天已经领过"
+				if scope == "" {
+					independent = true
+				}
+				notes = append(notes, "它今天已经领过")
 			default:
-				detail = row.Msg
-				if row.DeviceQuotaUsed {
-					detail = "仍与号池里另一个号被服务端算作同一个人，今天这份额度已被对方领走"
+				switch {
+				case row.DeviceQuotaUsed:
+					notes = append(notes, "今天这份额度已被同额度组的另一个号领走")
+				case row.Msg != "":
+					notes = append(notes, row.Msg)
 				}
 			}
 		}
 	}
+	detail := strings.Join(notes, "；")
 
 	qoderLoginSession.mu.Lock()
 	qoderLoginSession.done = true

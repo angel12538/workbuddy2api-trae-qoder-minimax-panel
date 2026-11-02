@@ -261,7 +261,7 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		ok = true
 		msg = fmt.Sprintf("今天已领取（+%.0f Credits）", amount)
 	default:
-		msg = "这个号今天没有可领的每日额度（可能已被同一人另一账号领走）"
+		msg = "这个号今天没有可领的每日额度（可能已被同额度组/同一实名的另一账号领走）"
 	}
 
 	// 会话存进该账号的 profile 目录（cookies.json）：之后每天后台直接用，

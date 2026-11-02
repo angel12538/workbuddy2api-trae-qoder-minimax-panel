@@ -174,7 +174,7 @@ func (p *Panel) qoderCheckin(w http.ResponseWriter, r *http.Request) {
 	if out.Blocked > 0 {
 		// 这档不是失败（重试没用），也不是"已签到"（本号根本没领到）——
 		// 服务端把这两个账号判成同一个人，今天这一份额度只给了其中一个。
-		msg += fmt.Sprintf("，%d 个今天没签上（同一人另一账号已领走每日额度）", out.Blocked)
+		msg += fmt.Sprintf("，%d 个今天没签上（同额度组/同一实名的另一账号已领走每日额度）", out.Blocked)
 	}
 	if out.Credits > 0 {
 		msg += fmt.Sprintf("，新增 +%.0f Credits", out.Credits)

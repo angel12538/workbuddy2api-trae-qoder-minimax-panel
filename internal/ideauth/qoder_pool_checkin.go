@@ -13,11 +13,14 @@ import (
 // 背景：Qoder 的每日签到（Campaign 领取）只需要两样东西——
 //   1) 该账号的 access token（401 时用 refresh_token 续期）；
 //   2) 设备指纹 Cosy-*（machineToken/machineCode 等）。
-// 其中设备指纹是**设备级**的，与账号无关；token 号池里每个账号都存了。
+// token 号池里每个账号都存了；设备指纹是**设备级**的，所有账号共用同一份。
 // 所以「签到」根本不需要切号、不需要重启客户端，可以按号池逐个账号直接打接口。
 //
 // 之前的实现只调 QoderCheckin()（读磁盘上的当前登录态），于是面板里明明有两个号，
 // 签到池也只显示/只能签当前那一个。本文件补上「按账号批量签到」的能力。
+//
+// ⚠️ 每日额度不是每个号一份（2026-11-02 实测）：服务端按**账号归属的 scope**
+// （同一实名/租户）发，同 scope 的多个账号共享**一份**。详见 QoderQuotaGroupKey。
 
 // QoderCheckinPoolResult 一次多号签到的汇总（面板直接展示）。
 type QoderCheckinPoolResult struct {
@@ -88,11 +91,49 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 				break
 			}
 		}
+	} else if len(items) > 1 {
+		// 自动路径（没人指定今天这份给谁）：**最久没真正领到的号先打**。
+		//
+		// 为什么必须排：每日额度按**人**给，一天只有一份，先打的那个号拿到，
+		// 其余的号服务端一律回 SAME_PERSON_ALREADY_CLAIMED（2026-10-24 实测；
+		// 2026-11-01 换整套伪造设备指纹复测，结论一字不变）。此前自动签到调的是
+		// 不带 priority 的 QoderCheckinPool(nil) → 顺序 = 号池文件里的顺序 →
+		// 排第一的号天天赢，第二个号一年也轮不到一次。Claims/LastClaimedAt
+		// 这两个字段当初就是为轮换存的，但一直没有接上（全仓零调用点）。
+		//
+		// 先把各号的上次领取时刻取一遍再排：LastClaimedAt 每次都要读一遍签到
+		// 日志文件，放进比较函数就是 O(n log n) 次磁盘读。
+		last := make(map[string]time.Time, len(items))
+		for _, it := range items {
+			if t, ok := LastClaimedAt("qoder", it.email); ok {
+				last[strings.ToLower(it.email)] = t
+			}
+		}
+		sort.SliceStable(items, func(i, j int) bool {
+			return last[strings.ToLower(items[i].email)].Before(last[strings.ToLower(items[j].email)])
+		})
 	}
 
 	out := &QoderCheckinPoolResult{Results: make([]QoderCheckinResult, 0, len(items))}
 	baseDev := QoderDeviceInfo()
 	out.NoDevice = baseDev == nil || baseDev.MachineToken == ""
+
+	// 额度组：同一 scope 的账号共享**同一份**每日额度（2026-11-02 实测）。
+	// 组内只有一个人能领到今天的 100 Credits；组与组之间互不影响。
+	groupOf := map[string]string{} // 邮箱(小写) → 组键
+	groupSize := map[string]int{}  // 邮箱(小写) → 组内账号数
+	for _, a := range pool.Accounts {
+		em := strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a)))
+		if em == "" {
+			continue
+		}
+		groupOf[em] = QoderQuotaGroupKey(a)
+	}
+	for _, ems := range QoderQuotaGroups(pool.Accounts) {
+		for _, em := range ems {
+			groupSize[strings.ToLower(em)] = len(ems)
+		}
+	}
 
 	changed := false
 	// 本次运行里已知的活动实例 id（账号 → cid）：先领到的号会贡献自己的 cid，
@@ -105,6 +146,7 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		res   *QoderCheckinResult
 		auth  *QoderAuth
 		dev   *QoderDevice
+		group string
 	}
 	var probes []pendingProbe
 
@@ -114,8 +156,10 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		auth := cloneQoderAuth(snap.Auth)
 		// 每个账号用**自己的**设备标识（不是客户端的物理设备），否则同一设备只能签一个号。
 		dev := qoderDeviceForAccount(auth)
-		res, at, rt := qoderCheckinAuth(auth, dev)
+		res, at, rt := qoderCheckinAuth(auth, dev, QoderQuotaScopeKey(snap))
 		res.Email = firstNonEmpty(email, res.Email)
+		res.Scope = QoderQuotaScopeKey(snap)
+		res.QuotaGroup = groupSize[strings.ToLower(strings.TrimSpace(email))]
 		// token 轮换写回号池（下次切号/签到才能继续用）
 		if at != "" {
 			snap.Auth.Token = at
@@ -133,23 +177,26 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			}
 		}
 		if res.Phase == "pending" {
-			probes = append(probes, pendingProbe{snap: snap, email: email, res: res, auth: auth, dev: dev})
+			// 自己的列表里没有今天的活动：交给下面的二次探测（那里才是这类账号的
+			// 归宿 —— 要么拿**同额度组**兄弟号的实例 id 问出 SAME_PERSON 判定，
+			// 要么用本地可信记录兜底成「今日已领取」）。
+			probes = append(probes, pendingProbe{
+				snap: snap, email: email, res: res, auth: auth, dev: dev,
+				group: groupOf[strings.ToLower(strings.TrimSpace(email))],
+			})
 			continue
-		}
-		// 上游「领完即删」：今天已经领过的账号，activities 会变成空列表，
-		// 上游报 pending。此时用**可信的**本地签到记录兜底（10:05 前写入的记录
-		// 是旧版误报，不能用来把 pending 翻成 already），否则面板永远显示"可签到"。
-		if res.Phase == "pending" && CheckinRecordTrusted("qoder", res.Email) {
-			res.Phase = "already"
-			res.Msg = "今日已领取（本地记录）"
-			res.CheckedInToday = true
 		}
 		switch res.Phase {
 		case "claimed":
 			out.Claimed++
 			out.Credits += res.Credits
-			res.CheckedInToday = true
-			_ = MarkClaimed("qoder", res.Email)
+			if res.ClaimedToday {
+				res.CheckedInToday = true
+				// 用服务端给的 claimedAt 落时间戳：本机时钟不准时（实测这台机器慢
+				// 8 小时）用 time.Now() 会把真领到的那次记到可信线之前，面板于是
+				// 整天显示「没签上」，重试循环也白跑。
+				_ = MarkClaimedAt("qoder", res.Email, claimStamp(res))
+			}
 			_ = MarkCheckedIn("qoder", res.Email)
 		case "already":
 			out.Already++
@@ -162,21 +209,35 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		out.Results = append(out.Results, *res)
 	}
 
-	// 二次探测：自己的列表里没有今天的活动 → 拿同一人**另一个账号**的活动实例
+	// 二次探测：自己的列表里没有今天的活动 → 拿**同一额度组**另一个账号的活动实例
 	// id 去领一次，向服务端要一个真实判定（而不是含糊地说"暂无活动"）。
 	//
-	// 实测（2026-10-24）：另一个账号领过之后，服务端回
+	// 实测（2026-10-24）：同组另一个账号领过之后，服务端回
 	// status=BLOCKED / failureCode=SAME_PERSON_ALREADY_CLAIMED —— 说明这个号
 	// 今天的每日额度已经被「同一个人」的另一个账号领走了，本号确实无需再领。
 	// 若这次反而领成功（服务端放行），那就是真·领到，按 claimed 计。
+	//
+	// ⚠️ 只能取**同额度组**的 cid（2026-11-02 修正）。额度组 = 服务端 scope，
+	// 同组共享一份每日额度；不同组的账号各有各的额度，拿别的组的实例 id 去领，
+	// 服务端回的就不再是 SAME_PERSON 判定，而本号可能**自己就能领** —— 拿错
+	// 会把一个本来能领的号误判成「额度已被领走」。
 	for i := range probes {
 		p := &probes[i]
 		cid := ""
-		for em, c := range knownCID {
-			if !strings.EqualFold(em, p.email) {
-				cid = c
-				break
+		// 同组候选按邮箱排序，保证每次挑到的是同一个（map 遍历顺序随机）。
+		var candidates []string
+		for em := range knownCID {
+			if strings.EqualFold(em, p.email) {
+				continue
 			}
+			if groupOf[strings.ToLower(em)] != p.group {
+				continue
+			}
+			candidates = append(candidates, em)
+		}
+		sort.Strings(candidates)
+		if len(candidates) > 0 {
+			cid = knownCID[strings.ToLower(candidates[0])]
 		}
 		if cid == "" {
 			// 号池快照里可能已存着别的号的实例 id（上次扫描记下的）。
@@ -184,14 +245,18 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 				if o == nil || o.ClaimCID == "" {
 					continue
 				}
-				if !strings.EqualFold(o.Email, p.email) {
-					cid = o.ClaimCID
-					break
+				if strings.EqualFold(o.Email, p.email) {
+					continue
 				}
+				if groupOf[strings.ToLower(strings.TrimSpace(o.Email))] != p.group {
+					continue
+				}
+				cid = o.ClaimCID
+				break
 			}
 		}
 		if cid == "" {
-			// 没有任何兄弟号的活动实例可比 → 只能按"活动未下发"如实说。
+			// 同组里没有别的号的活动实例可比 → 只能按"活动未下发"如实说。
 			if CheckinRecordTrusted("qoder", p.email) {
 				p.res.Phase = "already"
 				p.res.Msg = "今日已领取（本地记录）"
@@ -205,7 +270,7 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			out.Results = append(out.Results, *p.res)
 			continue
 		}
-		ph, amt, detail := qoderClaimInstance(p.auth, p.dev, cid)
+		ph, amt, detail, claimedAt := qoderClaimInstance(p.auth, p.dev, cid, QoderQuotaScopeKey(p.snap))
 		switch ph {
 		case "claimed":
 			p.res.Phase = "claimed"
@@ -213,19 +278,22 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			p.res.Credits = amt
 			p.res.Claimed = 1
 			p.res.CheckedInToday = true
+			// 用兄弟号的实例 id 反而领成功了 = 服务端放行了，本号今天真领到。
+			p.res.ClaimedAt = claimedAt
+			p.res.ClaimedToday = true
 			out.Claimed++
 			out.Credits += amt
-			_ = MarkClaimed("qoder", p.email)
+			_ = MarkClaimedAt("qoder", p.email, claimStamp(p.res))
 			_ = MarkCheckedIn("qoder", p.email)
 		case "blocked":
-			// 服务端明确答复：**同一个人**今天已经领过了（同一人另一账号领走），
+			// 服务端明确答复：**同一个人**今天已经领过了（同组另一账号领走），
 			// 也就是说**本号今天并没有签到**，今天的 100 积分也没进它的账。
 			//
 			// ⚠️ 这里绝不能写 MarkCheckedIn —— 那是"假签到"：本号压根没领到。
 			// 也不能算进 Already（那也是"今天签过了"的意思）。单列 blocked，
 			// 并把之前可能存在的误记清掉（Unmark）。
 			p.res.Phase = "blocked"
-			p.res.Msg = "今天没签上：同一人另一账号已领走每日额度（服务端判定 " + detail + "）"
+			p.res.Msg = "今天没签上：同一额度组（同一实名）另一账号已领走每日额度（服务端判定 " + detail + "）"
 			p.res.CheckedInToday = false
 			out.Blocked++
 			_ = UnmarkCheckedIn("qoder", p.email)
@@ -241,6 +309,29 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			}
 		}
 		out.Results = append(out.Results, *p.res)
+	}
+
+	// 额度组归属：标出每组里今天**谁**领到了那份每日额度，让面板能说清
+	// 「这个号为什么没签上」而不是只丢一句"被同一人领走了"。
+	groupHolder := map[string]string{}
+	for _, r := range out.Results {
+		if r.Phase != "claimed" || !r.ClaimedToday {
+			continue
+		}
+		g := groupOf[strings.ToLower(strings.TrimSpace(r.Email))]
+		if _, ok := groupHolder[g]; !ok {
+			groupHolder[g] = r.Email
+		}
+	}
+	for i := range out.Results {
+		r := &out.Results[i]
+		g := groupOf[strings.ToLower(strings.TrimSpace(r.Email))]
+		if h, ok := groupHolder[g]; ok && !strings.EqualFold(h, r.Email) {
+			r.QuotaTakenBy = h
+			if r.Phase == "blocked" {
+				r.Msg = r.Msg + "；今日额度由同组账号 " + h + " 领走"
+			}
+		}
 	}
 
 	if changed {
@@ -285,20 +376,63 @@ func QoderPoolStatuses() []map[string]any {
 	return out
 }
 
-// UsedDeviceQuotaToday 报告本机今天是否已有**其他**账号写入了可信的 Qoder
-// 签到记录（每设备每日限领一次；用于向被隐藏活动的账号解释原因）。
-func UsedDeviceQuotaToday(excludeEmail string) bool {
-	today := time.Now().Format("2006-01-02")
-	for email := range CheckinDates("qoder") {
-		if strings.EqualFold(email, strings.TrimSpace(excludeEmail)) {
+// QuotaHolderInGroup 返回**同一额度组**里今天已领到每日额度的账号邮箱。
+//
+// 2026-11-02 修正：每日额度按账号归属的 scope（服务端认定的实名/租户）发，**不是
+// 按设备**（实测伪造整套 Cosy-* 设备头也不影响判定，刷新 token 的响应里更是没有
+// 任何设备字段）。不同 scope 的账号各有各的每日额度 —— 拿**别的组**的领取记录
+// 去解释本号「没签上」是错的，会把一个本来能领的号说成额度被占。
+//
+// 同组多号时按邮箱排序取第一个，保证结果稳定。
+func QuotaHolderInGroup(excludeEmail string) (string, bool) {
+	pool, err := LoadQoderPool()
+	if err != nil || pool == nil {
+		return "", false
+	}
+	ex := strings.ToLower(strings.TrimSpace(excludeEmail))
+	group := ""
+	for _, a := range pool.Accounts {
+		if a == nil {
 			continue
 		}
-		if CheckedInToday("qoder", email) && CheckinRecordTrusted("qoder", email) {
-			_ = today
-			return true
+		if strings.ToLower(strings.TrimSpace(qoderSnapshotEmail(a))) == ex {
+			group = QoderQuotaGroupKey(a)
+			break
 		}
 	}
-	return false
+	if group == "" {
+		return "", false
+	}
+	var holders []string
+	for _, a := range pool.Accounts {
+		if a == nil {
+			continue
+		}
+		em := strings.TrimSpace(qoderSnapshotEmail(a))
+		if em == "" || strings.EqualFold(em, excludeEmail) {
+			continue
+		}
+		if QoderQuotaGroupKey(a) != group {
+			continue
+		}
+		if CheckedInToday("qoder", em) && CheckinRecordTrusted("qoder", em) {
+			holders = append(holders, em)
+		}
+	}
+	if len(holders) == 0 {
+		return "", false
+	}
+	sort.Strings(holders)
+	return holders[0], true
+}
+
+// UsedDeviceQuotaToday 报告**同一额度组**里今天是否已有其它账号写入可信的 Qoder
+// 签到记录（用于向看不到今日活动的账号解释原因）。
+//
+// 名字保留是为了不破坏既有调用点，语义已从「同设备」改成「同额度组」。
+func UsedDeviceQuotaToday(excludeEmail string) bool {
+	_, ok := QuotaHolderInGroup(excludeEmail)
+	return ok
 }
 
 // QoderScanAccount 号池单账号的上游核实结果。
@@ -325,9 +459,15 @@ type QoderScanAccount struct {
 	// Source 判定来源：upstream = 上游活动列表确认；local = 上游看不到今日活动
 	// （领完即删），但本地有可信记录。
 	Source string `json:"source,omitempty"`
-	// DeviceQuotaUsed 本账号看不到今日活动，是因为**同一个人**的另一账号
-	// 已领走了当天唯一一份每日额度（服务端按人给，先打先得）。
+	// DeviceQuotaUsed 本账号看不到今日活动，是因为**同一额度组**（同一 scope /
+	// 同一实名）的另一账号已领走了当天唯一一份每日额度（服务端按人给，先打先得）。
 	DeviceQuotaUsed bool `json:"same_person_taken,omitempty"`
+	// Scope 本账号归属的额度组标识（服务端下发的 agentAccountScope）。
+	Scope string `json:"scope,omitempty"`
+	// QuotaGroup 本账号所在额度组里的账号数（含自己）。>1 = 与别的号共享每日额度。
+	QuotaGroup int `json:"quota_group,omitempty"`
+	// QuotaTakenBy 同组里今天领到每日额度的账号（空 = 组里还没人领）。
+	QuotaTakenBy string `json:"quota_taken_by,omitempty"`
 }
 
 // QoderPoolScan 逐账号向**上游**核实签到状态（并发 2，只查不领）。
@@ -365,6 +505,8 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 		jobs = append(jobs, job{snap: snap})
 	}
 	out := make([]QoderScanAccount, len(jobs))
+	// 额度组信息：同一 scope 的账号共享同一份每日额度，扫描时要按组解释。
+	groupSize := QoderQuotaGroupSizes(pool.Accounts)
 	sem := make(chan struct{}, 2)
 	var wg sync.WaitGroup
 	for i, j := range jobs {
@@ -383,12 +525,14 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 				Name:           snap.Name,
 				UID:            snap.UserID,
 				CheckedInLocal: CheckedInToday("qoder", email),
+				Scope:          QoderQuotaScopeKey(snap),
+				QuotaGroup:     groupSize[strings.ToLower(strings.TrimSpace(email))],
 			}
 			if t, ok := CheckedInAt("qoder", email); ok {
 				row.CheckedInAt = t.Format(time.RFC3339)
 			}
 		auth := cloneQoderAuth(snap.Auth)
-		oc := qoderScanAuth(auth, qoderDeviceForAccount(auth))
+		oc := qoderScanAuth(auth, qoderDeviceForAccount(auth), QoderQuotaScopeKey(snap))
 		res := oc.result
 		// 续期出的新 token 写回号池（绝不写客户端登录态）。
 		if oc.newAccess != "" || oc.newRefresh != "" {
@@ -451,18 +595,45 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 				row.Msg = "上游核实失败（" + res.Msg + "）；本地记录今日已签 " + row.CheckedInAt
 			}
 		}
-		// 每日额度按**人**给（实测 2026-10-24：另一个账号领过后，服务端回
-		// failureCode=SAME_PERSON_ALREADY_CLAIMED；设备指纹怎么换都无效）。
-		// 本机今天已有其他账号的可信领取记录、而本账号看不到签到活动时，如实说明
-		// —— 这与笼统的"活动未下发"是两回事，用户需要分得清。
-		if res.Phase == "pending" && !trusted && UsedDeviceQuotaToday(email) {
-			row.DeviceQuotaUsed = true
-			row.Msg = "今日每日额度已被同一人另一账号领取（服务端按人给，一日一份、先打先得）"
+		// 每日额度按**账号归属的 scope**（同一实名/租户）给，不按设备
+		// （实测 2026-11-02：伪造整套 Cosy-* 设备头也不改变判定；同组另一个账号
+		// 领过后，服务端回 failureCode=SAME_PERSON_ALREADY_CLAIMED）。
+		// **同一额度组**里今天已有其它账号的可信领取记录、而本账号看不到签到活动时，
+		// 如实说明并点名是谁领的 —— 这与笼统的"活动未下发"是两回事，用户需要分得清。
+		if res.Phase == "pending" && !trusted {
+			if holder, ok := QuotaHolderInGroup(email); ok {
+				row.DeviceQuotaUsed = true
+				row.QuotaTakenBy = holder
+				row.Msg = "今日每日额度已被同额度组（同一实名）的账号 " + holder +
+					" 领取（服务端按账号归属的实名给，同组一天只有一份、先打先得）"
+			}
 		}
 		out[i] = row
 		}(i, j)
 	}
 	wg.Wait()
+	// 额度组归属：标出每组里今天**谁**领到了那份每日额度（同组其它号的
+	// QuotaTakenBy 一并补上，面板就能说清「这个号为什么没签上」）。
+	holder := map[string]string{}
+	for _, r := range out {
+		if r.Phase != "claimed" || !r.CheckedInToday {
+			continue
+		}
+		g := qoderQuotaGroupKeyOf(r.Scope)
+		if _, ok := holder[g]; !ok {
+			holder[g] = r.Email
+		}
+	}
+	for i := range out {
+		r := &out[i]
+		if r.QuotaTakenBy != "" {
+			continue
+		}
+		g := qoderQuotaGroupKeyOf(r.Scope)
+		if h, ok := holder[g]; ok && !strings.EqualFold(h, r.Email) {
+			r.QuotaTakenBy = h
+		}
+	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Email < out[j].Email })
 	return out
 }
@@ -483,7 +654,7 @@ func QoderUsageFor(email string) *QoderUsageResult {
 			continue
 		}
 		if strings.EqualFold(snap.Email, email) || strings.EqualFold(snap.Auth.User.Email, email) {
-			return qoderUsageAuth(cloneQoderAuth(snap.Auth), QoderDeviceInfo())
+			return qoderUsageAuth(cloneQoderAuth(snap.Auth), QoderDeviceInfo(), QoderQuotaScopeKey(snap))
 		}
 	}
 	return &QoderUsageResult{Phase: "error", Email: email, Msg: "号池里没有该账号"}
@@ -496,4 +667,18 @@ func cloneQoderAuth(a *QoderAuth) *QoderAuth {
 	}
 	c := *a
 	return &c
+}
+
+// claimStamp 本次领取的真实时刻：优先用上游返回的 claimedAt，拿不到才回落本机时钟。
+//
+// 为什么在意这个：签到记录的可信判定要比较"这条记录晚于今天活动下发"，两边都用
+// 本机时钟时，机器钟一慢（实测慢 8 小时）真领到的记录就被判成旧版误报，面板显示
+// "没签上"、重试循环整天空跑。上游给的时刻不受本机时钟影响。
+func claimStamp(res *QoderCheckinResult) time.Time {
+	if res != nil {
+		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(res.ClaimedAt)); err == nil {
+			return t
+		}
+	}
+	return time.Now()
 }
