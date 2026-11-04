@@ -36,11 +36,24 @@ import (
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 //
+// 1.15.6-panel：修三个实测出来的真问题 ——
+//  1) 华为云 CodeArts 续期被**陈旧结论永久锁死**：renew_result=needs_login 是
+//     「上一次尝试的结论」却被当成账号的固有属性，于是用户明明重新登录成功了，
+//     面板还是显示"只能重新登录"，手动「立即续期」386ms 就甩一句 needs_login
+//     （什么都没做）。现在：重新登录后旧结论作废；force 会真的发起一次尝试；
+//     判定结论不再伪装成"刚刚试过"（不再写 RenewAttemptAt）。
+//  2) Qoder 每日活动**不是 10:00 准时下发**，但"上游还没下发"这一状态此前
+//     **完全静默**（日志里一条都没有），用户只能得出"签不了"的结论。
+//     现在 pending 也要留痕，并把重试节奏在活动窗口内加密到 5 分钟。
+//  3) 面板进页"加载很久"：首屏三条渲染链各自独立请求同一批慢接口，
+//     qoder/usage 被并发打 4 次、workbuddy/usage 3 次，最慢的 checkin-status
+//     2.6s 卡住首屏。现在前端合并在途请求，服务端加 15s 短 TTL 缓存。
+//
 // 1.15.5-panel：Qoder 每日额度改按**人**判定（服务端 SAME_PERSON_ALREADY_CLAIMED
 // 实测）—— 不再拿 agentAccountScope 猜分组（实测两个号 scope 不同却共享一份额度）；
 // 跨号判定改成**只读**（GET .../campaigns/{cid}/reward），不会动到别人的额度；
 // 号池里的 scope 改为按账号自身解析（原来读的是主文件的 scope，会记错号）。
-const appVersion = "1.15.5-panel"
+const appVersion = "1.15.6-panel"
 
 // traeRateRange 汇总 Trae 目录的消耗倍率区间（启动日志用）。
 func traeRateRange(ms []traechat.ModelInfo) string {
@@ -405,6 +418,10 @@ func Run() {
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	// Qoder 每日活动「不是准时下发」：后台每 30 分钟补试一次（已签账号不打上游）。
 	startQoderAutoCheckin(ctx)
+	// 时钟核对闸：这套面板所有「每天几点」的判定都按本机时钟算，钟一偏就成片错位
+	// —— 实测这台机器慢整 8 小时，真领到的签到被 10:05 可信线判成「旧版误报」，
+	// 面板整天显示「没签上」。偏了就在日志里大声报警，别让下一次排查从头猜。
+	StartClockSkewGuard(ctx)
 	// Trae 签到自动排程（面板侧独立循环，不进 scheduler 核心，回归面最小）。
 	if cfg.Trae.Enabled {
 		if len(cfg.Trae.AutoHours) > 0 {
@@ -428,6 +445,14 @@ func Run() {
 	} else {
 		log.Printf("IDE 号池自动签到已禁用（schedule.ide_checkin_enabled=false）")
 	}
+	// CodeArts（华为云码道）自动领取 + 趁票据新鲜时静默续期。
+	// 之前它**没有进过任何自动排程**：每日 100 积分只有面板按钮一个入口，
+	// 而网页会话实测只有约 7 小时，靠人记着点必然漏。号池为空时循环自己空返回。
+	pn.StartCodeArtsAuto(ctx)
+	// 预热面板的慢读接口缓存：缓存是进程内的，服务刚重启时是空的，
+	// 用户第一次打开面板要干等上游（实测 checkin-status 冷启动 4.0s）。
+	// 这里提前算好，用户第一次打开就是热的。
+	pn.WarmIDECaches(60 * time.Second)
 	// MiniMax 凭证自动续期：access token 只有 1 小时，refresh token 每刷必轮换，
 	// 号池副本不续就死。每 30 分钟巡检临期账号，与客户端共享同一条 RT 链。
 	pn.StartMinimaxRenewAuto(ctx)

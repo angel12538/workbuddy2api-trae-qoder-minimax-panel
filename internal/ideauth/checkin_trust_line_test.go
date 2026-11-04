@@ -16,8 +16,18 @@ import (
 
 func todayAt(t *testing.T, h, m int) string {
 	t.Helper()
-	n := time.Now()
-	return time.Date(n.Year(), n.Month(), n.Day(), h, m, 0, 0, time.Local).Format(time.RFC3339)
+	return todayAtIn(t, time.Local, h, m)
+}
+
+// todayAtIn 按指定时区造「今天 hh:mm」的时间戳。
+//
+// 必须显式给时区：Qoder 的可信线是 **UTC+8** 的 10:05（活动按 UTC+8 刷新），
+// 若按机器本地时区造时间戳，在 UTC 机器（CI）上就与判定口径错开 8 小时
+// （09:00 UTC = 17:00 UTC+8 → 反而落在线后）。
+func todayAtIn(t *testing.T, loc *time.Location, h, m int) string {
+	t.Helper()
+	n := time.Now().In(loc)
+	return time.Date(n.Year(), n.Month(), n.Day(), h, m, 0, 0, loc).Format(time.RFC3339)
 }
 
 func TestCheckinTrustLinePerPlatform(t *testing.T) {
@@ -40,9 +50,9 @@ func TestCheckinTrustLinePerPlatform(t *testing.T) {
 		// WorkBuddy / CodeArts 同理（自然日刷新）。
 		{"workbuddy", "w1", todayAt(t, 7, 30), true, "WorkBuddy 07:30 的签到记录应可信"},
 		{"codearts", "c1", todayAt(t, 7, 30), true, "CodeArts 07:30 的签到记录应可信"},
-		// Qoder 保持 10:05 线不变（活动 10:00 刷新）。
-		{"qoder", "q1", todayAt(t, 9, 0), false, "Qoder 10:05 前写入的记录不可信"},
-		{"qoder", "q2", todayAt(t, 11, 0), true, "Qoder 10:05 后写入的记录可信"},
+		// Qoder 保持 10:05 线不变（活动 10:00 刷新），且线在 **UTC+8** 上。
+		{"qoder", "q1", todayAtIn(t, qoderCST, 9, 0), false, "Qoder 10:05 前写入的记录不可信"},
+		{"qoder", "q2", todayAtIn(t, qoderCST, 11, 0), true, "Qoder 10:05 后写入的记录可信"},
 	}
 	for _, c := range cases {
 		writeLog(t, dir, c.kind+":"+c.key, c.stamp)
@@ -59,7 +69,10 @@ func TestCheckinRecordTrustedRejectsYesterday(t *testing.T) {
 	// 昨天的记录在任何平台都不可信（自然日平台也不能拿昨天的当今天）。
 	for _, kind := range []string{"doubao", "workbuddy", "codearts", "qoder"} {
 		key := kind + "-yesterday"
-		writeLog(t, dir, kind+":"+key, time.Now().AddDate(0, 0, -1).Format(time.RFC3339))
+		// 「昨天」按该平台的时区基准取（Qoder 是 UTC+8，其余是本地），否则在
+		// 非本地时区机器上这条记录可能仍落在「今天」。
+		loc := checkinDayLoc(kind)
+		writeLog(t, dir, kind+":"+key, time.Now().In(loc).AddDate(0, 0, -1).Format(time.RFC3339))
 		if CheckinRecordTrusted(kind, key) {
 			t.Errorf("%s：昨天的记录不应算今日已签", kind)
 		}

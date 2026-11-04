@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -523,12 +524,18 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	cmd := exec.Command(node, f.Name(), "app.js")
+	// 两侧都固定用 UTC：node 子进程的 TZ 显式设成 UTC（Windows 上 node 认 TZ、
+	// Go 不认，两边不统一时「本地时刻 → epoch」的断言会随时区假失败），Go 侧的
+	// 期望值同样按 UTC 算。测的是「自定义区间 → from/to epoch」的映射本身，
+	// 「今天 = 本地零点」由 todayIsMidnight 在 node 内部自洽验证。
+	cmd.Env = append(os.Environ(), "TZ=UTC")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("time range node test failed: %v\n%s", err, out)
 	}
 	local := func(h, m int) string {
-		return strconv.FormatInt(time.Date(2026, 9, 30, h, m, 0, 0, time.Local).Unix(), 10)
+		return strconv.FormatInt(time.Date(2026, 9, 30, h, m, 0, 0, time.UTC).Unix(), 10)
 	}
 	want := `{"todayIsMidnight":true,"todayNoTo":true,` +
 		// rolling0 必须是 "hours=0"（显式全部历史）。此前期望值是空串——那恰好把
@@ -1007,5 +1014,520 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+/* ── C-UI-REPAIR@1（T10）前端回归 ───────────────────────────────────────
+   断言策略：只钉稳定的 data-* 锚点与契约字段消费，不校验整段 HTML。
+   需要跑真实 JS 行为的用例用 node + vm 抽取单段函数（与既有 expiry/chart
+   用例同一方式），无 node 环境自动跳过。 */
+
+// runNodeScript 把脚本写入临时文件并以 app.js 为参数执行，返回 stdout。
+func runNodeScript(t *testing.T, name, script string) string {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; skipped")
+	}
+	f, err := os.CreateTemp(t.TempDir(), name+"-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s node test failed: %v\n%s", name, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestFrontendRepairContractAnchors 页面源码必须消费 C-UI-REPAIR@1 的稳定锚点：
+// CodeArts 三按钮 + 票据字段、Qoder 设备/出口与历史、任务中心错误横幅。
+// 同时钉住被明令禁止的无路径承诺文案。
+func TestFrontendRepairContractAnchors(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, page := string(js), string(html)
+
+	must := []string{
+		// CodeArts 契约字段（C-CA-API@1）
+		"ticket_deadline", "ticket_source", "session_expires_at", "last_ok_at",
+		"renew_next_at", "renew_result", "renew_fail_msg", "probe_state", "probe_msg",
+		"can_auto_renew", "needs_manual", "expires_known_count", "session_cookie_count",
+		// CodeArts 操作入口（data-* 供测试）
+		"data-ca-probe", "data-ca-renew", "data-ca-keepalive",
+		"ide/codearts/probe", "ide/codearts/renew", "ide/codearts/keepalive",
+		// 文案：会话级 / 估算 / 未观测
+		"票据为会话级", "（估算）", "票据寿命未观测（可点补采）",
+		// Qoder（C-QD-API@1 / C-QD-LEDGER@1）
+		"data-qd-egress", "data-qd-history",
+		"ide/qoder/egress", "ide/qoder/claim_history",
+		"quota_group", "quota_taken_by", "rotation_rank", "rotation_order",
+		"同一人已领", "blocked_accounts", "claim_history_days",
+		"blocked", "login_required",
+		// 任务中心（C-WB-SCAN@1 / C-WB-AUTO@1）
+		"scan_ok", "scan_state", "upstream_total", "incomplete_total",
+		"renderScanErrors", "partial", "unverified", "verified",
+		"progress_before", "progress_after",
+	}
+	for _, s := range must {
+		if !strings.Contains(src, s) {
+			t.Errorf("app.js 缺少 C-UI-REPAIR@1 锚点/字段：%q", s)
+		}
+	}
+	// 禁止文案：没有任何代码路径支撑“重新登录会采集”。
+	for _, banned := range []string{"下次重新登录会采集", "重新登录会采集"} {
+		if strings.Contains(src, banned) || strings.Contains(page, banned) {
+			t.Errorf("页面仍含无路径承诺文案 %q", banned)
+		}
+	}
+	// 必须存在“空 deadline + 空 source”的唯一降级文案。
+	if !strings.Contains(src, "票据寿命未观测") {
+		t.Error("缺少票据寿命未观测的降级文案")
+	}
+
+	// index.html 的骨架锚点
+	for _, s := range []string{
+		`id="tcScanErr"`, `class="scan-error"`,
+		`id="ckQoderBuckets"`, `id="taskAutoResult"`,
+		`id="qdEgressVeil"`, `id="qdEgressMode"`, `id="qdEgressProxy"`, `id="qdEgressProfile"`,
+		`id="qdHistVeil"`,
+	} {
+		if !strings.Contains(page, s) {
+			t.Errorf("index.html 缺少锚点：%q", s)
+		}
+	}
+}
+
+// TestFrontendCodeArtsTicketLines 票据寿命文案：空字段只能是「未观测」，
+// 会话级不得报成不可续期，估算必须标注。
+func TestFrontendCodeArtsTicketLines(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const CA_TICKET_SOURCE');
+const end = src.indexOf('const CA_ACTIONS');
+if (start < 0 || end < 0 || end < start) throw new Error('caTicketLines region not found');
+const ctx = {
+  parseAPITime: v => { const ms = Date.parse(String(v || '')); return Number.isFinite(ms) ? ms : 0; },
+  fmtLocalDateTime: ms => { const d = new Date(ms); const p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()); },
+  String, Number, Date, Object, Array,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.caTicketLines = caTicketLines;', ctx);
+const empty = ctx.caTicketLines({});
+const session = ctx.caTicketLines({ ticket_source: 'session', session_expires_at: '2026-11-02T21:30:00+08:00' });
+const cookie = ctx.caTicketLines({
+  ticket_deadline: '2026-11-05T08:00:00+08:00', ticket_source: 'cookie',
+  last_ok_at: '2026-11-02T14:30:00+08:00', renew_next_at: '2026-11-03T10:00:00+08:00',
+  renew_result: 'failed', renew_fail_msg: '票据换不回会话',
+  probe_state: 'failed', probe_msg: '网络错误',
+  expires_known_count: 37, session_cookie_count: 14, can_auto_renew: false,
+});
+const manual = ctx.caTicketLines({ needs_manual: true, probe_state: 'login_dead', probe_msg: '会话已失效', can_auto_renew: false });
+process.stdout.write(JSON.stringify({ empty: empty, session: session, cookie: cookie, manual: manual }));`
+	out := runNodeScript(t, "ca-ticket", script)
+	var got struct {
+		Empty   []string `json:"empty"`
+		Session []string `json:"session"`
+		Cookie  []string `json:"cookie"`
+		Manual  []string `json:"manual"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out)
+	}
+	join := func(lines []string) string { return strings.Join(lines, "\n") }
+	if len(got.Empty) != 1 || got.Empty[0] != "票据寿命未观测（可点补采）" {
+		t.Fatalf("空字段文案=%v，want 仅「票据寿命未观测（可点补采）」", got.Empty)
+	}
+	if s := join(got.Session); !strings.Contains(s, "票据为会话级") || !strings.Contains(s, "（估算）") {
+		t.Fatalf("会话级文案缺关键句：%s", s)
+	}
+	c := join(got.Cookie)
+	for _, want := range []string{"票据到期：", "上次成功", "下次续期检查", "续期失败原因：票据换不回会话",
+		"探测状态：探测失败（网络错误）", "已观测过期 37 条 · 会话级 14 条", "当前不可自动续期"} {
+		if !strings.Contains(c, want) {
+			t.Errorf("cookie 文案缺 %q：\n%s", want, c)
+		}
+	}
+	if m := join(got.Manual); !strings.Contains(m, "会话已失效") {
+		t.Errorf("needs_manual 文案缺原因：%s", m)
+	}
+}
+
+// TestFrontendQoderBuckets 七相分桶：blocked 必须单列且显示 quota_taken_by，
+// credits 不得把被阻塞的号显示成已入账。
+func TestFrontendQoderBuckets(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const QD_PHASE_ORDER');
+const end = src.indexOf('function renderQoderBuckets');
+if (start < 0 || end < 0 || end < start) throw new Error('qoder buckets region not found');
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  Map, Array, String, Number, Object, console,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.qdBucketHTML = qdBucketHTML; this.qdCounts = qdCounts; this.qdPhaseText = qdPhaseText;', ctx);
+const d = { results: [
+  { email: 'a@x', phase: 'claimed', credits: 100, quota_taken_by: 'a@x', strategy: 'shared_person', msg: '领取成功' },
+  { email: 'b@y', phase: 'blocked', credits: 0, benefit_amount: 100, quota_taken_by: 'a@x', strategy: 'shared_person', msg: '服务端判定同人' },
+  { email: 'c@z', phase: 'pending', credits: 0 },
+  { email: 'd@z', phase: 'failed', credits: 0, msg: 'HTTP 500' },
+  { email: 'e@z', phase: 'login_required', credits: 0 },
+  { email: 'f@z', phase: 'error', credits: 0 },
+  { email: 'g@z', phase: 'already', credits: 100 },
+] };
+const html = ctx.qdBucketHTML(d);
+const c = ctx.qdCounts(d.results);
+process.stdout.write(JSON.stringify({
+  html: html,
+  counts: c,
+  hasSeven: ['claimed','already','blocked','pending','failed','login_required','error']
+    .every(p => html.indexOf('data-qd-bucket="' + p + '"') >= 0),
+  blockedText: html.indexOf('同一人已领（a@x）') >= 0,
+  blockedZero: html.indexOf('data-qd-result="b@y"') >= 0 && html.indexOf('+0 Credits（活动面值 100，未入账）') >= 0,
+  sumOk: c.claimed === 1 && c.already === 1 && c.blocked === 1 && c.pending === 1 &&
+         c.failed === 1 && c.login_required === 1 && c.error === 1,
+}));`
+	out := runNodeScript(t, "qoder-buckets", script)
+	var got struct {
+		HasSeven    bool           `json:"hasSeven"`
+		BlockedText bool           `json:"blockedText"`
+		BlockedZero bool           `json:"blockedZero"`
+		SumOk       bool           `json:"sumOk"`
+		Counts      map[string]int `json:"counts"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out)
+	}
+	if !got.HasSeven {
+		t.Errorf("七相分桶未全部渲染：%s", out)
+	}
+	if !got.BlockedText {
+		t.Errorf("blocked 未显示「同一人已领（quota_taken_by）」：%s", out)
+	}
+	if !got.BlockedZero {
+		t.Errorf("blocked 的 credits 必须为 0 且面值标注未入账：%s", out)
+	}
+	if !got.SumOk {
+		t.Errorf("七相计数不等于实际尝试数：%v", got.Counts)
+	}
+}
+
+// TestFrontendTaskCenterScanError 错误态禁止渲染“没有待办任务 🎉”。
+func TestFrontendTaskCenterScanError(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function scanErrors');
+const end = src.indexOf('function updateProgress');
+if (start < 0 || end < 0 || end < start) throw new Error('scan render region not found');
+const sinks = {};
+const mk = id => (sinks[id] = {
+  innerHTML: '', textContent: '', hidden: false, style: {},
+  querySelector: sel => (sinks[id + sel] || (sinks[id + sel] = { textContent: '' })),
+});
+const ctx = {
+  $: id => sinks[id] || mk(id),
+  esc: s => String(s == null ? '' : s),
+  fmtUnlock: () => '',
+  GROWTH_TITLES: {},
+  Object, Number, String, Set, Array, Map,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderScanResult = renderScanResult;', ctx);
+ctx.renderScanResult({ scan_ok: false, errors: [{ uid: 'u-401', scope: 'growth', message: 'HTTP 401: invalid token' }], accounts: [] });
+const fail = {
+  banner: sinks.tcScanErr.hidden === false,
+  bannerText: sinks.tcScanErr.innerHTML,
+  emptyDisplay: sinks.tcEmpty.style.display,
+  list: sinks.qcList.innerHTML,
+  summary: sinks.qcSummary.textContent,
+};
+ctx.renderScanResult({ scan_ok: true, errors: [], accounts: [
+  { uid: 'u-empty', nickname: '空号', scan_state: 'empty', upstream_total: 0, incomplete_total: 0 },
+] });
+const ok = {
+  bannerHidden: sinks.tcScanErr.hidden === true,
+  emptyDisplay: sinks.tcEmpty.style.display,
+  emptyTitle: sinks['tcEmpty.t'] ? sinks['tcEmpty.t'].textContent : '',
+};
+process.stdout.write(JSON.stringify({ fail: fail, ok: ok }));`
+	out := runNodeScript(t, "scan-error", script)
+	var got struct {
+		Fail struct {
+			Banner       bool   `json:"banner"`
+			BannerText   string `json:"bannerText"`
+			EmptyDisplay string `json:"emptyDisplay"`
+			List         string `json:"list"`
+			Summary      string `json:"summary"`
+		} `json:"fail"`
+		Ok struct {
+			BannerHidden bool   `json:"bannerHidden"`
+			EmptyDisplay string `json:"emptyDisplay"`
+			EmptyTitle   string `json:"emptyTitle"`
+		} `json:"ok"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out)
+	}
+	if !got.Fail.Banner {
+		t.Error("scan_ok=false 时未显示 .scan-error 横幅")
+	}
+	for _, want := range []string{"u-401", "growth", "HTTP 401"} {
+		if !strings.Contains(got.Fail.BannerText, want) {
+			t.Errorf("错误横幅缺 %q：%s", want, got.Fail.BannerText)
+		}
+	}
+	if got.Fail.EmptyDisplay != "none" {
+		t.Errorf("错误态不得渲染空态（tcEmpty.display=%q）", got.Fail.EmptyDisplay)
+	}
+	if got.Fail.List != "" {
+		t.Errorf("错误态列表应为空：%q", got.Fail.List)
+	}
+	if !got.Ok.BannerHidden {
+		t.Error("scan_ok=true 时错误横幅应隐藏")
+	}
+	if got.Ok.EmptyDisplay == "none" {
+		t.Error("合法空结果应允许渲染空态（scan_ok=true 且无错误）")
+	}
+}
+
+// TestFrontendAutoSummaryStatuses 一键完成汇总：done 只在 verified 时计入成功，
+// partial/unverified/manual/locked/skipped/failed 必须分别报告。
+func TestFrontendAutoSummaryStatuses(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const AUTO_STATUS_TEXT');
+const end = src.indexOf("$('btnTaskAutoAll').onclick");
+if (start < 0 || end < 0 || end < start) throw new Error('auto summary region not found');
+const ctx = { String, Number, Object, Array };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.autoSummaryText = autoSummaryText; this.autoCounts = autoCounts; this.normalizeAutoStatus = normalizeAutoStatus;', ctx);
+const r = { results: [
+  { task_code: 't1', status: 'done', verified: true },
+  { task_code: 't2', status: 'done', verified: false },
+  { task_code: 't3', status: 'partial', verified: false },
+  { task_code: 't4', status: 'unverified', verified: false },
+  { task_code: 't5', status: 'manual' },
+  { task_code: 't6', status: 'locked' },
+  { task_code: 't7', status: 'skipped' },
+  { task_code: 't8', status: 'failed' },
+  { task_code: 'ctl', status: 'done', kind: 'control' },
+] };
+const text = ctx.autoSummaryText(r, 12);
+const c = ctx.autoCounts(r);
+process.stdout.write(JSON.stringify({ text: text, counts: c, t2: ctx.normalizeAutoStatus({ status: 'done', verified: false }) }));`
+	out := runNodeScript(t, "auto-summary", script)
+	var got struct {
+		Text   string         `json:"text"`
+		Counts map[string]int `json:"counts"`
+		T2     string         `json:"t2"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out)
+	}
+	if got.Counts["done"] != 1 || got.Counts["unverified"] != 2 {
+		t.Errorf("done 必须只计 verified=true 的 1 项, unverified=2，实际 %v", got.Counts)
+	}
+	if got.Counts["total"] != 8 {
+		t.Errorf("summary.total 应排除 control 条目=8，实际 %d", got.Counts["total"])
+	}
+	if got.T2 != "unverified" {
+		t.Errorf("done+verified=false 必须降级为 unverified，实际 %q", got.T2)
+	}
+	for _, want := range []string{"完成 1 项（已验证）", "部分完成 1 项", "未证实 2 项",
+		"需手动 1 项", "未解锁 1 项", "跳过 1 项", "失败 1 项"} {
+		if !strings.Contains(got.Text, want) {
+			t.Errorf("汇总缺 %q：%s", want, got.Text)
+		}
+	}
+	if strings.Contains(got.Text, "完成 2 项") {
+		t.Errorf("未证实的 done 被计入成功：%s", got.Text)
+	}
+}
+
+// TestFrontendQueueRowVerifiedProgress 队列行必须显示 verified 与前后进度，
+// 且 done+verified=false 不得显示成完成。
+func TestFrontendQueueRowVerifiedProgress(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const ST_WORDS');
+const end = src.indexOf('function renderQueue');
+if (start < 0 || end < 0 || end < start) throw new Error('qrow region not found');
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtUnlock: () => '',
+  GROWTH_TITLES: {},
+  String, Object, Array,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.qrowHTML = qrowHTML;', ctx);
+const partial = ctx.qrowHTML({ status: 'partial', code: 'chat_5', progress_before: '3/5', progress_after: '4/5', verified: false, action: 'auto' });
+const fakeDone = ctx.qrowHTML({ status: 'done', code: 'chat_6', verified: false });
+const realDone = ctx.qrowHTML({ status: 'done', code: 'chat_7', verified: true });
+process.stdout.write(JSON.stringify({ partial: partial, fakeDone: fakeDone, realDone: realDone }));`
+	out := runNodeScript(t, "queue-row", script)
+	var got struct {
+		Partial  string `json:"partial"`
+		FakeDone string `json:"fakeDone"`
+		RealDone string `json:"realDone"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out)
+	}
+	for _, want := range []string{"部分完成", "3/5 → 4/5", "未证实", "可自动执行"} {
+		if !strings.Contains(got.Partial, want) {
+			t.Errorf("partial 行缺 %q：%s", want, got.Partial)
+		}
+	}
+	if !strings.Contains(got.FakeDone, "未证实") {
+		t.Errorf("done+verified=false 必须显示未证实：%s", got.FakeDone)
+	}
+	if strings.Contains(got.RealDone, "未证实") {
+		t.Errorf("verified=true 的 done 不得显示未证实：%s", got.RealDone)
+	}
+	if !strings.Contains(got.RealDone, "完成") {
+		t.Errorf("verified=true 的 done 应显示完成：%s", got.RealDone)
+	}
+}
+
+// TestFrontendCodeArtsRowCondensed CodeArts 卡片默认只显示一行摘要：
+// 正常态给「自动维护中」且不出现排障按钮，只有需人工时才给重登/重置入口，
+// 技术字段（slot_dir / person_key）只在展开详情里出现。
+//
+// 断言的都是**可见文案**与稳定锚点，不校验整段 HTML 的排版；数据 shape 直接
+// 用 GET ide/codearts/accounts 的字段名（后端契约），前端不得自造同义字段。
+func TestFrontendCodeArtsRowCondensed(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function caStatusPhrase');
+const end = src.indexOf('async function doCaAction');
+if (start < 0 || end < 0 || end < start) throw new Error('caStatusPhrase region not found');
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtNum: n => String(n),
+  caTime: iso => String(iso || ''),
+  CA_RENEW_RESULT: { needs_login: '需人工登录', failed: '续期失败' },
+  CA_PROBE_STATE: { login_dead: '会话已失效' },
+  UI: {
+    act: (attr, val, label) => '<button class="xs primary" ' + attr + '="' + val + '">' + label + '</button>',
+    sub: (attr, val, label) => '<button class="xs" ' + attr + '="' + val + '">' + label + '</button>',
+    off: label => '<button class="xs" disabled>' + label + '</button>',
+    badge: (kind, mark, text) => '<span class="stask ' + kind + '">' + text + '</span>',
+  },
+  Number, String, console,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.caStatusPhrase = caStatusPhrase; this.caSummaryHtml = caSummaryHtml;' +
+  'this.caDetailHtml = caDetailHtml; this.caRowHtml = caRowHtml;', ctx);
+
+const normal = { id: 'a1', label: '秋', can_auto_renew: true, checked_in_today: true,
+  today_gain: 100, ticket_source: 'cookie' };
+const manual = { id: 'a2', label: '乙', needs_manual: true, probe_state: 'login_dead',
+  probe_msg: '会话已失效', can_auto_renew: false };
+const sessionAcc = { id: 'a3', ticket_source: 'session', can_auto_renew: false };
+const failedAcc = { id: 'a4', renew_result: 'failed', can_auto_renew: false };
+const fresh = { id: 'a5' };
+const banned = ['补采票据寿命', '验证会话', '立即续期'];
+const normalSum = ctx.caSummaryHtml(normal);
+const manualSum = ctx.caSummaryHtml(manual);
+const detail = ctx.caDetailHtml(normal, {
+  slot_dir: 'D:/x/codearts-slots/a1', person_key: 'person:abc',
+  slot_id: 'a1', device_guid: 'guid-1', client_source: 'browser',
+});
+process.stdout.write(JSON.stringify({
+  phraseNormal: ctx.caStatusPhrase(normal),
+  phraseManual: ctx.caStatusPhrase(manual),
+  phraseSession: ctx.caStatusPhrase(sessionAcc),
+  phraseFailed: ctx.caStatusPhrase(failedAcc),
+  phraseFresh: ctx.caStatusPhrase(fresh),
+  normalHasBanned: banned.some(x => normalSum.indexOf(x) >= 0),
+  manualHasBanned: banned.some(x => manualSum.indexOf(x) >= 0),
+  manualHasRelogin: manualSum.indexOf('data-ca-relogin') >= 0,
+  manualHasForget: manualSum.indexOf('重置身份') >= 0,
+  normalHasAuto: normalSum.indexOf('自动维护中') >= 0,
+  normalHasToday: normalSum.indexOf('今日 +100') >= 0,
+  normalHasName: normalSum.indexOf('秋') >= 0,
+  detailHasSlotDir: detail.indexOf('slot_dir') >= 0 && detail.indexOf('D:/x/codearts-slots/a1') >= 0,
+  detailHasPersonKey: detail.indexOf('person_key') >= 0 && detail.indexOf('person:abc') >= 0,
+  detailFolded: ctx.caRowHtml(normal).indexOf('data-ca-detail="a1" hidden') >= 0,
+}));`
+	out := runNodeScript(t, "ca-condensed", script)
+	var got struct {
+		PhraseNormal     string `json:"phraseNormal"`
+		PhraseManual     string `json:"phraseManual"`
+		PhraseSession    string `json:"phraseSession"`
+		PhraseFailed     string `json:"phraseFailed"`
+		PhraseFresh      string `json:"phraseFresh"`
+		NormalHasBanned  bool   `json:"normalHasBanned"`
+		ManualHasBanned  bool   `json:"manualHasBanned"`
+		ManualHasRelogin bool   `json:"manualHasRelogin"`
+		ManualHasForget  bool   `json:"manualHasForget"`
+		NormalHasAuto    bool   `json:"normalHasAuto"`
+		NormalHasToday   bool   `json:"normalHasToday"`
+		NormalHasName    bool   `json:"normalHasName"`
+		DetailHasSlotDir bool   `json:"detailHasSlotDir"`
+		DetailHasPerson  bool   `json:"detailHasPersonKey"`
+		DetailFolded     bool   `json:"detailFolded"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out)
+	}
+	want := map[string]string{
+		"正常态":  "自动维护中",
+		"人工态":  "需重新登录",
+		"会话级":  "会话票据（自动续期）",
+		"续期失败": "续期失败（自动重试）",
+		"空字段":  "待维护",
+	}
+	gotPhrases := map[string]string{
+		"正常态": got.PhraseNormal, "人工态": got.PhraseManual,
+		"会话级": got.PhraseSession, "续期失败": got.PhraseFailed, "空字段": got.PhraseFresh,
+	}
+	for name, w := range want {
+		if gotPhrases[name] != w {
+			t.Errorf("%s状态短语=%q，want %q", name, gotPhrases[name], w)
+		}
+	}
+	if got.NormalHasBanned {
+		t.Error("正常态默认行不得出现补采/验证/续期按钮文案")
+	}
+	if got.ManualHasBanned {
+		t.Error("需人工的默认行也不得出现补采/验证/续期按钮文案（它们属于展开详情）")
+	}
+	if !got.ManualHasRelogin || !got.ManualHasForget {
+		t.Errorf("needs_manual 必须给「重新登录」主按钮与「重置身份」文字链（relogin=%v forget=%v）",
+			got.ManualHasRelogin, got.ManualHasForget)
+	}
+	if !got.NormalHasAuto {
+		t.Error("正常态必须显示「自动维护中」")
+	}
+	if !got.NormalHasToday || !got.NormalHasName {
+		t.Errorf("默认行必须是 `昵称 · 状态 · 今日积分` 单行（name=%v today=%v）",
+			got.NormalHasName, got.NormalHasToday)
+	}
+	if !got.DetailHasSlotDir || !got.DetailHasPerson {
+		t.Errorf("展开详情必须显示 slot_dir / person_key（slot_dir=%v person_key=%v）",
+			got.DetailHasSlotDir, got.DetailHasPerson)
+	}
+	if !got.DetailFolded {
+		t.Error("详情区默认必须是折叠（hidden）状态，不能把技术字段铺在默认行")
 	}
 }

@@ -2,8 +2,10 @@ package ideauth
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -130,11 +132,24 @@ func MarkClaimedAt(kind, key string, at time.Time) error {
 }
 
 // LastClaimedAt 返回某账号最后一次**真正领到**积分的时刻（没有记录返回 false）。
+//
+// 契约 C-QD-LEDGER@1：Qoder 的 Claims 只记「最后一次真正领取」一条，若它缺失
+// （换了机器 / 文件被清理 / 旧版没写），回落到逐日领取账本里最近一条
+// phase=claimed 的记录 —— 轮换排序依赖「上次真正领到是什么时候」，不能让
+// 账本里明明有的历史被忽略。
 func LastClaimedAt(kind, key string) (time.Time, bool) {
+	key = strings.TrimSpace(key)
 	checkinLogMu.Lock()
-	defer checkinLogMu.Unlock()
 	f := loadCheckinLogFile()
-	return parseCheckinStamp(f.Claims[kind+":"+strings.TrimSpace(key)])
+	stamp := f.Claims[kind+":"+key]
+	checkinLogMu.Unlock()
+	if t, ok := parseCheckinStamp(stamp); ok {
+		return t, true
+	}
+	if strings.EqualFold(strings.TrimSpace(kind), "qoder") {
+		return qoderLedgerLastClaimed(key)
+	}
+	return time.Time{}, false
 }
 
 // UnmarkCheckedIn 撤销某签到对象的「今日已签到」记录。
@@ -281,4 +296,411 @@ func CheckinDates(kind string) map[string]string {
 		}
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Qoder 逐日领取账本（契约 C-QD-LEDGER@1）
+//
+// 为什么需要独立文件：checkin_log.json 的 Entries 只记「今天签过」，Claims 只记
+// 「最后一次真正领到」的一条 —— 前者会被第二天的记录盖掉，后者根本没有逐日轨迹。
+// 用户问「这个号为什么今天没领到 / 下次轮到谁」时，需要的是**逐日、逐号的尝试
+// 与结果**（含 blocked/pending/failed 这些没领到的尝试），而不是一行当前状态。
+//
+// 文件：<PoolDir>/qoder_claim_history.json，0600，原子写。
+//   - 按 (email, date) 覆盖：同一天多次尝试只留一条最新结果；
+//   - 粘性：当天一旦有过 phase=claimed，后续 blocked/pending/failed **不得**覆盖
+//     它（只能更新 strategy/quota_taken_by/at），否则轮换依据会被后一次失败擦掉；
+//   - 保留 180 天；超过 5000 条按 at 淘汰最旧。
+//
+// 注意：本文件与 checkin_log.json 是两套语义，互不覆盖 —— 旧文件保持原样，
+// 新账本只做追加/覆盖审计，不改既有签到记录的行为。
+// ---------------------------------------------------------------------------
+
+const (
+	// qoderClaimHistoryVersion 账本文件版本（契约固定为 1）。
+	qoderClaimHistoryVersion = 1
+	// qoderClaimHistoryKeepDays 账本保留天数（契约 180 天）。
+	qoderClaimHistoryKeepDays = 180
+	// qoderClaimHistoryMaxRecords 账本条数上限（超过按 at 淘汰最旧）。
+	qoderClaimHistoryMaxRecords = 5000
+)
+
+// QoderClaimRecord 一条逐日领取记录（契约 C-QD-LEDGER@1）。
+type QoderClaimRecord struct {
+	Email        string  `json:"email"`
+	Date         string  `json:"date"`  // UTC+8 的 YYYY-MM-DD
+	Phase        string  `json:"phase"` // claimed|already|blocked|pending|failed|login_required|error
+	Credits      float64 `json:"credits"`
+	CampaignID   string  `json:"campaign_id,omitempty"`
+	GrantID      string  `json:"grant_id,omitempty"`
+	QuotaTakenBy string  `json:"quota_taken_by,omitempty"`
+	Strategy     string  `json:"strategy,omitempty"`
+	At           string  `json:"at"`
+}
+
+// qoderClaimHistoryFile 账本文件结构。
+type qoderClaimHistoryFile struct {
+	Version int                `json:"version"`
+	Records []QoderClaimRecord `json:"records"`
+}
+
+// qoderClaimPhases 七相枚举（契约 C-QD-API@1，账本 phase 同集合）。
+var qoderClaimPhases = map[string]bool{
+	"claimed":        true,
+	"already":        true,
+	"blocked":        true,
+	"pending":        true,
+	"failed":         true,
+	"login_required": true,
+	"error":          true,
+}
+
+// qoderClaimHistoryMu 串行化账本的「读-改-写」。与 checkinLogMu 分开：
+// 两个文件独立，混用一把锁会让签到路径与轮换读互相阻塞。
+var qoderClaimHistoryMu sync.Mutex
+
+// qoderClaimHistoryPath 账本文件路径（契约固定文件名）。
+func qoderClaimHistoryPath() string {
+	return filepath.Join(PoolDir(), "qoder_claim_history.json")
+}
+
+// qoderClaimDay 把时刻转成 UTC+8 的 YYYY-MM-DD（契约 date 口径）。
+func qoderClaimDay(t time.Time) string {
+	return t.In(qoderCST).Format("2006-01-02")
+}
+
+// loadQoderClaimHistoryLocked 读账本（调用方须持 qoderClaimHistoryMu）。
+//
+// 文件不存在 → 空账本；损坏 → 也按空账本处理（账本是审计/轮换的辅助数据，
+// 不能因为一个坏掉的文件把整条签到链路打死；下一次写入会重建一个合法文件）。
+func loadQoderClaimHistoryLocked() qoderClaimHistoryFile {
+	empty := qoderClaimHistoryFile{
+		Version: qoderClaimHistoryVersion,
+		Records: []QoderClaimRecord{},
+	}
+	raw, err := os.ReadFile(qoderClaimHistoryPath())
+	if err != nil || len(strings.TrimSpace(string(raw))) == 0 {
+		return empty
+	}
+	var f qoderClaimHistoryFile
+	if json.Unmarshal(raw, &f) != nil {
+		return empty
+	}
+	if f.Version == 0 {
+		f.Version = qoderClaimHistoryVersion
+	}
+	if f.Records == nil {
+		f.Records = []QoderClaimRecord{}
+	}
+	return f
+}
+
+// saveQoderClaimHistoryLocked 原子写回账本（0600；atomicWrite 临时文件即 0600）。
+func saveQoderClaimHistoryLocked(f qoderClaimHistoryFile) error {
+	f.Version = qoderClaimHistoryVersion
+	if f.Records == nil {
+		f.Records = []QoderClaimRecord{}
+	}
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(qoderClaimHistoryPath(), b)
+}
+
+// normalizeQoderClaimRecord 规范化并校验一条记录。
+func normalizeQoderClaimRecord(rec QoderClaimRecord) (QoderClaimRecord, error) {
+	rec.Email = normalizeQoderEmail(rec.Email)
+	if rec.Email == "" {
+		return rec, fmt.Errorf("领取记录缺少 email")
+	}
+	rec.Phase = strings.ToLower(strings.TrimSpace(rec.Phase))
+	if !qoderClaimPhases[rec.Phase] {
+		return rec, fmt.Errorf("领取记录 phase 非法: %q（只允许七相枚举）", rec.Phase)
+	}
+	at := strings.TrimSpace(rec.At)
+	if at != "" {
+		if t, err := time.Parse(time.RFC3339, at); err == nil {
+			at = t.In(qoderCST).Format(time.RFC3339)
+			if strings.TrimSpace(rec.Date) == "" {
+				rec.Date = qoderClaimDay(t)
+			}
+		} else {
+			return rec, fmt.Errorf("领取记录 at 非法（需要 RFC3339）: %q", rec.At)
+		}
+	} else {
+		n := time.Now().In(qoderCST)
+		at = n.Format(time.RFC3339)
+		if strings.TrimSpace(rec.Date) == "" {
+			rec.Date = n.Format("2006-01-02")
+		}
+	}
+	rec.Date = strings.TrimSpace(rec.Date)
+	if _, err := time.ParseInLocation("2006-01-02", rec.Date, qoderCST); err != nil {
+		return rec, fmt.Errorf("领取记录 date 非法（需要 UTC+8 的 YYYY-MM-DD）: %q", rec.Date)
+	}
+	rec.At = at
+	// 契约：只有 claimed/already 才有「本号实际入账」的积分；其余相位一律 0。
+	if rec.Phase != "claimed" && rec.Phase != "already" {
+		rec.Credits = 0
+	}
+	if rec.Credits < 0 {
+		rec.Credits = 0
+	}
+	return rec, nil
+}
+
+// mergeQoderClaimRecord 把同一天的新结果并入旧记录。
+func mergeQoderClaimRecord(old, rec QoderClaimRecord) QoderClaimRecord {
+	// 粘性：当天已经真领到过，后续的失败/阻塞不得把它擦掉。
+	if old.Phase == "claimed" && rec.Phase != "claimed" {
+		old.Strategy = firstNonEmpty(rec.Strategy, old.Strategy)
+		old.QuotaTakenBy = firstNonEmpty(rec.QuotaTakenBy, old.QuotaTakenBy)
+		old.At = firstNonEmpty(rec.At, old.At)
+		return old
+	}
+	out := rec
+	// 新记录没带上的活动/奖励标识保留旧值（claimed 才有 grant/campaign）。
+	if strings.TrimSpace(out.CampaignID) == "" {
+		out.CampaignID = old.CampaignID
+	}
+	if strings.TrimSpace(out.GrantID) == "" {
+		out.GrantID = old.GrantID
+	}
+	return out
+}
+
+// pruneQoderClaimRecords 按 180 天 / 5000 条淘汰并统一排序。
+func pruneQoderClaimRecords(records []QoderClaimRecord, now time.Time) []QoderClaimRecord {
+	// 保留 today-179 起（含当天共 180 天）。
+	cutoff := qoderClaimDay(now.AddDate(0, 0, -(qoderClaimHistoryKeepDays - 1)))
+	out := make([]QoderClaimRecord, 0, len(records))
+	for _, r := range records {
+		if r.Date != "" && r.Date < cutoff {
+			continue
+		}
+		out = append(out, r)
+	}
+	if len(out) > qoderClaimHistoryMaxRecords {
+		// 按 at 升序淘汰最旧；at 相同则保持原顺序（SliceStable）。
+		sort.SliceStable(out, func(i, j int) bool { return out[i].At < out[j].At })
+		out = out[len(out)-qoderClaimHistoryMaxRecords:]
+	}
+	// 文件按 date 升序、同日按 at 升序、再按 email，便于人读与逐日对比。
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Date != out[j].Date {
+			return out[i].Date < out[j].Date
+		}
+		if out[i].At != out[j].At {
+			return out[i].At < out[j].At
+		}
+		return out[i].Email < out[j].Email
+	})
+	return out
+}
+
+// AppendQoderClaim 追加（或按 (email,date) 覆盖）一条领取记录。原子写。
+//
+// 每次尝试都写（含 blocked/pending/failed/login_required/error），供审计与轮换；
+// 只有 phase=claimed 才是轮换依据。
+func AppendQoderClaim(rec QoderClaimRecord) error {
+	rec, err := normalizeQoderClaimRecord(rec)
+	if err != nil {
+		return err
+	}
+	qoderClaimHistoryMu.Lock()
+	defer qoderClaimHistoryMu.Unlock()
+	f := loadQoderClaimHistoryLocked()
+	replaced := false
+	for i := range f.Records {
+		if strings.EqualFold(f.Records[i].Email, rec.Email) && f.Records[i].Date == rec.Date {
+			f.Records[i] = mergeQoderClaimRecord(f.Records[i], rec)
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		f.Records = append(f.Records, rec)
+	}
+	f.Records = pruneQoderClaimRecords(f.Records, time.Now())
+	return saveQoderClaimHistoryLocked(f)
+}
+
+// QoderClaimHistory 返回某账号最近 days 天的领取记录（date 升序）。
+//
+// email 为空 = 全部账号；days<=0 = 全部已保留记录（最多 180 天）。
+func QoderClaimHistory(email string, days int) []QoderClaimRecord {
+	ex := normalizeQoderEmail(email)
+	qoderClaimHistoryMu.Lock()
+	f := loadQoderClaimHistoryLocked()
+	qoderClaimHistoryMu.Unlock()
+
+	cutoff := ""
+	if days > 0 {
+		if days > qoderClaimHistoryKeepDays {
+			days = qoderClaimHistoryKeepDays
+		}
+		cutoff = qoderClaimDay(time.Now().AddDate(0, 0, -(days - 1)))
+	}
+	out := make([]QoderClaimRecord, 0, len(f.Records))
+	for _, r := range f.Records {
+		if ex != "" && !strings.EqualFold(r.Email, ex) {
+			continue
+		}
+		if cutoff != "" && r.Date < cutoff {
+			continue
+		}
+		out = append(out, r)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Date != out[j].Date {
+			return out[i].Date < out[j].Date
+		}
+		if out[i].At != out[j].At {
+			return out[i].At < out[j].At
+		}
+		return out[i].Email < out[j].Email
+	})
+	return out
+}
+
+// QoderClaimedDates 返回某账号 phase=claimed 的去重日期（升序）。
+func QoderClaimedDates(email string, days int) []string {
+	records := QoderClaimHistory(email, days)
+	seen := map[string]bool{}
+	out := make([]string, 0, len(records))
+	for _, r := range records {
+		if r.Phase != "claimed" || r.Date == "" || seen[r.Date] {
+			continue
+		}
+		seen[r.Date] = true
+		out = append(out, r.Date)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// QoderRecentClaims 返回全部账号最近 limit 条记录（at 降序），供面板 history 端点用。
+// limit<=0 时按契约上限 500 条。
+func QoderRecentClaims(limit int) []QoderClaimRecord {
+	if limit <= 0 {
+		limit = 500
+	}
+	records := QoderClaimHistory("", 0)
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].At != records[j].At {
+			return records[i].At > records[j].At
+		}
+		if records[i].Date != records[j].Date {
+			return records[i].Date > records[j].Date
+		}
+		return records[i].Email < records[j].Email
+	})
+	if len(records) > limit {
+		records = records[:limit]
+	}
+	return records
+}
+
+// qoderLatestClaimRecords 返回每个账号最近一条账本记录（按 date/at 取最新）。
+func qoderLatestClaimRecords() map[string]QoderClaimRecord {
+	records := QoderClaimHistory("", 0)
+	out := make(map[string]QoderClaimRecord, len(records))
+	for _, r := range records {
+		key := normalizeQoderEmail(r.Email)
+		old, ok := out[key]
+		if !ok || r.Date > old.Date || (r.Date == old.Date && r.At > old.At) {
+			out[key] = r
+		}
+	}
+	return out
+}
+
+// qoderLedgerLastClaimed 返回账本里该账号最近一次 phase=claimed 的时刻。
+func qoderLedgerLastClaimed(email string) (time.Time, bool) {
+	ex := normalizeQoderEmail(email)
+	if ex == "" {
+		return time.Time{}, false
+	}
+	qoderClaimHistoryMu.Lock()
+	f := loadQoderClaimHistoryLocked()
+	qoderClaimHistoryMu.Unlock()
+	var best time.Time
+	found := false
+	for _, r := range f.Records {
+		if !strings.EqualFold(r.Email, ex) || r.Phase != "claimed" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, strings.TrimSpace(r.At))
+		if err != nil {
+			continue
+		}
+		if !found || t.After(best) {
+			best, found = t, true
+		}
+	}
+	return best, found
+}
+
+// qoderLedgerLastClaimedRFC3339 返回账本/Claims 里最近一次真领到的时刻（RFC3339，空 = 无）。
+func qoderLedgerLastClaimedRFC3339(email string) string {
+	if t, ok := LastClaimedAt("qoder", email); ok {
+		return t.In(qoderCST).Format(time.RFC3339)
+	}
+	return ""
+}
+
+// qoderDailyClaimCredits Qoder 每日 CLAIM_BENEFIT 的固定面值（实测 benefit.amount=100）。
+// 历史补写时若账本里没有任何 claimed 记录可参考面值，用它兜底。
+const qoderDailyClaimCredits = 100.0
+
+// QoderBackfillClaimHistoryForToday 补写「今天已领但账本缺失」的 claimed 记录。
+//
+// 场景（D-Q2）：某号今天确实领到了（checkin_log.json 的 Claims 里有今天的时刻），
+// 但那次领取发生在 qoder_claim_history.json 建立之前（或由旧版进程完成），
+// 账本当天没有 phase=claimed 记录 —— claim_history_days 因此少算一天。
+// 这是**历史数据缺失**，不是统计口径错误，所以补一条真实记录而不是改统计规则。
+//
+// 规则：
+//   - LastClaimedAt("qoder", email) 必须是今天（UTC+8），否则不补；
+//   - 账本当天已有 phase=claimed 记录 → 跳过（幂等，不重复写盘）；
+//   - credits 取账本里最近一次 claimed 的面值，没有则用每日固定面值；
+//   - date=今天、at=Claims 里的真实领取时刻（不是 now），campaign/grant 留空。
+//
+// 返回是否真的写了一条记录。失败由调用方记日志，不阻断扫描/签到。
+func QoderBackfillClaimHistoryForToday(email string) (bool, error) {
+	ex := normalizeQoderEmail(email)
+	if ex == "" {
+		return false, nil
+	}
+	claimedAt, ok := LastClaimedAt("qoder", ex)
+	if !ok || !sameCheckinDay("qoder", claimedAt) {
+		return false, nil
+	}
+	today := qoderClaimDay(time.Now())
+	for _, rec := range QoderClaimHistory(ex, 1) {
+		if rec.Date == today && rec.Phase == "claimed" {
+			return false, nil
+		}
+	}
+	credits := 0.0
+	for _, rec := range QoderClaimHistory(ex, 0) { // date 升序：后出现的是更近的一次
+		if rec.Phase == "claimed" && rec.Credits > 0 {
+			credits = rec.Credits
+		}
+	}
+	if credits <= 0 {
+		credits = qoderDailyClaimCredits
+	}
+	err := AppendQoderClaim(QoderClaimRecord{
+		Email:   ex,
+		Date:    today,
+		Phase:   "claimed",
+		Credits: credits,
+		At:      claimedAt.In(qoderCST).Format(time.RFC3339),
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }

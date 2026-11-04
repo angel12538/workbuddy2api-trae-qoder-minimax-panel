@@ -2,7 +2,11 @@ package ideauth
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ---------------------------------------------------------------------------
@@ -57,6 +63,11 @@ type QoderDevice struct {
 	// Synthetic 表示这是"按账号派生"的设备标识（不是物理设备）：
 	// 设备指纹照常参与判定，但 MachineToken/MachineCode 是物理设备绑定值，不能发出去。
 	Synthetic bool `json:"-"`
+	// Derived 表示本设备由账号确定性派生（device_mode=derived），不是物理设备。
+	// 与 Synthetic 的区别：Derived 设备的 Token/Code 也必须真实发送，否则上游不下发活动。
+	Derived bool `json:"-"`
+	// ProxyURL 该账号的出口代理（http/https://host:port）；空 = 进程默认网络。
+	ProxyURL string `json:"-"`
 }
 
 // Apply 写入 Cosy-* 请求头。
@@ -78,7 +89,40 @@ func (d *QoderDevice) Apply(h http.Header) {
 	set("Cosy-Version", d.Version)
 }
 
-// qoderUSTags 返回 "x86_64_windows" 形态的 machineOS。
+// NewHTTPClient 按设备的出口代理构造 HTTP 客户端。
+//
+//   - ProxyURL 为空：http.DefaultTransport 克隆 —— 与现网 &http.Client{} 完全等价
+//     （同样受进程级 HTTP_PROXY/HTTPS_PROXY 影响）；
+//   - ProxyURL 为 http(s)://host:port：克隆默认 Transport 后换成 http.ProxyURL；
+//   - socks5 等不支持的 scheme：返回错误（不新增依赖），绝不静默直连 ——
+//     静默直连会让请求从本机真实出口发出去，而调用方以为已经做了隔离。
+func (d *QoderDevice) NewHTTPClient(timeout time.Duration) (*http.Client, error) {
+	tr := cloneQoderDefaultTransport()
+	proxy := ""
+	if d != nil {
+		proxy = strings.TrimSpace(d.ProxyURL)
+	}
+	if proxy != "" {
+		u, err := parseQoderProxyURL(proxy)
+		if err != nil {
+			return nil, err
+		}
+		if u != nil {
+			tr.Proxy = http.ProxyURL(u)
+		}
+	}
+	return &http.Client{Timeout: timeout, Transport: tr}, nil
+}
+
+// cloneQoderDefaultTransport 克隆进程默认 Transport（保留代理环境变量、TLS、HTTP/2 设置）。
+func cloneQoderDefaultTransport() *http.Transport {
+	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+		return tr.Clone()
+	}
+	return &http.Transport{Proxy: http.ProxyFromEnvironment}
+}
+
+// qoderMachineOS 返回 "x86_64_windows" 形态的 machineOS。
 func qoderMachineOS() string {
 	arch := "x86_64"
 	switch runtime.GOARCH {
@@ -294,14 +338,14 @@ func qoderClassifyCampaigns(campaigns []QoderCampaign) (claimable []QoderCampaig
 
 // QoderCheckinResult 签到结果。
 type QoderCheckinResult struct {
-	Email      string  `json:"email"`
-	Name       string  `json:"name"`
-	UID        string  `json:"uid"`
-	Phase      string  `json:"phase"` // claimed / already / pending / login_required / error
-	Msg        string  `json:"msg"`
-	Credits    float64 `json:"credits"`
-	Claimed    int     `json:"claimed"`
-	Total      int     `json:"total_campaigns"`
+	Email     string  `json:"email"`
+	Name      string  `json:"name"`
+	UID       string  `json:"uid"`
+	Phase     string  `json:"phase"` // claimed / already / pending / login_required / error
+	Msg       string  `json:"msg"`
+	Credits   float64 `json:"credits"`
+	Claimed   int     `json:"claimed"`
+	Total     int     `json:"total_campaigns"`
 	DeviceOK  bool    `json:"device_ok"`
 	Refreshed bool    `json:"refreshed"`
 	Exe       string  `json:"umid_exe,omitempty"`
@@ -357,19 +401,27 @@ func qoderOpenAPIBaseListForScope(scope string) []string {
 	return []string{qoderOpenAPICN, qoderOpenAPIINTL}
 }
 
-// qoderDo 发一次带鉴权与设备头的请求。
+// QoderDo 是 Qoder 上游请求的唯一入口：带鉴权头、设备头，并按 dev.ProxyURL 走
+// 该账号的出口。
 //
 // 网络层失败会**原地重试一次**：本机默认走 HTTP_PROXY（127.0.0.1:10808 的本地
 // 代理），那个代理偶尔拒连，一次网络错误就判「token 失效」是冤枉。实测：同一秒
 // 探针脚本能通、服务进程却报连接失败，重试一次就稳了。
-func qoderDo(base, path, method, token string, body []byte, dev *QoderDevice) (int, []byte, error) {
+//
+// 代理配置错误（socks5 / 格式非法）属于配置问题，不重试，直接返回错误：
+// 重试只会把 1.5s 的等待加在必然失败的请求上，还会掩盖真正的原因。
+func QoderDo(base, path, method, token string, body []byte, dev *QoderDevice) (int, []byte, error) {
+	client, err := dev.NewHTTPClient(30 * time.Second)
+	if err != nil {
+		return 0, nil, err
+	}
 	url := strings.TrimRight(base, "/") + path
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
 			time.Sleep(1500 * time.Millisecond)
 		}
-		st, raw, err := qoderDoOnce(url, method, token, body, dev)
+		st, raw, err := qoderDoOnce(client, url, method, token, body, dev)
 		if err == nil {
 			return st, raw, nil
 		}
@@ -378,7 +430,50 @@ func qoderDo(base, path, method, token string, body []byte, dev *QoderDevice) (i
 	return 0, nil, lastErr
 }
 
-func qoderDoOnce(url, method, token string, body []byte, dev *QoderDevice) (int, []byte, error) {
+// qoderDo 是 QoderDo 的薄封装（保留包内既有调用点的签名）。
+//
+// 所有签到/探测/usage 调用都经此进入 QoderDo，从而按账号出口走代理。
+func qoderDo(base, path, method, token string, body []byte, dev *QoderDevice) (int, []byte, error) {
+	return QoderDo(base, path, method, token, body, dev)
+}
+
+// QoderDoAny 按候选 base 顺序尝试，返回第一个拿到 HTTP 响应的 base。
+//
+// 给不掌握 qoderOpenAPIBaseListForScope 的调用方（cmd/qoderprobe）使用：
+// scope 决定候选顺序（global 账号国际服优先，其余国内服优先），
+// QODER_OPENAPI_BASE 可固定单一 base。设备指纹与出口复用 QoderDo。
+//
+// 语义约定：
+//   - 网络层错误（连不上/DNS/TLS）继续试下一个 base；
+//   - 任何 HTTP 响应（含 401/403/404）都算命中并立即返回 —— 探测需要区分
+//     "没网"与"没权限"，把 401 当成失败会让结论失真；
+//   - 全部 base 网络失败时返回最后一个错误，base 为空。
+func QoderDoAny(scope, path, method, token string, body []byte, dev *QoderDevice) (status int, raw []byte, base string, err error) {
+	bases := qoderOpenAPIBaseListForScope(scope)
+	if len(bases) == 0 {
+		return 0, nil, "", fmt.Errorf("没有可用的 openapi base")
+	}
+	var lastErr error
+	for _, b := range bases {
+		st, rw, derr := QoderDo(b, path, method, token, body, dev)
+		if derr != nil {
+			// 代理配置错误对所有 base 都一样，继续试只会把同一个错误重复一遍。
+			if errors.Is(derr, ErrInvalidProxyURL) {
+				return 0, nil, "", derr
+			}
+			lastErr = derr
+			continue
+		}
+		return st, rw, b, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("所有 openapi base 均不可达")
+	}
+	return 0, nil, "", lastErr
+}
+
+// qoderDoOnce 用已构造好的客户端发一次请求。
+func qoderDoOnce(client *http.Client, url, method, token string, body []byte, dev *QoderDevice) (int, []byte, error) {
 	var rdr io.Reader
 	if len(body) > 0 {
 		rdr = bytes.NewReader(body)
@@ -398,7 +493,6 @@ func qoderDoOnce(url, method, token string, body []byte, dev *QoderDevice) (int,
 	if dev != nil {
 		dev.Apply(req.Header)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -962,7 +1056,7 @@ func QoderUsage() *QoderUsageResult {
 	if err != nil {
 		return &QoderUsageResult{Phase: "login_required", Msg: "未登录或无法读取登录态"}
 	}
-	return qoderUsageAuth(auth, QoderDeviceInfo(), currentQoderScope())
+	return qoderUsageAuth(auth, qoderDeviceForAccount(auth), currentQoderScope())
 }
 
 // qoderUsageAuth 用指定登录态查额度（号池多号查询复用，见 QoderUsageFor）。
@@ -1056,7 +1150,7 @@ func QoderRenew(force bool) *QoderRenewResult {
 		res.Msg = "缺少 refresh token，请重新登录 Qoder"
 		return res
 	}
-	dev := QoderDeviceInfo()
+	dev := qoderDeviceForAccount(auth)
 	lastErr := ""
 	for _, base := range qoderOpenAPIBaseListForScope(currentQoderScope()) {
 		at, rt, exp, rtexp, ok := qoderRefreshTokenFull(auth, base, dev)
@@ -1114,7 +1208,78 @@ func qoderCampaignsOf(raw []byte) []QoderCampaign {
 	return nil
 }
 
-// qoderDeviceForAccount 返回**本机真实设备指纹**。
+// QoderDeviceForEmail 按账号解析设备指纹与出口（契约 C-QD-DEVICE@1）。
+//
+// 读取 qoder_egress.json：
+//   - real（无配置时的默认值）：返回 QoderDeviceInfo() 的真实设备，字段与现网完全一致；
+//   - derived：按 lower(email) 确定性派生 MachineID/MachineToken/MachineCode/
+//     MachineHostname，ClientType/MachineOS/MachineType/Version 复制真实设备；
+//     派生设备 Derived=true、Synthetic=false —— Token/Code 必须真实发送，
+//     否则上游不下发活动（2026-10-24 实测）。
+//
+// 出口代理只写入 dev.ProxyURL，由 NewHTTPClient/QoderDo 应用；本函数不发起网络请求。
+// 配置文件损坏时返回错误（由调用方决定是否降级），不静默改配置。
+func QoderDeviceForEmail(email string) (*QoderDevice, error) {
+	pool, err := LoadQoderEgress()
+	if err != nil {
+		return nil, err
+	}
+	prof := qoderEgressProfileOf(pool, email)
+	proxy := strings.TrimSpace(prof.ProxyURL)
+	base := QoderDeviceInfo()
+	if base == nil {
+		base = &QoderDevice{}
+	}
+	if strings.ToLower(strings.TrimSpace(prof.DeviceMode)) == QoderDeviceModeDerived {
+		dev := qoderDeriveDevice(prof.Email, base)
+		dev.ProxyURL = proxy
+		return dev, nil
+	}
+	base.Synthetic = false
+	base.Derived = false
+	base.ProxyURL = proxy
+	return base, nil
+}
+
+// qoderDeriveDevice 按邮箱确定性派生设备指纹（同一邮箱跨进程稳定）。
+//
+// 规则见契约 2.2.6：
+//
+//	MachineID       = uuid.NewSHA1(NameSpaceOID, "qoder-device:"+lower(email))
+//	MachineToken    = base64.RawURLEncoding(sha256("qoder-token:"+lower(email)+":"+realMachineID))
+//	MachineCode     = hex(sha256("qoder-code:"+lower(email)))[:32]
+//	MachineHostname = "DESKTOP-" + upper(hex(sha256("qoder-host:"+lower(email)))[:7])
+//
+// 真实 MachineID 参与 Token 派生：不同物理机器的同一邮箱会得到不同 Token，
+// 但同一台机器上同一邮箱始终一致。
+func qoderDeriveDevice(email string, base *QoderDevice) *QoderDevice {
+	key := normalizeQoderEmail(email)
+	if base == nil {
+		base = &QoderDevice{}
+	}
+	realMachineID := strings.TrimSpace(base.MachineID)
+	d := &QoderDevice{
+		ClientType:  base.ClientType,
+		MachineOS:   base.MachineOS,
+		MachineType: base.MachineType,
+		Version:     base.Version,
+		Derived:     true,
+		Synthetic:   false,
+	}
+	d.MachineID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("qoder-device:"+key)).String()
+	d.MachineToken = base64.RawURLEncoding.EncodeToString(qoderSHA256("qoder-token:" + key + ":" + realMachineID))
+	d.MachineCode = hex.EncodeToString(qoderSHA256("qoder-code:" + key))[:32]
+	d.MachineHostname = "DESKTOP-" + strings.ToUpper(hex.EncodeToString(qoderSHA256("qoder-host:" + key))[:7])
+	return d
+}
+
+// qoderSHA256 返回字符串的 SHA-256 摘要。
+func qoderSHA256(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
+}
+
+// qoderDeviceForAccount 返回该账号的设备指纹与出口。
 //
 // 2026-10-24 实测修正：此前为多号同签给每个账号派生「合成 MachineId + 不发
 // MachineToken」，结果服务端**只对真实设备指纹下发每日签到活动**（合成设备
@@ -1128,8 +1293,17 @@ func qoderCampaignsOf(raw []byte) []QoderCampaign {
 // **人**（服务端判定码 SAME_PERSON_ALREADY_CLAIMED），与账号、scope 都无关。
 // 详见 QoderQuotaGroupKey 与 qoder_person.go。
 //
-// 所以这里发真实指纹（保证活动会被下发），额度归属交给「同一人」判定处理。
+// 现在按 qoder_egress.json 的 device_mode 决定：默认 real（真实指纹，现网行为），
+// 显式配置 derived 时才使用派生设备。读取配置失败一律回落到真实设备 ——
+// 签到是无人值守路径，不能因为一个坏掉的配置文件全部失败。
 func qoderDeviceForAccount(auth *QoderAuth) *QoderDevice {
+	email := ""
+	if auth != nil {
+		email = auth.User.Email
+	}
+	if dev, err := QoderDeviceForEmail(email); err == nil && dev != nil {
+		return dev
+	}
 	dev := QoderDeviceInfo()
 	if dev == nil {
 		dev = &QoderDevice{}

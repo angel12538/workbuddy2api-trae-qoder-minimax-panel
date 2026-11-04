@@ -189,9 +189,29 @@ func (p *Panel) qoderLoginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email := strings.TrimSpace(a.User.Email)
-	if email == "" || email == before {
+	if email == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待 Qoder 客户端完成登录…"})
 		return
+	}
+	if email == before {
+		// 扫的号跟开始前是**同一个**（重登同号、或本来就没退出）。
+		//
+		// 旧逻辑在这里直接 return 等下一轮，于是 email 永远 == before，
+		// 要一直等到 20 分钟超时才结束 —— 用户看到的就是"扫码要扫很久"。
+		// 正确判据看**登录态文件是否被重写**：auth.v1.dat 的 mtime 晚于本次
+		// 开始时间，说明刚刚确实走了一次新的登录，直接收号。
+		mtime := time.Time{}
+		if st, serr := os.Stat(filepath.Join(ideauth.QoderDataDir(), "auth.v1.dat")); serr == nil {
+			mtime = st.ModTime()
+		}
+		qoderLoginSession.mu.Lock()
+		startedAt := qoderLoginSession.startedAt
+		qoderLoginSession.mu.Unlock()
+		if mtime.IsZero() || !mtime.After(startedAt) {
+			writeJSON(w, http.StatusOK, map[string]any{"done": false,
+				"message": "客户端当前已经是 " + email + " —— 如果这就是要加的号，稍等它自动收录；要换别的号请先点「退出当前账号」"})
+			return
+		}
 	}
 	_, added, err := ideauth.UpsertQoderAccount()
 	verb := "已添加"

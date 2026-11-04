@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/appdir"
@@ -32,8 +33,22 @@ func qoderPoolPath() string {
 	return filepath.Join(PoolDir(), "qoder_accounts.json")
 }
 
+// qoderPoolMu 串行化号池文件的「读-改-写」。
+//
+// 号池有多个并发写者（签到回写 token、ClaimCID 更新、增删账号），裸
+// Load → 改 → Save 会互相覆盖：两个 goroutine 各自读到同一份快照，后写的
+// 那份把先写的账号改动整个盖掉。所有读改写路径必须走 UpdateQoderPool。
+var qoderPoolMu sync.Mutex
+
 // LoadQoderPool 读取号池（不存在返回空池）。
 func LoadQoderPool() (*QoderPoolFile, error) {
+	qoderPoolMu.Lock()
+	defer qoderPoolMu.Unlock()
+	return loadQoderPool()
+}
+
+// loadQoderPool 读取号池（调用方须已持锁）。
+func loadQoderPool() (*QoderPoolFile, error) {
 	p := qoderPoolPath()
 	raw, err := os.ReadFile(p)
 	if err != nil {
@@ -49,12 +64,25 @@ func LoadQoderPool() (*QoderPoolFile, error) {
 	return &f, nil
 }
 
-// SaveQoderPool 原子写回号池。
+// SaveQoderPool 原子写回号池（按 Email 排序）。
 func SaveQoderPool(f *QoderPoolFile) error {
+	qoderPoolMu.Lock()
+	defer qoderPoolMu.Unlock()
+	return saveQoderPool(f)
+}
+
+// saveQoderPool 原子写回号池（调用方须已持锁）。
+func saveQoderPool(f *QoderPoolFile) error {
 	if f == nil {
 		return fmt.Errorf("nil pool")
 	}
 	sort.SliceStable(f.Accounts, func(i, j int) bool {
+		if f.Accounts[i] == nil {
+			return false
+		}
+		if f.Accounts[j] == nil {
+			return true
+		}
 		return f.Accounts[i].Email < f.Accounts[j].Email
 	})
 	b, err := json.MarshalIndent(f, "", "  ")
@@ -62,6 +90,26 @@ func SaveQoderPool(f *QoderPoolFile) error {
 		return err
 	}
 	return atomicWrite(qoderPoolPath(), b)
+}
+
+// UpdateQoderPool 在包级互斥锁内执行 Load → fn → Save（契约 C-QD-POOL@1）。
+//
+// fn 返回错误时不写盘；fn 内**禁止**再调用 LoadQoderPool/SaveQoderPool/
+// QoderScopePeers 等会再次拿这把锁的函数（互斥锁不可重入，会死锁）。
+func UpdateQoderPool(fn func(*QoderPoolFile) error) error {
+	if fn == nil {
+		return fmt.Errorf("nil update func")
+	}
+	qoderPoolMu.Lock()
+	defer qoderPoolMu.Unlock()
+	f, err := loadQoderPool()
+	if err != nil {
+		return err
+	}
+	if err := fn(f); err != nil {
+		return err
+	}
+	return saveQoderPool(f)
 }
 
 // UpsertQoderAccount 把当前登录态存入号池（按 Email 去重）。
@@ -74,22 +122,20 @@ func UpsertQoderAccount() (*QoderSnapshot, bool, error) {
 	if strings.TrimSpace(snap.Email) == "" {
 		return nil, false, fmt.Errorf("当前 Qoder 未登录或邮箱为空")
 	}
-	f, err := LoadQoderPool()
-	if err != nil {
-		return nil, false, err
-	}
+
 	added := true
-	for i, a := range f.Accounts {
-		if strings.EqualFold(a.Email, snap.Email) {
-			f.Accounts[i] = snap
-			added = false
-			break
+	err = UpdateQoderPool(func(f *QoderPoolFile) error {
+		for i, a := range f.Accounts {
+			if a != nil && strings.EqualFold(a.Email, snap.Email) {
+				f.Accounts[i] = snap
+				added = false
+				return nil
+			}
 		}
-	}
-	if added {
 		f.Accounts = append(f.Accounts, snap)
-	}
-	if err := SaveQoderPool(f); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, false, err
 	}
 	return snap, added, nil
@@ -97,18 +143,16 @@ func UpsertQoderAccount() (*QoderSnapshot, bool, error) {
 
 // RemoveQoderAccount 从号池移除指定邮箱。
 func RemoveQoderAccount(email string) error {
-	f, err := LoadQoderPool()
-	if err != nil {
-		return err
-	}
-	out := f.Accounts[:0]
-	for _, a := range f.Accounts {
-		if !strings.EqualFold(a.Email, email) {
-			out = append(out, a)
+	return UpdateQoderPool(func(f *QoderPoolFile) error {
+		out := f.Accounts[:0]
+		for _, a := range f.Accounts {
+			if a == nil || !strings.EqualFold(a.Email, email) {
+				out = append(out, a)
+			}
 		}
-	}
-	f.Accounts = out
-	return SaveQoderPool(f)
+		f.Accounts = out
+		return nil
+	})
 }
 
 // SwitchQoderTo 把号池中指定邮箱的登录态写入 Qoder（切号核心）。

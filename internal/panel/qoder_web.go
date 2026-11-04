@@ -9,9 +9,10 @@
 // **完全一样**（GET /sash/api/v1/me/campaigns、POST /sash/api/v1/me/campaigns/{id}/claim、
 // GET /sash/api/v1/me/campaigns/{id}/reward），认证方式不同（Cookie vs Bearer token），
 // 身份也一样（同一个 uid）。所以：
-//   · 换网页登录**不能**让一个号多领一份每日额度（额度按**人**发，见 qoder_person.go）；
-//   · 但它仍有价值：① 客户端没装/没登录时也能签；② 每个号一份独立 profile，
-//     互不串登录态；③ 会话过期时可以用同一 profile 再起一次浏览器续上。
+//
+//	· 换网页登录**不能**让一个号多领一份每日额度（额度按**人**发，见 qoder_person.go）；
+//	· 但它仍有价值：① 客户端没装/没登录时也能签；② 每个号一份独立 profile，
+//	  互不串登录态；③ 会话过期时可以用同一 profile 再起一次浏览器续上。
 //
 // 流程：
 //  1. 每号一个 profile 目录 data/qoder-web/<账号哈希>/，启动浏览器打开
@@ -40,6 +41,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/ideauth"
 )
 
 // qoderWebOrigin Qoder 网页控制台。
@@ -52,8 +55,8 @@ const qoderWebTTL = 30 * time.Minute
 
 // qoderWebSession 一次「网页登录 + 领取」的进行态（按账号分别记）。
 var qoderWebSessions = struct {
-	mu  sync.Mutex
-	by  map[string]*qoderWebState
+	mu sync.Mutex
+	by map[string]*qoderWebState
 }{by: map[string]*qoderWebState{}}
 
 type qoderWebState struct {
@@ -118,18 +121,22 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// profile 目录一律沿用历史路径（qoderWebProfileDir）：这是网页会话的存放位置，
+	// 换成 egress 里的 profile_dir 会让已有登录态"消失"。契约 C-QD-EGRESS@1 要求
+	// ProfileDir 与 qoderWebProfileDir 一致 —— 这里以它为准。
 	dir := qoderWebProfileDir(p, email)
+	egress := ideauth.QoderEgressFor(email)
+	if pd := strings.TrimSpace(egress.ProfileDir); pd != "" && !strings.EqualFold(filepath.Clean(pd), filepath.Clean(dir)) {
+		log.Printf("panel: Qoder 出口配置的 profile_dir=%s 与运行路径 %s 不一致，按运行路径启动", pd, dir)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		qoderWebSessions.mu.Unlock()
 		writeErr(w, http.StatusInternalServerError, "创建浏览器 profile 目录失败: "+err.Error())
 		return
 	}
-	cmd := exec.Command(chrome,
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir="+dir,
-		"--no-first-run", "--no-default-browser-check",
-		qoderWebOrigin+"/account/usage",
-	)
+	// 配置了出口代理的账号：登录环境与签到请求走同一个代理（否则"隔离"只隔离了一半）。
+	args := ideauth.QoderWebChromeArgs(port, dir, egress.ProxyURL, qoderWebOrigin+"/account/usage")
+	cmd := exec.Command(chrome, args...)
 	if err := cmd.Start(); err != nil {
 		qoderWebSessions.mu.Unlock()
 		writeErr(w, http.StatusBadGateway, "启动浏览器失败: "+err.Error())
@@ -139,7 +146,8 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		email: email, port: port, dir: dir, proc: cmd, startedAt: time.Now(),
 	}
 	qoderWebSessions.mu.Unlock()
-	log.Printf("panel: Qoder 网页登录：%s（调试端口 %d，profile %s）", email, port, dir)
+	log.Printf("panel: Qoder 网页登录：%s（调试端口 %d，profile %s，代理 %s）",
+		email, port, dir, firstNonEmpty(egress.ProxyURL, "进程默认"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "running": true,
 		"message": "已打开浏览器（这个账号的独立会话），请登录要添加的 Qoder 账号 —— 登录一次即可，以后每天由面板自动签到",
@@ -337,7 +345,8 @@ func loadQoderWebCookies(dir string) []cdpCookie {
 }
 
 // qoderCookieJar 把抓到的 Cookie 装进 jar（按域规则），并返回登录态域名列表。
-func qoderCookieJar(all []cdpCookie) (*cookiejar.Jar, []string) {	jar, _ := cookiejar.New(nil)
+func qoderCookieJar(all []cdpCookie) (*cookiejar.Jar, []string) {
+	jar, _ := cookiejar.New(nil)
 	var doms []string
 	seen := map[string]bool{}
 	for _, c := range all {

@@ -32,6 +32,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -1438,274 +1439,404 @@ func runExpertUseNamed(p *Panel, a *auth.Auth, code string) (string, error) {
 // 全量自动完成
 // ---------------------------------------------------------------------------
 
-// runAutoAll 对单账号依次执行所有可自动化任务，返回逐项结果。
+// runAutoAll 对单账号执行「一键完成」，返回逐项结果（C-WB-AUTO@1）。
 // 供「一键完成全部可自动任务」使用；单项失败不影响后续项。
 //
-// 流程：先把所有未接受的任务批量 accept（规范状态机；上游脚本建议"先 accept"），
-// 再逐项执行行为链路。accept 不是进度产生的必要条件，但让后续状态流转规范。
+// 流程见 runAutoAllWithDeps：批量 accept（过程条目 kind=control）→ 生成
+// 执行计划（静态表 + 动态 expert_use_* + 只领奖 + 锁定/手动兜底）→
+// 逐项「执行动作 → 强制回读上游 → classifyAutoOutcome 判定」→ 达标即领奖。
+// 关键语义：**动作不报错不等于完成**，done 只由回读达标产生（verified=true）。
 func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
-	var out []map[string]any
+	return p.runAutoAllWithDeps(a, p.defaultAutoRunDeps())
+}
 
-	// 国际版「成长路径」清单型账号直接短路：它的 5 个任务（真实对话 / 装技能 /
-	// 链微信 / 召唤专家 / 用模板）没有 accept 步骤，也**无法由网关代做**
-	// （已验证：/v2/report 上报 chat_request_send 返回 200 但状态不变，
-	// 需官方桌面客户端行为点亮）。继续跑下面的 CN 自动化只会得到一串
-	// 「该账号无此任务」，白等 1-2 分钟还让人以为程序坏了。
-	//
-	// 只拉一次列表：清单型判定与「阶段 0 批量接受」用的是同一份任务，
-	// 分两次拉纯属多打一次上游（端点相同，一次失败即两次都失败，无收益）。
-	tasks, terr := p.cfg.Upstream.ListTasks(a)
-	isChecklist := false
-	if terr == nil {
-		if checklist, pending := checklistSummary(tasks); checklist {
-			isChecklist = true
-			// 清单里若有「已达标未领取」的，先自动领掉（网关做不了行为，但领奖可以）。
-			if cl := p.claimCompletedTasks(a, tasks, false, map[string]bool{}); len(cl) > 0 {
-				return cl
+// autoRunDeps 一键完成的外部依赖（上游读取 + 动作表）。
+//
+// 抽出来只有一个目的：让「动作后强制回读 + 完成判定」可以在**不真实打上游**
+// 的前提下做单元测试（假任务表 + 假动作）。生产路径由 defaultAutoRunDeps 提供
+// 真实实现，动作函数签名保持 autoAction.run 不变。
+type autoRunDeps struct {
+	listTasks   func(a *auth.Auth) ([]upstream.Task, error)
+	listMP      func(a *auth.Auth) ([]upstream.Task, error)
+	readTask    func(a *auth.Auth, code string) (*upstream.Task, error) // 回读（含上游异步计分等待）
+	acceptTasks func(a *auth.Auth, codes []string) ([]upstream.AcceptResult, error)
+	acceptMP    func(a *auth.Auth, codes []string) ([]upstream.AcceptResult, error)
+	claim       func(a *auth.Auth, isMP bool, code string) (int64, int64, error)
+	actions     []autoAction
+	actionFor   func(code string) *autoAction
+	gap         time.Duration // 项间节流（测试置 0）
+}
+
+// defaultAutoRunDeps 生产实现：真实上游客户端 + 真实动作表。
+func (p *Panel) defaultAutoRunDeps() *autoRunDeps {
+	return &autoRunDeps{
+		listTasks:   p.cfg.Upstream.ListTasks,
+		listMP:      p.cfg.Upstream.ListTasksMP,
+		acceptTasks: p.cfg.Upstream.AcceptTasksDetailed,
+		acceptMP:    p.cfg.Upstream.AcceptTasksMPDetailed,
+		readTask: func(a *auth.Auth, code string) (*upstream.Task, error) {
+			// mp 专属码只在 mp 口径下发；其余走带轮询等待的默认口径
+			// （上游计分是异步的，一次性回读会把刚点亮的任务误判为未达标）。
+			if isMPTaskCode(code) {
+				return p.taskByCodeMP(a, code)
 			}
-			// 清单型任务默认没有报名环节、需客户端行为；但若其中存在**面板已实现
-			// 自动动作**的项（国际版 checklist：first_chat / template_used /
-			// expert_summoned / skill_installed，见 autoActions 的 Attempt 项），
-			// 则继续走通用自动流程尝试点亮，而不是整单跳过。
-			anyAuto := false
-			for _, t := range tasks {
-				if !t.Claimed && autoActionFor(t.TaskCode) != nil {
-					anyAuto = true
-					break
-				}
-			}
-			if !anyAuto {
-				return []map[string]any{{
-					"task_code": "(成长路径)",
-					"status":    "skipped",
-					"desc":      "国际版成长路径任务",
-					"message": fmt.Sprintf(
-						"该账号是国际版「成长路径」任务（%d 个待完成），没有报名环节，"+
-							"也无法由网关代做：需在官方 WorkBuddy 客户端完成对应操作，达标后面板会自动领奖。",
-						pending),
-				}}
-			}
-		}
+			return p.taskByCodeWaiting(a, code)
+		},
+		claim:     p.claimFor,
+		actions:   autoActions,
+		actionFor: autoActionFor,
+		gap:       reportGap,
+	}
+}
+
+// autoDepsSleep 项间节流（测试可把 gap 置 0 免等待）。
+func autoDepsSleep(d *autoRunDeps) {
+	if d.gap > 0 {
+		time.Sleep(d.gap)
+	}
+}
+
+// runAutoAllWithDeps 一键完成主流程。
+//
+// 流程：拉取任务（默认 + 小程序口径）→ 批量接受（过程条目 kind=control）
+// → 生成执行计划（静态表 + 动态 autoActionFor + 只领奖 + manual/locked）
+// → 逐项「执行动作 → 强制回读 → classifyAutoOutcome」→ 达标即领奖。
+//
+// 与旧实现的关键差别（W4/W5）：
+//   - 不再「动作不报错就 done」：status/verified 一律由回读结果决定；
+//   - 不再只遍历静态 autoActions：expert_use_* 等动态任务同样进计划执行；
+//   - 其余未完成项以 manual 如实列出，不再从结果里消失；
+//   - 全流程按 task_code 去重（合并 mp 口径时 mp 专属码以 mp 条目为准）。
+func (p *Panel) runAutoAllWithDeps(a *auth.Auth, deps *autoRunDeps) []map[string]any {
+	out := []map[string]any{}
+
+	tasks, terr := deps.listTasks(a)
+	mpTasks, mperr := deps.listMP(a)
+
+	// 两个口径都拿不到任务：无法可信枚举待办，如实报错（不得回答「没有待办」）。
+	if terr != nil && mperr != nil {
+		return append(out, map[string]any{
+			"task_code": "(任务列表)", "kind": "control", "status": AutoStatusFailed,
+			"message": "拉取上游任务列表失败：默认口径 " + terr.Error() +
+				"；小程序口径 " + mperr.Error(),
+		})
+	}
+	if terr != nil {
+		out = append(out, map[string]any{
+			"task_code": "(任务列表)", "kind": "control", "status": AutoStatusFailed,
+			"message": "默认口径任务列表拉取失败（仅按小程序口径执行）: " + terr.Error(),
+		})
+	}
+	if mperr != nil {
+		// mp 口径失败不阻塞默认口径；但不能假装 mp 专属任务不存在。
+		log.Printf("panel: 一键完成 uid=%s: 小程序口径任务列表拉取失败: %v", a.UID, mperr)
 	}
 
 	// 阶段 0：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
 	if terr == nil {
-		codes, _ := acceptCandidates(tasks)
-		if len(codes) > 0 {
-			results, aerr := p.cfg.Upstream.AcceptTasksDetailed(a, codes)
-			if aerr != nil {
-				out = append(out, map[string]any{
-					"task_code": "(批量接受)", "status": "error",
-					"message": "接受任务失败（不阻塞后续）: " + aerr.Error(),
-				})
-			} else {
-				ok, bad := countAcceptResults(results)
-				status := "done"
-				msg := fmt.Sprintf("已接受 %d 个任务", ok)
-				if bad > 0 {
-					status = "error"
-					msg = fmt.Sprintf("接受 %d 个、%d 个被上游拒绝（不阻塞后续）", ok, bad)
-				}
-				out = append(out, map[string]any{
-					"task_code": "(批量接受)", "status": status, "message": msg,
-				})
-				time.Sleep(reportGap)
+		if codes, _ := acceptCandidates(tasks); len(codes) > 0 {
+			results, aerr := deps.acceptTasks(a, codes)
+			out = append(out, autoAcceptControl("(批量接受)", "任务", results, aerr))
+			if aerr == nil {
+				autoDepsSleep(deps)
+			}
+		}
+	}
+	// 阶段 0b：小程序口径单独接受（默认列表不含 mp 专属码；失败不阻塞）。
+	if mperr == nil {
+		if codes, _ := acceptCandidates(mpTasks); len(codes) > 0 {
+			results, aerr := deps.acceptMP(a, codes)
+			out = append(out, autoAcceptControl("(批量接受-mp)", "小程序任务", results, aerr))
+			if aerr == nil {
+				autoDepsSleep(deps)
 			}
 		}
 	}
 
-	// 阶段 0b：小程序口径任务单独接受（默认列表不含 mp 码；失败不阻塞）。
-	if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-		mpCodes, _ := acceptCandidates(mpTasks)
-		if len(mpCodes) > 0 {
-			results, aerr := p.cfg.Upstream.AcceptTasksMPDetailed(a, mpCodes)
-			if aerr != nil {
-				out = append(out, map[string]any{
-					"task_code": "(批量接受-mp)", "status": "error",
-					"message": "接受小程序任务失败（不阻塞后续）: " + aerr.Error(),
-				})
-			} else {
-				ok, bad := countAcceptResults(results)
-				status := "done"
-				msg := fmt.Sprintf("已接受 %d 个小程序任务", ok)
-				if bad > 0 {
-					status = "error"
-					msg = fmt.Sprintf("接受小程序任务 %d 个、%d 个被上游拒绝", ok, bad)
-				}
-				out = append(out, map[string]any{
-					"task_code": "(批量接受-mp)", "status": status, "message": msg,
-				})
-				time.Sleep(reportGap)
-			}
-		}
-	}
+	// 执行计划：只覆盖**真实存在且未完成**的任务。
+	// 静态 autoActions 与动态 autoActionFor（expert_use_* 等）统一进计划，
+	// 其余未完成项落 manual —— 按 task_code 去重，不存在「有动作却消失」。
+	snapshot := mergeTaskSnapshot(tasks, mpTasks)
+	plan := buildAutoPlan(snapshot, deps.actions, deps.actionFor)
 
-	for _, act := range autoActions {
-		item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
-		before, err := p.taskByCode(a, act.TaskCode)
-		if err != nil {
-			item["status"] = "error"
-			item["message"] = "查询失败: " + err.Error()
-			out = append(out, item)
-			continue
+	for _, it := range plan {
+		item := map[string]any{
+			"task_code":       it.code,
+			"desc":            it.desc,
+			"action":          it.action,
+			"progress_before": taskProgressText(it.before),
+			// 未执行项（locked/manual）的 progress_after 与 before 相同：
+			// R3.6.1 要求每条结果都可核对前后进度，缺字段会让前端显示为空。
+			"progress_after": taskProgressText(it.before),
+			"verified":       false,
 		}
-		if before == nil {
-			// 国际版 checklist 账号跑的是另一套任务码（first_chat/skill_installed…），
-			// 旧国服白名单在这里必然"查无此任务"。以前会输出一屏这句话，
-			// 用户只看到"没有任务"就以为程序坏了——这里直接不输出。
-			if isChecklist {
-				continue
-			}
-			item["status"] = "skipped"
-			item["message"] = "该账号无此任务"
-			out = append(out, item)
-			continue
+		if it.before != nil && it.before.UnlockAt != "" {
+			item["unlock_at"] = it.before.UnlockAt
 		}
-		// 未解锁：上游把任务真锁住（accept 逐条回 "task locked until <日期>"），
-		// 继续跑只会白等两轮 accept 并给出「上游 200+OK 但未落账形态」这种误导性
-		// 提示。这不是放弃——把解锁时刻如实回报，解锁后由 scheduler 的 growth
-		// 时点自动执行（与扫描 growthPending 跳过 locked 同口径）。
-		if before.Locked {
-			item["status"] = "locked"
-			item["message"] = taskLockHint(before)
-			item["unlock_at"] = before.UnlockAt
-			out = append(out, item)
-			continue
-		}
-		if before.Claimed || before.Current >= before.Target && before.Target > 0 {
-			item["status"] = "skipped"
-			item["message"] = "已完成（" + taskProgressText(before) + "）"
-			out = append(out, item)
-			continue
-		}
-		msg, err := act.run(p, a)
-		if err != nil {
-			item["status"] = "error"
-			item["message"] = err.Error()
-			out = append(out, item)
-			continue
-		}
-		var after *upstream.Task
-		if isMPTaskCode(act.TaskCode) {
-			after, _ = p.taskByCodeMP(a, act.TaskCode)
-		} else {
-			after, _ = p.taskByCodeWaiting(a, act.TaskCode)
-		}
-		item["status"] = "done"
-		item["message"] = msg
-		item["progress_after"] = taskProgressText(after)
-		// 进度达标即自动领奖（mp 任务走 chat 域 mp 口径，其余 Web 端接口）。
-		// 领奖失败不掩盖主流程结果：status 仍为 done，附加 claim_error 供前端提示。
-		if after != nil && after.Claimable {
-			item["claimable"] = true
-			var credit, energy int64
-			var cerr error
-			if isMPTaskCode(act.TaskCode) {
-				credit, energy, cerr = p.cfg.Upstream.ClaimRewardMP(a, act.TaskCode)
-			} else {
-				credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, act.TaskCode)
-			}
-			if cerr == nil {
-				item["claimed"] = true
-				item["credit"] = credit
-				item["energy"] = energy
-				if credit > 0 || energy > 0 {
-					item["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
-				} else {
-					item["message"] = msg + "；奖励此前已领取"
-				}
-			} else {
-				item["claim_error"] = cerr.Error()
-				item["message"] = msg + "；达标但领奖失败（可在列表手动重试）"
-			}
+		switch {
+		case it.locked:
+			// 上游锁定：不执行（跑也只会白等 accept 两轮），如实回报解锁时刻。
+			item["status"] = AutoStatusLocked
+			item["reason"] = "上游未解锁"
+			item["message"] = taskLockHint(it.before)
+		case it.manual:
+			reason := autoManualReason(it.before)
+			item["status"] = AutoStatusManual
+			item["reason"] = reason
+			item["message"] = "需真实操作：" + reason + "（面板不做伪造；达标后会自动领奖）"
+		case it.claimOnly:
+			p.runPlanClaimOnly(a, deps, it, item)
+		default:
+			p.runPlanAction(a, deps, it, item)
 		}
 		out = append(out, item)
-		time.Sleep(reportGap) // 项间节流
-	}
-
-	// 收尾：领掉「已达标但未领取」的任务——**包括没有自动动作的**（关注公众号 /
-	// 真实捐款 / 国际版成长路径）。这些任务网关做不了「真实行为」，但用户一旦在
-	// 官方客户端 / 微信做完达标，奖励不该还等人手点。扫一遍列表把它们领掉。
-	seen := map[string]bool{}
-	if terr == nil {
-		out = append(out, p.claimCompletedTasks(a, tasks, false, seen)...)
-	}
-	if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-		out = append(out, p.claimCompletedTasks(a, mpTasks, true, seen)...)
-	}
-
-	// 收尾 3：把「未完成、且网关做不了」的任务也如实列出来。
-	//
-	// 为什么必须列：autoActions 只有 25 项，用户点「一键完成」看到 25 项全「已完成」，
-	// 转头在任务中心却看到还有「需手动」——两边对不上，会以为有一边坏了。这里把它们
-	// 以 status=manual 一并回报（关注公众号 / 真实捐款 / 国际版成长路径），
-	// 前端计入「需手动」计数并提示原因。面板不做伪造，只如实说明。
-	if terr == nil {
-		out = append(out, manualTaskReport(tasks, seen)...)
-	}
-	if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-		out = append(out, manualTaskReport(mpTasks, seen)...)
+		autoDepsSleep(deps)
 	}
 	return out
 }
 
-// manualTaskReport 列出「未完成、无自动动作」的任务（seen 去重，含已领奖与已达标项）。
-func manualTaskReport(tasks []upstream.Task, seen map[string]bool) []map[string]any {
-	var out []map[string]any
+// autoAcceptControl 批量接受的过程条目：kind=control，不计入 summary。
+func autoAcceptControl(code, what string, results []upstream.AcceptResult, err error) map[string]any {
+	item := map[string]any{"task_code": code, "kind": "control"}
+	if err != nil {
+		item["status"] = AutoStatusFailed
+		item["message"] = "接受" + what + "失败（不阻塞后续）: " + err.Error()
+		return item
+	}
+	ok, bad := countAcceptResults(results)
+	if bad > 0 {
+		item["status"] = AutoStatusFailed
+		item["message"] = fmt.Sprintf("接受 %d 个、%d 个被上游拒绝（不阻塞后续）", ok, bad)
+		return item
+	}
+	item["status"] = AutoStatusDone
+	item["message"] = fmt.Sprintf("已接受 %d 个%s", ok, what)
+	return item
+}
+
+// mergeTaskSnapshot 合并默认口径与小程序口径的任务列表，按 task_code 去重。
+//
+// mp 列表实测是默认口径的超集（含常规任务），合并规则：
+//   - 默认条目先入，重复码不覆盖；
+//   - mp 条目仅在「该码登记为 mp 专属」(mpTaskCodes) 或默认口径没有时采用，
+//     避免把同码的默认条目替换成 mp 口径字段。
+func mergeTaskSnapshot(tasks, mpTasks []upstream.Task) []upstream.Task {
+	out := make([]upstream.Task, 0, len(tasks)+len(mpTasks))
+	idx := make(map[string]int, len(tasks)+len(mpTasks))
+	add := func(t upstream.Task, prefer bool) {
+		code := strings.TrimSpace(t.TaskCode)
+		if code == "" {
+			return // 任务码缺失（解析异常）时不生成执行项
+		}
+		t.TaskCode = code
+		if i, ok := idx[code]; ok {
+			if prefer {
+				out[i] = t
+			}
+			return
+		}
+		idx[code] = len(out)
+		out = append(out, t)
+	}
 	for _, t := range tasks {
-		if t.Claimed || seen[t.TaskCode] {
-			continue
-		}
-		if t.Target > 0 && t.Current >= t.Target {
-			continue // 已达标：claimCompletedTasks 已处理
-		}
-		if autoActionFor(t.TaskCode) != nil {
-			continue // 有自动动作：上面的 autoActions 循环已跑过
-		}
-		seen[t.TaskCode] = true
-		reason := t.TaskDesc
-		if reason == "" {
-			reason = t.Description
-		}
-		if reason == "" {
-			reason = "需在官方客户端 / 微信完成真实操作"
-		}
-		out = append(out, map[string]any{
-			"task_code": t.TaskCode,
-			"desc":      t.Title,
-			"status":    "manual",
-			"message":   "需真实操作：" + reason + "（面板不做伪造；达标后会自动领奖）",
-		})
+		add(t, false)
+	}
+	for _, t := range mpTasks {
+		add(t, isMPTaskCode(t.TaskCode))
 	}
 	return out
 }
 
-// claimCompletedTasks 领掉给定列表中「已达标但未领取」的任务（含无自动动作的）。
-// seen 跨调用去重（mp 列表是默认口径的超集）。逐条返回结果供前端展示。
-func (p *Panel) claimCompletedTasks(a *auth.Auth, tasks []upstream.Task, mp bool, seen map[string]bool) []map[string]any {
-	var out []map[string]any
-	for _, t := range tasks {
-		if t.Claimed || !t.Claimable || seen[t.TaskCode] {
-			continue
+// autoPlanItem 执行计划项（未完成任务的分类结果）。
+type autoPlanItem struct {
+	code      string
+	desc      string
+	before    *upstream.Task
+	act       *autoAction // nil = 无自动动作
+	action    string      // auto|claim_only|locked_auto|manual
+	claimOnly bool
+	locked    bool
+	manual    bool
+}
+
+// buildAutoPlan 把「未完成任务」分成可执行动作 / 只领奖 / 锁定 / 需手动四类。
+//
+// 分类与扫描（C-WB-SCAN@1）完全同口径：一键结果计数才能与扫描结果对得上。
+// 顺序：静态 autoActions 按表序（依赖先行）→ 动态动作 → 只领奖 → 锁定 → 手动。
+func buildAutoPlan(snapshot []upstream.Task, actions []autoAction, actionFor func(string) *autoAction) []autoPlanItem {
+	// 静态表顺序（依赖先行）；不在表里的（动态 expert_use_*）排到表后，
+	// 用 deps 传入的动作表而不是全局 autoActions，保证测试注入的表也生效。
+	staticOrder := make(map[string]int, len(actions))
+	for i := range actions {
+		if _, dup := staticOrder[actions[i].TaskCode]; !dup {
+			staticOrder[actions[i].TaskCode] = i
 		}
-		seen[t.TaskCode] = true
-		credit, energy, err := p.claimFor(a, mp || isMPTaskCode(t.TaskCode), t.TaskCode)
-		item := map[string]any{"task_code": t.TaskCode, "desc": t.Title}
-		if err != nil {
-			item["status"] = "error"
-			item["message"] = "已达标但领奖失败: " + err.Error()
+	}
+	orderOf := func(code string) int {
+		if i, ok := staticOrder[code]; ok {
+			return i
+		}
+		return 1 << 20
+	}
+
+	var autos, claims, locked, manuals []autoPlanItem
+	for i := range snapshot {
+		t := snapshot[i]
+		if t.Claimed {
+			continue // 已领取：不是待办，不进结果（否则把 total 撑大）
+		}
+		act := actionFor(t.TaskCode)
+		item := autoPlanItem{code: t.TaskCode, desc: autoTaskDesc(t, act), before: &snapshot[i], act: act}
+		switch {
+		case t.Locked && act != nil:
+			item.action = "locked_auto"
+			item.locked = true
+			locked = append(locked, item)
+		case t.Locked:
+			// 锁定且无动作：永远等不到自动执行，按扫描口径归 manual。
+			item.action = "manual"
+			item.manual = true
+			manuals = append(manuals, item)
+		case t.Target > 0 && t.Current >= t.Target:
+			// 已达标未领取：无需再跑动作，直接领奖（含无自动动作的任务）。
+			item.action = "claim_only"
+			item.claimOnly = true
+			claims = append(claims, item)
+		case act != nil:
+			item.action = "auto"
+			autos = append(autos, item)
+		default:
+			item.action = "manual"
+			item.manual = true
+			manuals = append(manuals, item)
+		}
+	}
+	// 静态表按表序执行；动态动作稳定排序后保持在任务列表中的相对顺序。
+	sort.SliceStable(autos, func(i, j int) bool {
+		return orderOf(autos[i].code) < orderOf(autos[j].code)
+	})
+	plan := make([]autoPlanItem, 0, len(autos)+len(claims)+len(locked)+len(manuals))
+	plan = append(plan, autos...)
+	plan = append(plan, claims...)
+	plan = append(plan, locked...)
+	plan = append(plan, manuals...)
+	return plan
+}
+
+// autoTaskDesc 结果里的展示标题：静态动作说明优先，其次任务标题/达成条件。
+func autoTaskDesc(t upstream.Task, act *autoAction) string {
+	if act != nil && strings.TrimSpace(act.Desc) != "" {
+		return act.Desc
+	}
+	if s := strings.TrimSpace(t.Title); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(t.TaskDesc); s != "" {
+		return s
+	}
+	return t.Description
+}
+
+// autoManualReason 需手动任务的原因（如实取上游文案，缺失时给通用说明）。
+func autoManualReason(t *upstream.Task) string {
+	if t == nil {
+		return "需在官方客户端 / 微信完成真实操作"
+	}
+	if t.Locked {
+		return "上游未解锁且无自动动作，需真实操作"
+	}
+	if s := strings.TrimSpace(t.TaskDesc); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(t.Description); s != "" {
+		return s
+	}
+	return "需在官方客户端 / 微信完成真实操作"
+}
+
+// runPlanAction 执行自动动作 → **强制回读** → 按 classifyAutoOutcome 判定。
+// 没有成功回读绝不写 done（R3.3.3/R3.3.4）。
+func (p *Panel) runPlanAction(a *auth.Auth, deps *autoRunDeps, it autoPlanItem, item map[string]any) {
+	msg, runErr := it.act.run(p, a)
+	after, readErr := deps.readTask(a, it.code)
+
+	status, verified := classifyAutoOutcome(it.before, after, runErr)
+	item["status"] = status
+	item["verified"] = verified
+	item["progress_after"] = taskProgressText(after)
+	if after != nil {
+		item["claimable"] = after.Claimable
+		if after.Claimed {
+			item["claimed"] = true
+		}
+	}
+
+	switch status {
+	case AutoStatusFailed:
+		item["reason"] = "动作执行失败"
+		item["message"] = runErr.Error()
+	case AutoStatusDone:
+		item["message"] = msg
+	case AutoStatusPartial:
+		item["reason"] = "进度增加但未达标"
+		item["message"] = msg + "；动作已执行，进度 " + taskProgressText(it.before) +
+			" → " + taskProgressText(after) + "（部分完成，未达标）"
+	default: // unverified
+		if after == nil {
+			item["reason"] = "回读失败"
+			item["message"] = msg + "；已执行动作但回读失败，无法确认完成"
+			if readErr != nil {
+				item["read_error"] = readErr.Error()
+				item["message"] = msg + "；已执行动作但回读失败（" + readErr.Error() + "），无法确认完成"
+			}
 		} else {
-			item["status"] = "done"
+			item["reason"] = "动作无错误但进度未变化"
+			item["message"] = msg + "；动作已执行，但进度仍为 " + taskProgressText(after) + "（未证实完成）"
+		}
+	}
+
+	// 进度达标即自动领奖（mp 任务走 mp 口径）。领奖失败不掩盖「任务已完成」，
+	// 但必须留下 claim_error 供前端提示。
+	if status == AutoStatusDone && after != nil && after.Claimable && !after.Claimed {
+		credit, energy, cerr := deps.claim(a, isMPTaskCode(it.code), it.code)
+		if cerr == nil {
 			item["claimed"] = true
 			item["credit"] = credit
 			item["energy"] = energy
-			item["message"] = fmt.Sprintf("已达标，自动领奖 +%d 分 +%d 能", credit, energy)
-			log.Printf("panel: 一键完成 uid=%s code=%s: 已达标自动领奖 +%d分 +%d能", a.UID, t.TaskCode, credit, energy)
+			if credit > 0 || energy > 0 {
+				item["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
+			} else {
+				item["message"] = msg + "；奖励此前已领取"
+			}
+		} else {
+			item["claim_error"] = cerr.Error()
+			item["message"] = msg + "；达标但领奖失败（可在列表手动重试）"
 		}
-		out = append(out, item)
-		time.Sleep(reportGap)
 	}
-	return out
+	log.Printf("panel: 一键完成 uid=%s code=%s action=%s status=%s verified=%v progress %s -> %s",
+		a.UID, it.code, it.action, status, verified, taskProgressText(it.before), taskProgressText(after))
+}
+
+// runPlanClaimOnly 已达标未领取：直接领奖，不再跑行为链路。
+// 领奖成功 = done + verified（达标进度来自本轮真实回读快照）；失败 = failed。
+func (p *Panel) runPlanClaimOnly(a *auth.Auth, deps *autoRunDeps, it autoPlanItem, item map[string]any) {
+	credit, energy, cerr := deps.claim(a, isMPTaskCode(it.code), it.code)
+	item["progress_after"] = taskProgressText(it.before)
+	if cerr != nil {
+		item["status"] = AutoStatusFailed
+		item["verified"] = false
+		item["reason"] = "领奖失败"
+		item["message"] = "已达标但领奖失败: " + cerr.Error()
+		log.Printf("panel: 一键完成 uid=%s code=%s: 已达标但领奖失败: %v", a.UID, it.code, cerr)
+		return
+	}
+	item["status"] = AutoStatusDone
+	item["verified"] = true
+	item["claimed"] = true
+	item["credit"] = credit
+	item["energy"] = energy
+	item["message"] = fmt.Sprintf("已达标，自动领奖 +%d 分 +%d 能", credit, energy)
+	log.Printf("panel: 一键完成 uid=%s code=%s: 已达标自动领奖 +%d分 +%d能", a.UID, it.code, credit, energy)
 }
 
 // accountTaskAutoAll 一键完成该账号全部可自动任务。
@@ -1741,8 +1872,11 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	}()
 	select {
 	case results := <-done:
-		log.Printf("panel: 一键完成可自动任务 uid=%s 共 %d 项", uid, len(results))
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+		summary := autoAllSummary(results)
+		log.Printf("panel: 一键完成可自动任务 uid=%s 共 %d 项 summary=%v", uid, len(results), summary)
+		// summary 只统计真实任务（kind=control 的过程条目不计入），
+		// 保证 total == done+partial+unverified+skipped+locked+manual+failed。
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": summary, "results": results})
 	case <-ctx.Done():
 		// HTTP 侧超时返回，但后台流水线仍在跑——锁在流水线 goroutine 内释放，
 		// 期间重复点击会被 409 挡住，不会出现两轮并发。

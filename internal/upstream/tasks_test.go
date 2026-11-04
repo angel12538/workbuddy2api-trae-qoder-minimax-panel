@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,5 +212,240 @@ func TestParseAcceptResultsFallback(t *testing.T) {
 		if r.Status != "unknown" || !r.Failed() {
 			t.Errorf("缺失 results 应回填 unknown 且算失败，got %q failed=%v", r.Status, r.Failed())
 		}
+	}
+}
+
+// —— C-WB-TASKLIST@1 验收（T7）——
+
+// newTaskListServer 启动只回固定状态/body 的假上游（禁止打真实外网）。
+func newTaskListServer(t *testing.T, status int, body string) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+}
+
+// TestListTasksDetailedEmptyArrayIsLegal 验收点①：data.tasks=[] 是合法空——
+// 必须返回非 nil 空列表 + nil error，且 Items 序列化为 []（不是 null）。
+func TestListTasksDetailedEmptyArrayIsLegal(t *testing.T) {
+	c := newTaskListServer(t, http.StatusOK, `{"code":0,"msg":"OK","data":{"tasks":[]}}`)
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	tl, err := c.ListTasksDetailed(a)
+	if err != nil {
+		t.Fatalf("合法空数组不应报错: %v", err)
+	}
+	if tl == nil {
+		t.Fatal("TaskList 不应为 nil")
+	}
+	if tl.Items == nil {
+		t.Error("Items 必须是非 nil 空切片（否则 JSON 序列化成 null）")
+	}
+	if len(tl.Items) != 0 || tl.TaskCount != 0 {
+		t.Errorf("len/TaskCount = %d/%d, want 0/0", len(tl.Items), tl.TaskCount)
+	}
+	if tl.Source != "cn" {
+		t.Errorf("Source = %q, want cn", tl.Source)
+	}
+	if len(tl.RawKeys) != 1 || tl.RawKeys[0] != "tasks" {
+		t.Errorf("RawKeys = %v, want [tasks]", tl.RawKeys)
+	}
+	raw, err := json.Marshal(tl.Items)
+	if err != nil {
+		t.Fatalf("marshal items: %v", err)
+	}
+	if string(raw) != "[]" {
+		t.Errorf("Items 序列化 = %s, want []（不得是 null）", raw)
+	}
+
+	// 旧接口签名不变；合法空仍返回空列表 + nil。
+	items, err := c.ListTasks(a)
+	if err != nil {
+		t.Fatalf("ListTasks 合法空不应报错: %v", err)
+	}
+	if items == nil || len(items) != 0 {
+		t.Errorf("ListTasks = %#v, want 非 nil 空切片", items)
+	}
+}
+
+// TestListTasksDetailedMissingPayload 验收点②③：data 缺失/null、tasks 缺失/null/
+// 非数组必须返回 ErrTasksPayloadMissing，错误文本含账号标识与 data 顶层键，
+// 且绝不能被当成「0 任务」返回空列表 + nil。
+func TestListTasksDetailedMissingPayload(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		wants []string // 错误文本必须同时包含的片段
+	}{
+		{"data 缺失", `{"code":0,"msg":"OK"}`, []string{"data 缺失"}},
+		{"data 为 null", `{"code":0,"data":null}`, []string{"data 缺失"}},
+		{"data 为空对象（tasks 缺失）", `{"code":0,"data":{}}`, []string{"顶层键=[]", "缺少 tasks"}},
+		{"tasks 缺失但 data 有其他键", `{"code":0,"data":{"progress":1,"tasks_v2":[]}}`, []string{"顶层键=[progress tasks_v2]", "缺少 tasks"}},
+		{"tasks 为 null", `{"code":0,"data":{"tasks":null}}`, []string{"顶层键=[tasks]", "tasks 为 null"}},
+		{"tasks 为字符串", `{"code":0,"data":{"tasks":"oops"}}`, []string{"tasks 类型=string"}},
+		{"tasks 为对象", `{"code":0,"data":{"tasks":{}}}`, []string{"tasks 类型=object"}},
+		{"tasks 为数字", `{"code":0,"data":{"tasks":3}}`, []string{"tasks 类型=number"}},
+		{"data 为数组", `{"code":0,"data":[]}`, []string{"data 类型=array"}},
+		{"data 为字符串", `{"code":0,"data":"oops"}`, []string{"data 类型=string"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTaskListServer(t, http.StatusOK, tc.body)
+			a := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+			tl, err := c.ListTasksDetailed(a)
+			if err == nil {
+				t.Fatalf("want ErrTasksPayloadMissing，got nil（tl=%#v）", tl)
+			}
+			if tl != nil {
+				t.Errorf("错误时必须返回 nil TaskList，got %#v", tl)
+			}
+			if !errors.Is(err, ErrTasksPayloadMissing) {
+				t.Fatalf("errors.Is(err, ErrTasksPayloadMissing) = false，err=%v", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "u1") {
+				t.Errorf("错误文本缺少账号标识 u1: %q", msg)
+			}
+			if !strings.Contains(msg, "tasks") {
+				t.Errorf("错误文本缺少缺失/异常的顶层键 tasks: %q", msg)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(msg, want) {
+					t.Errorf("错误文本缺少 %q: %q", want, msg)
+				}
+			}
+
+			// 旧接口兼容收紧：缺失 payload 必须报错，不得返回空列表。
+			if items, err := c.ListTasks(a); err == nil || items != nil {
+				t.Errorf("ListTasks 应返回错误与 nil，got items=%#v err=%v", items, err)
+			}
+			// mp 口径同样不得吞错。
+			if _, err := c.ListTasksMPDetailed(a); !errors.Is(err, ErrTasksPayloadMissing) {
+				t.Errorf("ListTasksMPDetailed 应返回同一哨兵，got %v", err)
+			}
+		})
+	}
+}
+
+// TestListTasksDetailedHTTPStatusKept 验收点④：401/403/5xx 必须原样保留
+// *Error（状态码 + 上游 body 摘要），不得被包装成 payload 缺失。
+func TestListTasksDetailedHTTPStatusKept(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			c := newTaskListServer(t, status, `{"error":"token expired or forbidden"}`)
+			tl, err := c.ListTasksDetailed(&auth.Auth{AccessToken: "at", UID: "u1"})
+			if err == nil {
+				t.Fatalf("HTTP %d 必须报错", status)
+			}
+			if tl != nil {
+				t.Errorf("错误时 TaskList 应为 nil，got %#v", tl)
+			}
+			var ue *Error
+			if !errors.As(err, &ue) {
+				t.Fatalf("HTTP %d 应返回 *Error，got %T: %v", status, err, err)
+			}
+			if ue.Status != status {
+				t.Errorf("Status = %d, want %d", ue.Status, status)
+			}
+			if !strings.Contains(ue.Msg, "token expired") {
+				t.Errorf("Msg 应保留上游 body 摘要，got %q", ue.Msg)
+			}
+			if errors.Is(err, ErrTasksPayloadMissing) {
+				t.Error("HTTP 错误不得被误报成 payload 缺失")
+			}
+		})
+	}
+}
+
+// TestListTasksDetailedBusinessCodeKept 业务 code != 0 必须保留既有业务错误。
+func TestListTasksDetailedBusinessCodeKept(t *testing.T) {
+	c := newTaskListServer(t, http.StatusOK, `{"code":11140,"msg":"request illegal"}`)
+	_, err := c.ListTasksDetailed(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err == nil {
+		t.Fatal("业务 code != 0 必须报错")
+	}
+	var ue *Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("应返回 *Error，got %T: %v", err, err)
+	}
+	if !strings.Contains(ue.Msg, "code=11140") {
+		t.Errorf("Msg 应包含 code=11140，got %q", ue.Msg)
+	}
+	if errors.Is(err, ErrTasksPayloadMissing) {
+		t.Error("业务错误不得被误报成 payload 缺失")
+	}
+}
+
+// TestListTasksMPDetailedSourceAndHeader mp 口径：Source=mp，且必须带
+// X-Client-Platform: miniprogram（缺头上游不下发 mp 专属任务）。
+func TestListTasksMPDetailedSourceAndHeader(t *testing.T) {
+	var gotPlatform string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPlatform = r.Header.Get("X-Client-Platform")
+		w.Write([]byte(`{"code":0,"msg":"OK","data":{"tasks":[
+			{"task_code":"Sequential_Tasks_1","title":"小程序首对话","progress":{"current":1,"target":1}}
+		]}}`))
+	}))
+	defer srv.Close()
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+
+	tl, err := c.ListTasksMPDetailed(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("mp list: %v", err)
+	}
+	if gotPlatform != mpPlatform {
+		t.Errorf("X-Client-Platform = %q, want %q", gotPlatform, mpPlatform)
+	}
+	if tl.Source != "mp" {
+		t.Errorf("Source = %q, want mp", tl.Source)
+	}
+	if tl.TaskCount != 1 || len(tl.Items) != 1 {
+		t.Errorf("TaskCount/len = %d/%d, want 1/1", tl.TaskCount, len(tl.Items))
+	}
+	if tl.Items[0].TaskCode != "Sequential_Tasks_1" || !tl.Items[0].Claimable {
+		t.Errorf("mp 任务解析异常: %#v", tl.Items[0])
+	}
+}
+
+// TestListTasksDetailedIntlSchema 验收点⑥：国际版 code/level_name 解析不回归
+// （任务码取 code、level_name 非空即清单型、status=claimed 即已领取）。
+func TestListTasksDetailedIntlSchema(t *testing.T) {
+	body := `{"code":0,"msg":"OK","data":{"tasks":[
+		{"task_id":1,"code":"first_chat","title":"完成一次对话","description":"...","level_name":"养虾尝试","status":"available","url":""},
+		{"task_id":3,"code":"wechat_linked","title":"链接微信","description":"...","level_name":"养虾熟手","status":"claimed","url":""}
+	]}}`
+	c := newTaskListServer(t, http.StatusOK, body)
+
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+		t.Fatalf("设置 realm: %v", err)
+	}
+	tl, err := c.ListTasksDetailed(a)
+	if err != nil {
+		t.Fatalf("国际版列表解析: %v", err)
+	}
+	if tl.Source != "global" {
+		t.Errorf("Source = %q, want global", tl.Source)
+	}
+	if tl.TaskCount != 2 || len(tl.Items) != 2 {
+		t.Fatalf("TaskCount/len = %d/%d, want 2/2", tl.TaskCount, len(tl.Items))
+	}
+	t0 := tl.Items[0]
+	if t0.TaskCode != "first_chat" {
+		t.Errorf("TaskCode = %q, want first_chat（国际版任务码在 code）", t0.TaskCode)
+	}
+	if !t0.Checklist || t0.TaskID != 1 || t0.LevelName != "养虾尝试" {
+		t.Errorf("Checklist/TaskID/LevelName = %v/%d/%q，want true/1/养虾尝试",
+			t0.Checklist, t0.TaskID, t0.LevelName)
+	}
+	if t0.Claimed {
+		t.Error("status=available 不应判定为已领取")
+	}
+	if !tl.Items[1].Claimed {
+		t.Error("国际版 status=claimed 应判定为已领取")
 	}
 }
