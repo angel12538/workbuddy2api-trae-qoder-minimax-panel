@@ -453,8 +453,16 @@ func TestPoolRoundTripKeepsIDAndNewFields(t *testing.T) {
 
 // 保存成功后：文件存在、内容是完整 JSON、槽字段已补全、目录里没有临时文件残留。
 // Windows 没有 Unix 权限位（Stat 恒为 0666），只在类 Unix 上断言 0600。
+//
+// ⚠️ 号池文件要放在**尚不存在**的子目录里（2026-11-04 修）：断言的是
+// 「**被测代码**把号池目录建成 0700」，所以目录必须由 writePoolFileAtomically
+// 的 MkdirAll(dir, 0700) 亲手创建。之前直接用 t.TempDir() 的叶子目录 ——
+// 那是 testing 自己用 0777 建的（Linux 上落地成 0755），与被测代码无关，
+// 在 CI（ubuntu）上必然失败。
 func TestSavePoolAtomicWriteFileModeAndContent(t *testing.T) {
-	path := useTempPool(t)
+	base := t.TempDir()
+	path := filepath.Join(base, "pool", "codearts_accounts.json")
+	t.Setenv("CODEARTS_POOL_FILE", path)
 	t.Setenv("CODEARTS_SLOT_ROOT", filepath.Join(t.TempDir(), "slots"))
 
 	if err := SavePool(&Pool{Accounts: []*Account{{ID: "atomic-1", Label: "CodeArts 原子"}}}); err != nil {
