@@ -3,11 +3,13 @@ package ideauth
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Qoder 每日额度的「同一人」判定。
@@ -166,10 +168,16 @@ func qoderPersonVerdict(ownerProbe, holderProbe QoderRewardProbe) string {
 // qoderPersonLinks 文件：记录「这两个号被服务端判定为同一个人」。
 //
 // 为什么要存：判定的代价是打上游（每个号一次只读请求）。面板列表页要显示
-//「这个号与谁共享每日额度」，不该每次刷页面都去问一遍上游；而判定结论在同一天
+// 「这个号与谁共享每日额度」，不该每次刷页面都去问一遍上游；而判定结论在同一天
 // 内不会变（当天只发一份额度），所以记下来即可。
 //
 // 格式：{"links":{"a@x.com":"b@x.com"}}（双向存一份即可，读时按无向图处理）。
+//
+// ⚠️ 写入的结论**可以被反证撤销**：同人判定不是永恒的（账号可能更换手机号/身份，
+// 或最初那次判定本身是误判）。当只读探测明确返回 QoderVerdictOther 时，必须
+// 用 QoderForgetPersonLink 删掉这对历史关系，否则「同人组」会永久保留，
+// 面板继续把两个号算成一组、继续声称「额度被对方领走」——而签到侧已经实测
+// 不是同一个人（D-Q1）。unknown 表示证据不足，**不得**据此清除任何关系。
 var qoderPersonLinksMu sync.Mutex
 
 type qoderPersonLinksFile struct {
@@ -180,9 +188,22 @@ func qoderPersonLinksPath() string {
 	return strings.TrimRight(qoderPoolPath(), "/") + ".person.json"
 }
 
-func loadQoderPersonLinks() map[string]string {
-	qoderPersonLinksMu.Lock()
-	defer qoderPersonLinksMu.Unlock()
+// normalizeQoderPersonLinks 归一化关系表：键值小写去空格，丢弃空值与自环。
+func normalizeQoderPersonLinks(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.ToLower(strings.TrimSpace(v))
+		if k == "" || v == "" || k == v {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// loadQoderPersonLinksLocked 读 person.json（调用方须持 qoderPersonLinksMu）。
+func loadQoderPersonLinksLocked() map[string]string {
 	raw, err := readFileMaybe(qoderPersonLinksPath())
 	if err != nil || raw == "" {
 		return map[string]string{}
@@ -191,41 +212,138 @@ func loadQoderPersonLinks() map[string]string {
 	if json.Unmarshal([]byte(raw), &f) != nil || f.Links == nil {
 		return map[string]string{}
 	}
-	out := make(map[string]string, len(f.Links))
-	for k, v := range f.Links {
-		out[strings.ToLower(strings.TrimSpace(k))] = strings.ToLower(strings.TrimSpace(v))
+	return normalizeQoderPersonLinks(f.Links)
+}
+
+// writeQoderPersonLinksLocked 原子写 person.json（0600，临时文件 + rename）。
+//
+// 复用号池的 atomicWrite：写入与清除关系都必须原子，否则并发签到/扫描读到的
+// 可能是写了一半的关系表。
+func writeQoderPersonLinksLocked(links map[string]string) error {
+	buf, err := json.MarshalIndent(qoderPersonLinksFile{Links: links}, "", "  ")
+	if err != nil {
+		return err
 	}
-	return out
+	return atomicWrite(qoderPersonLinksPath(), buf)
+}
+
+func loadQoderPersonLinks() map[string]string {
+	qoderPersonLinksMu.Lock()
+	defer qoderPersonLinksMu.Unlock()
+	return loadQoderPersonLinksLocked()
 }
 
 // saveQoderPersonLink 记下「a 与 b 是同一个人」（双向）。
-func saveQoderPersonLink(a, b string) {
-	a = strings.ToLower(strings.TrimSpace(a))
-	b = strings.ToLower(strings.TrimSpace(b))
+func saveQoderPersonLink(a, b string) error {
+	a = normalizeQoderEmail(a)
+	b = normalizeQoderEmail(b)
 	if a == "" || b == "" || a == b {
-		return
+		return nil
 	}
 	qoderPersonLinksMu.Lock()
 	defer qoderPersonLinksMu.Unlock()
-	links := map[string]string{}
-	if raw, err := readFileMaybe(qoderPersonLinksPath()); err == nil && raw != "" {
-		var f qoderPersonLinksFile
-		if json.Unmarshal([]byte(raw), &f) == nil && f.Links != nil {
-			for k, v := range f.Links {
-				links[strings.ToLower(strings.TrimSpace(k))] = strings.ToLower(strings.TrimSpace(v))
-			}
-		}
-	}
+	links := loadQoderPersonLinksLocked()
 	if links[a] == b && links[b] == a {
-		return
+		return nil
 	}
 	links[a] = b
 	links[b] = a
-	buf, err := json.MarshalIndent(qoderPersonLinksFile{Links: links}, "", "  ")
-	if err != nil {
+	return writeQoderPersonLinksLocked(links)
+}
+
+// QoderForgetPersonLink 撤销「a 与 b 是同一个人」这条历史判定（原子写盘）。
+//
+// 只在**有反证**时调用（见 qoderForgetPersonLinkIfContradicted）：
+// 服务端明确判定两者不是同一个人，历史 link 就是过期/错误的结论。
+// 没有该关系时直接返回 nil，不写盘、不记日志。
+func QoderForgetPersonLink(a, b string) error {
+	a = normalizeQoderEmail(a)
+	b = normalizeQoderEmail(b)
+	if a == "" || b == "" || a == b {
+		return nil
+	}
+	qoderPersonLinksMu.Lock()
+	defer qoderPersonLinksMu.Unlock()
+	links := loadQoderPersonLinksLocked()
+	changed := false
+	if links[a] == b {
+		delete(links, a)
+		changed = true
+	}
+	if links[b] == a {
+		delete(links, b)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if err := writeQoderPersonLinksLocked(links); err != nil {
+		return fmt.Errorf("撤销同人关系 %s ↔ %s 失败: %w", a, b, err)
+	}
+	// key 按字典序规范化：同一对账号无论调用方传 (a,b) 还是 (b,a)，
+	// 每个自然日都只输出一条日志。
+	pairKey := a + "|" + b
+	if b < a {
+		pairKey = b + "|" + a
+	}
+	qoderNotePersonOnce("forget:"+pairKey,
+		"[qoder-person] 探测明确判定不是同一个人，已撤销历史同人关系：%s ↔ %s", a, b)
+	return nil
+}
+
+// qoderForgetPersonLinkIfContradicted 仅在「探测明确判定不是同一个人」时撤销历史
+// 同人关系，返回是否真的清掉了一条关系。
+//
+// 规则（与 QoderCheckinPoolOrdered / QoderPoolScan 共用，保证两端点口径一致）：
+//   - verdict == other → 有反证，清除这对 link；
+//   - verdict == same_person / owner → 结论一致或相反方向（对方是主人），保留；
+//   - verdict == unknown / 空 → 证据不足，**不清除**（避免把一次网络失败当成反证）。
+//
+// 清除失败只记日志，不阻断签到/扫描（关系表是解释性数据，不是签到前置条件）。
+func qoderForgetPersonLinkIfContradicted(email, other, verdict string) bool {
+	if !strings.EqualFold(strings.TrimSpace(verdict), QoderVerdictOther) {
+		return false
+	}
+	a := normalizeQoderEmail(email)
+	b := normalizeQoderEmail(other)
+	if a == "" || b == "" || a == b {
+		return false
+	}
+	// 先确认这对关系确实存在，避免对不存在的 pair 走一次加锁 + 写盘。
+	if links := loadQoderPersonLinks(); links[a] != b {
+		return false
+	}
+	if err := QoderForgetPersonLink(a, b); err != nil {
+		log.Printf("[qoder-person] 撤销同人关系失败（不影响签到结论）：%v", err)
+		return false
+	}
+	return true
+}
+
+// qoderPersonLogMu/qoderPersonLogDay/qoderPersonLogSet 实现「同一 key 每个自然日
+// 最多一条日志」：关系表的清除属于低频事件，但一次批量扫描会对同一 pair 反复
+// 判定，必须去重，否则日志会被刷屏。
+var (
+	qoderPersonLogMu  sync.Mutex
+	qoderPersonLogDay string
+	qoderPersonLogSet = map[string]bool{}
+)
+
+// qoderNotePersonOnce 同一 key 在 UTC+8 自然日内最多输出一条日志。
+func qoderNotePersonOnce(key, format string, args ...any) {
+	day := time.Now().In(qoderCST).Format("2006-01-02")
+	qoderPersonLogMu.Lock()
+	if qoderPersonLogDay != day {
+		qoderPersonLogDay = day
+		qoderPersonLogSet = map[string]bool{}
+	}
+	if qoderPersonLogSet[key] {
+		qoderPersonLogMu.Unlock()
 		return
 	}
-	_ = writeFileMaybe(qoderPersonLinksPath(), buf)
+	qoderPersonLogSet[key] = true
+	qoderPersonLogMu.Unlock()
+	log.Printf(format, args...)
 }
 
 // QoderSamePersonPeers 返回号池里与指定账号**被服务端判定为同一人**的其它账号。
@@ -309,15 +427,11 @@ func QoderSamePersonGroupSizes(accounts []*QoderSnapshot) map[string]int {
 	return out
 }
 
-// readFileMaybe / writeFileMaybe：薄封装，避免到处判空。
+// readFileMaybe 读小文件（关系表读失败按空表处理，调用方不关心具体错误）。
 func readFileMaybe(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
-}
-
-func writeFileMaybe(path string, b []byte) error {
-	return os.WriteFile(path, b, 0o600)
 }

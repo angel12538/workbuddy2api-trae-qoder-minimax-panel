@@ -1,22 +1,31 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/codearts"
-	"bytes"
-	"sort"
-	"sync"
 )
 
 // codearts_cdp.go CodeArts 通道用的 CDP 小工具（打开标签页 / 导航 / 写 Cookie）。
 // 复用 wsclient + doubaoCDPCall（同一套 CDP 调用与解包逻辑）。
+//
+// 与身份槽指纹的衔接（见 codearts_fingerprint.go）：
+//   - **启动参数**：用 codeartsChromeArgsForAccount(codeartsChromeArgs(...), acc)
+//     取最终参数，按槽追加 --window-size / --lang / --accept-lang，并在
+//     CODEARTS_PROXY_<SlotID> 存在时追加 --proxy-server；
+//   - **注入 Cookie**：用 caSetCookiesAndFingerprint(port, pageWS, acc) 代替裸
+//     caSetCookies，顺序天然是「Cookie → 指纹 → Page.navigate」。
+//   - 无账号 / 无槽身份时两者都退化成原有行为，普通登录成功路径不受影响。
 
 // caOpenTab 新建一个标签页并返回它的 ws 连接。
 func caOpenTab(port int, target string) (*wsConn, error) {
@@ -85,15 +94,17 @@ func caEval(ws *wsConn, expr string) (json.RawMessage, error) {
 	}, 45*time.Second)
 }
 
-// caSetCookies 把号池里的 Cookie 写进浏览器（HttpOnly 也能写）。
-func caSetCookies(port int, cookies []codearts.Cookie) error {
-	if len(cookies) == 0 {
-		return fmt.Errorf("该账号没有 Cookie")
-	}
+// caBrowserConn 连到浏览器级 ws（/json/version 里那个），用于 Storage.setCookies
+// 这类不属于某个页面的域。
+//
+// ⚠️ 浏览器级连接**不能**承载 Emulation.*：Emulation 是页面级域，在 browser
+// target 上是 "not found"；UA/时区必须发到具体页面的 ws（见
+// caSetCookiesAndFingerprint）。
+func caBrowserConn(port int) (*wsConn, error) {
 	cl := &http.Client{Timeout: 6 * time.Second}
 	resp, err := cl.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -101,14 +112,61 @@ func caSetCookies(port int, cookies []codearts.Cookie) error {
 		WS string `json:"webSocketDebuggerUrl"`
 	}
 	if json.Unmarshal(raw, &v) != nil || v.WS == "" {
-		return fmt.Errorf("浏览器调试端口没返回 webSocketDebuggerUrl")
+		return nil, fmt.Errorf("浏览器调试端口没返回 webSocketDebuggerUrl")
 	}
-	ws, err := wsDial(v.WS, 6*time.Second)
+	return wsDial(v.WS, 6*time.Second)
+}
+
+// caSetCookies 把号池里的 Cookie 写进浏览器（HttpOnly 也能写）。
+func caSetCookies(port int, cookies []codearts.Cookie) error {
+	if len(cookies) == 0 {
+		return fmt.Errorf("该账号没有 Cookie")
+	}
+	ws, err := caBrowserConn(port)
 	if err != nil {
 		return err
 	}
 	defer ws.Close()
+	return caSetCookiesOnConn(ws, cookies)
+}
 
+// caSetCookiesAndFingerprint 注入 Cookie + 应用该账号槽的最小指纹。
+//
+// 这是「注入 Cookie 后、导航前」的唯一推荐入口：pageWS 是调用方已连上的**页面**
+// 连接（Emulation 必须发到这里），acc 提供槽身份（SlotID → UA/语言/时区；
+// CODEARTS_PROXY_<SlotID> → 出口，出口在启动参数里生效，见
+// codeartsChromeArgsForAccount）。
+//
+// 语义保证：
+//   - acc 为空 / 没有 Cookie → 与原 caSetCookies 一致地报错，不静默成功；
+//   - pageWS 为 nil（老调用方只传 port）→ 跳过指纹，Cookie 照常注入；
+//   - 指纹应用失败只记日志，不阻断——Cookie 已经写进去了，导航仍应继续。
+//
+// 接入方式：把调用点的 caSetCookies(port, acc.Cookies) 换成
+// caSetCookiesAndFingerprint(port, ws, acc) 即可（ws 用调用方已有的页面连接）。
+func caSetCookiesAndFingerprint(port int, pageWS *wsConn, acc *codearts.Account) error {
+	if acc == nil {
+		return fmt.Errorf("账号为空")
+	}
+	if err := caSetCookies(port, acc.Cookies); err != nil {
+		return err
+	}
+	fp := codeartsFingerprintFor(acc)
+	if fp.empty() || pageWS == nil {
+		return nil
+	}
+	if err := codeartsApplyFingerprint(pageWS, fp); err != nil {
+		log.Printf("[codearts] 槽 %s 指纹应用失败（Cookie 已注入，继续导航）: %v",
+			codeartsSlotIdentityOf(acc), err)
+	}
+	return nil
+}
+
+// caSetCookiesOnConn 在已有的浏览器级连接上写 Cookie。
+func caSetCookiesOnConn(ws *wsConn, cookies []codearts.Cookie) error {
+	if len(cookies) == 0 {
+		return fmt.Errorf("该账号没有 Cookie")
+	}
 	list := make([]map[string]any, 0, len(cookies))
 	for _, c := range cookies {
 		if c.Name == "" {
@@ -128,6 +186,17 @@ func caSetCookies(port int, cookies []codearts.Cookie) error {
 		if item["path"] == "" {
 			item["path"] = "/"
 		}
+		// 必须保留观测到的 expires（C-CA-COOKIE@1）：CDP 不传这个字段时会把
+		// Cookie 当**会话级**处理，注入一轮再读回来全是 -1 —— 这正是
+		// "重新登录/补采也采集不到过期时间"的坑。
+		// 未知来源（旧号池 Expires=0 且 ExpiresKnown=false）不写：宁可让浏览器
+		// 按会话 Cookie 处理，也不伪造一个过期时刻。
+		switch {
+		case c.ExpiresKnown && c.Expires > 0:
+			item["expires"] = c.Expires
+		case c.ExpiresKnown && (c.Session || c.Expires == -1):
+			item["expires"] = -1
+		}
 		list = append(list, item)
 	}
 	buf, _ := json.Marshal(map[string]any{
@@ -144,7 +213,7 @@ func caSetCookies(port int, cookies []codearts.Cookie) error {
 			return err
 		}
 		var r struct {
-			ID    int             `json:"id"`
+			ID    int                       `json:"id"`
 			Error *struct{ Message string } `json:"error"`
 		}
 		if json.Unmarshal(msg, &r) != nil || r.ID != 11 {

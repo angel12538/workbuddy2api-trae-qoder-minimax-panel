@@ -17,9 +17,12 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -105,15 +108,44 @@ type AcceptResult struct {
 	Message  string `json:"message,omitempty"`
 }
 
+// ErrTasksPayloadMissing 上游任务列表响应里没有可用的 data.tasks 数组。
+//
+// 必须与「合法空数组」严格区分：
+//   - `data.tasks=[]` 是**这个账号确实没有任务**（合法空）；
+//   - `data` 缺失 / `data:null` / `tasks` 缺失 / `tasks:null` / `tasks` 非数组
+//     是**上游异常或鉴权失效的信号**，绝不能当成 0 任务。
+//
+// 此前所有形态都被解析成空列表 + nil error，扫描结果因此把 401/空 body/
+// 上游形态变化一律渲染成「没有待办任务 🎉」。调用方用 errors.Is 判定本哨兵，
+// 必须按失败上报（T8 的 scan_ok=false），不得当作空列表。
+var ErrTasksPayloadMissing = errors.New("上游任务列表缺少 tasks 字段")
+
+// TaskList 一次任务列表拉取的结构化结果（C-WB-TASKLIST@1）。
+//
+// 与只返回 []Task 的旧接口相比，这里额外带出诊断信息：Source 标识口径
+// （cn|global|mp），RawKeys 是 data 对象的顶层键（上游字段改名/包了一层时
+// 一眼看出），TaskCount 便于对照 len(Items) 与前端字段映射。
+type TaskList struct {
+	Items     []Task   `json:"items"`
+	Source    string   `json:"source"` // cn|global|mp
+	RawKeys   []string `json:"raw_keys"`
+	TaskCount int      `json:"task_count"`
+}
+
 // ListTasks 拉取全量任务列表（默认口径，无端标记头）。
 // 响应形如 data.tasks[]，元素字段随任务类型变化（progress 可能是 {current,target} 或平铺），
 // 这里做宽松解析：两种形状都尝试。
+//
+// 行为收紧（C-WB-TASKLIST@1）：payload 缺失/为 null 时返回
+// ErrTasksPayloadMissing，不再静默返回空列表；合法空数组仍返回
+// 非 nil 的空 []Task 与 nil error。需要 Source/RawKeys 诊断信息时用
+// ListTasksDetailed。
 func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
-	data, err := c.growthJSON(a, http.MethodGet, tasksListPath, nil)
+	tl, err := c.ListTasksDetailed(a)
 	if err != nil {
 		return nil, err
 	}
-	return parseGrowthTasks(data)
+	return tl.Items, nil
 }
 
 // ListTasksMP 拉取小程序口径的任务列表（X-Client-Platform: miniprogram）。
@@ -122,12 +154,40 @@ func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
 // task not found，上游 task_runner 实测）。**实测 mp 列表是默认口径的超集**
 // （含 RichMeow/Model_chat 等常规任务 + wb_wechat_oa_subscribe_task 等 mp 专属），
 // 合并时调用方须按 task_code 去重。
+//
+// 行为收紧同 ListTasks：payload 缺失返回 ErrTasksPayloadMissing。
 func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
+	tl, err := c.ListTasksMPDetailed(a)
+	if err != nil {
+		return nil, err
+	}
+	return tl.Items, nil
+}
+
+// ListTasksDetailed 拉取默认口径任务列表，返回带诊断信息的 TaskList。
+//
+// 错误语义：
+//   - HTTP 401/403/5xx 与业务 code != 0：原样返回既有 *Error（含状态码与
+//     body 摘要），不包装、不吞掉；
+//   - data 缺失/`null`、tasks 缺失/`null`/非数组：返回 ErrTasksPayloadMissing，
+//     错误文本含账号标识与 data 顶层键；
+//   - data.tasks=[]：返回 Items=[]Task{}（非 nil）、TaskCount=0、nil error。
+func (c *Client) ListTasksDetailed(a *auth.Auth) (*TaskList, error) {
+	data, err := c.growthJSON(a, http.MethodGet, tasksListPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	return parseGrowthTasksDetailed(data, taskListSource(a), taskListAccount(a))
+}
+
+// ListTasksMPDetailed 拉取小程序口径任务列表，返回 TaskList（Source=mp）。
+// 错误语义与 ListTasksDetailed 完全一致。
+func (c *Client) ListTasksMPDetailed(a *auth.Auth) (*TaskList, error) {
 	data, err := c.growthJSONMP(a, http.MethodGet, tasksListPath, nil)
 	if err != nil {
 		return nil, err
 	}
-	return parseGrowthTasks(data)
+	return parseGrowthTasksDetailed(data, "mp", taskListAccount(a))
 }
 
 // growthJSONMP 发 growth 域请求（小程序口径：叠加 X-Client-Platform: miniprogram）
@@ -192,95 +252,219 @@ func parseClaimReward(data json.RawMessage) (credit, energy int64, err error) {
 	return resp.Credit, resp.Energy, nil
 }
 
-// parseGrowthTasks 解析 growth 任务列表 data.tasks[]（国服 / 国际版两套 schema 共用）。
+// taskWire 上游单条任务的原始字段（国服 / 国际版两套 schema 的并集）。
+//
+// 从 parseGrowthTasks 的内联结构提取为命名类型，只为实现「先验证外层
+// data/tasks 形态、再解析数组元素」的两段式解析；字段与 JSON 标签逐字保持不变。
+type taskWire struct {
+	// 国服字段
+	TaskCode     string          `json:"task_code"`
+	Title        string          `json:"title"`
+	Description  string          `json:"description"`
+	TaskDesc     string          `json:"task_desc"`
+	RewardCredit int64           `json:"reward_credit"` // 上游实际字段名（reward_ 前缀）
+	RewardEnergy int64           `json:"reward_energy"`
+	HasReward    bool            `json:"has_reward"`
+	RewardBuddy  bool            `json:"reward_buddy"`
+	TaskType     string          `json:"task_type"`
+	Tag          string          `json:"tag"`
+	JumpURL      string          `json:"jump_url"`
+	Locked       bool            `json:"locked"`
+	UnlockAt     string          `json:"unlock_at"`
+	AcceptStatus string          `json:"accept_status"`
+	Status       string          `json:"status"`
+	Target       int64           `json:"target"`
+	Current      int64           `json:"current"`
+	Progress     json.RawMessage `json:"progress"`
+	// 国际版字段（任务码在 code，另有 task_id / level_name / url）
+	Code      string `json:"code"`
+	TaskID    int64  `json:"task_id"`
+	LevelName string `json:"level_name"`
+	URL       string `json:"url"`
+}
+
+// toTask 把上游原始字段归一成对外视图。
 //
 // 两套 schema 的差异见 Task 结构体注释。这里做**双字段兼容**：任务码取
 // task_code，缺失时回落 code（国际版）；并读 task_id / level_name / url。
 // 判定清单型用 level_name 非空——国服任务不带该字段，不会误判。
-func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
-	var resp struct {
-		Tasks []struct {
-			// 国服字段
-			TaskCode     string          `json:"task_code"`
-			Title        string          `json:"title"`
-			Description  string          `json:"description"`
-			TaskDesc     string          `json:"task_desc"`
-			RewardCredit int64           `json:"reward_credit"` // 上游实际字段名（reward_ 前缀）
-			RewardEnergy int64           `json:"reward_energy"`
-			HasReward    bool            `json:"has_reward"`
-			RewardBuddy  bool            `json:"reward_buddy"`
-			TaskType     string          `json:"task_type"`
-			Tag          string          `json:"tag"`
-			JumpURL      string          `json:"jump_url"`
-			Locked       bool            `json:"locked"`
-			UnlockAt     string          `json:"unlock_at"`
-			AcceptStatus string          `json:"accept_status"`
-			Status       string          `json:"status"`
-			Target       int64           `json:"target"`
-			Current      int64           `json:"current"`
-			Progress     json.RawMessage `json:"progress"`
-			// 国际版字段（任务码在 code，另有 task_id / level_name / url）
-			Code      string `json:"code"`
-			TaskID    int64  `json:"task_id"`
-			LevelName string `json:"level_name"`
-			URL       string `json:"url"`
-		} `json:"tasks"`
+func (t taskWire) toTask() Task {
+	cur, tgt := t.Current, t.Target
+	// progress 可能是 {current,target} 对象（实测口径），覆盖平铺字段。
+	if len(t.Progress) > 0 && string(t.Progress) != "null" {
+		var pr struct {
+			Current int64 `json:"current"`
+			Target  int64 `json:"target"`
+		}
+		if json.Unmarshal(t.Progress, &pr) == nil && (pr.Target > 0 || pr.Current > 0) {
+			cur, tgt = pr.Current, pr.Target
+		}
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	// 任务码：国际版放在 code。缺 task_code 时回落，否则前端拿到空码，
+	// 接受/领奖请求都会提交空字符串（历史上表现为「点按钮没反应」）。
+	code := t.TaskCode
+	if code == "" {
+		code = t.Code
+	}
+	claimed := t.AcceptStatus == "claimed"
+	// 清单型（国际版成长路径）：level_name 非空是可靠判据（国服无此字段）。
+	checklist := t.LevelName != ""
+	if checklist && t.Status == "claimed" {
+		claimed = true // 国际版把「已领取」放在 status 里
+	}
+	return Task{
+		TaskCode:     code,
+		Title:        t.Title,
+		Description:  t.Description,
+		TaskDesc:     t.TaskDesc,
+		Credit:       t.RewardCredit,
+		Energy:       t.RewardEnergy,
+		HasReward:    t.HasReward,
+		RewardBuddy:  t.RewardBuddy,
+		TaskType:     t.TaskType,
+		Tag:          t.Tag,
+		JumpURL:      t.JumpURL,
+		Locked:       t.Locked,
+		UnlockAt:     t.UnlockAt,
+		Target:       tgt,
+		Current:      cur,
+		AcceptStatus: t.AcceptStatus,
+		Status:       t.Status,
+		Claimable:    !claimed && tgt > 0 && cur >= tgt,
+		Claimed:      claimed,
+		TaskID:       t.TaskID,
+		LevelName:    t.LevelName,
+		URL:          t.URL,
+		Checklist:    checklist,
+	}
+}
+
+// parseGrowthTasks 解析 growth 任务列表 data.tasks[]（默认口径，供既有测试与
+// 内部调用复用）。它等价于 parseGrowthTasksDetailed(data, "cn", "") 的
+// Items，保留是为兼容既有测试入口；业务路径请用 ListTasksDetailed。
+//
+// 行为收紧同 ListTasks：缺失/null 返回 ErrTasksPayloadMissing。
+func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
+	tl, err := parseGrowthTasksDetailed(data, "cn", "")
+	if err != nil {
 		return nil, err
 	}
-	out := make([]Task, 0, len(resp.Tasks))
-	for _, t := range resp.Tasks {
-		cur, tgt := t.Current, t.Target
-		// progress 可能是 {current,target} 对象（实测口径），覆盖平铺字段。
-		if len(t.Progress) > 0 && string(t.Progress) != "null" {
-			var pr struct {
-				Current int64 `json:"current"`
-				Target  int64 `json:"target"`
-			}
-			if json.Unmarshal(t.Progress, &pr) == nil && (pr.Target > 0 || pr.Current > 0) {
-				cur, tgt = pr.Current, pr.Target
-			}
-		}
-		// 任务码：国际版放在 code。缺 task_code 时回落，否则前端拿到空码，
-		// 接受/领奖请求都会提交空字符串（历史上表现为「点按钮没反应」）。
-		code := t.TaskCode
-		if code == "" {
-			code = t.Code
-		}
-		claimed := t.AcceptStatus == "claimed"
-		// 清单型（国际版成长路径）：level_name 非空是可靠判据（国服无此字段）。
-		checklist := t.LevelName != ""
-		if checklist && t.Status == "claimed" {
-			claimed = true // 国际版把「已领取」放在 status 里
-		}
-		out = append(out, Task{
-			TaskCode:     code,
-			Title:        t.Title,
-			Description:  t.Description,
-			TaskDesc:     t.TaskDesc,
-			Credit:       t.RewardCredit,
-			Energy:       t.RewardEnergy,
-			HasReward:    t.HasReward,
-			RewardBuddy:  t.RewardBuddy,
-			TaskType:     t.TaskType,
-			Tag:          t.Tag,
-			JumpURL:      t.JumpURL,
-			Locked:       t.Locked,
-			UnlockAt:     t.UnlockAt,
-			Target:       tgt,
-			Current:      cur,
-			AcceptStatus: t.AcceptStatus,
-			Status:       t.Status,
-			Claimable:    !claimed && tgt > 0 && cur >= tgt,
-			Claimed:      claimed,
-			TaskID:       t.TaskID,
-			LevelName:    t.LevelName,
-			URL:          t.URL,
-			Checklist:    checklist,
-		})
+	return tl.Items, nil
+}
+
+// parseGrowthTasksDetailed 两段式解析 growth 列表响应 data，并区分「合法空」与
+// 「payload 缺失」。
+//
+// 第一段只做形态校验（data 是否为对象、data.tasks 是否存在/为 null/是否为数组），
+// 第二段才解析元素。这样 `data.tasks=[]` 与 `data={}`/`tasks:null`/`tasks:"x"`
+// 不会再被同一段 json.Unmarshal 的零值语义抹平。
+//
+// account 仅用于错误文本定位账号（空串时退化为 unknown），不参与解析。
+func parseGrowthTasksDetailed(data json.RawMessage, source, account string) (*TaskList, error) {
+	if account == "" {
+		account = "unknown"
 	}
-	return out, nil
+	raw := bytes.TrimSpace(data)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, fmt.Errorf("%w: 账号=%s data 缺失（null/空，缺少 tasks）", ErrTasksPayloadMissing, account)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		// data 不是 JSON 对象（数组/字符串/数字等）：同样是不可用的列表载荷。
+		return nil, fmt.Errorf("%w: 账号=%s data 类型=%s（期望对象）",
+			ErrTasksPayloadMissing, account, jsonValueType(raw))
+	}
+	if obj == nil {
+		// 防御性兜底：Unmarshal("null") 已在上方拦截，正常不可达。
+		return nil, fmt.Errorf("%w: 账号=%s data 缺失（null）", ErrTasksPayloadMissing, account)
+	}
+	keys := sortedRawKeys(obj)
+	tasksRaw, ok := obj["tasks"]
+	if !ok {
+		return nil, fmt.Errorf("%w: 账号=%s data 顶层键=%v（缺少 tasks）",
+			ErrTasksPayloadMissing, account, keys)
+	}
+	trimmed := bytes.TrimSpace(tasksRaw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, fmt.Errorf("%w: 账号=%s data 顶层键=%v（tasks 为 null）",
+			ErrTasksPayloadMissing, account, keys)
+	}
+	if trimmed[0] != '[' {
+		return nil, fmt.Errorf("%w: 账号=%s data 顶层键=%v（tasks 类型=%s，期望数组）",
+			ErrTasksPayloadMissing, account, keys, jsonValueType(trimmed))
+	}
+	var wires []taskWire
+	if err := json.Unmarshal(trimmed, &wires); err != nil {
+		return nil, fmt.Errorf("%w: 账号=%s data 顶层键=%v（tasks 数组解析失败: %v）",
+			ErrTasksPayloadMissing, account, keys, err)
+	}
+	items := make([]Task, 0, len(wires))
+	for _, w := range wires {
+		items = append(items, w.toTask())
+	}
+	return &TaskList{
+		Items:     items,
+		Source:    source,
+		RawKeys:   keys,
+		TaskCount: len(items),
+	}, nil
+}
+
+// sortedRawKeys 返回 data 对象顶层键的稳定排序副本（诊断输出必须可复现）。
+func sortedRawKeys(obj map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// jsonValueType 按 JSON 首字节粗判类型，仅用于错误文本（不做完整解析）。
+func jsonValueType(raw []byte) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return "empty"
+	}
+	switch raw[0] {
+	case '{':
+		return "object"
+	case '[':
+		return "array"
+	case '"':
+		return "string"
+	case 't', 'f':
+		return "bool"
+	case 'n':
+		return "null"
+	default:
+		return "number"
+	}
+}
+
+// taskListSource 返回默认口径的 Source 标签（cn|global）。
+//
+// 用 ResolveRealm 而非 Realm()：后者受 global 逃生门影响，逃生门打开时会把
+// global 账号标成 cn，让诊断信息失真；这里只做标识判定，不受路由锁影响。
+func taskListSource(a *auth.Auth) string {
+	if a == nil {
+		return "cn"
+	}
+	return auth.ResolveRealm(a.RealmStored(), a.DomainValue())
+}
+
+// taskListAccount 返回错误文本里的账号标识：UID 优先，其次昵称，最后 unknown。
+func taskListAccount(a *auth.Auth) string {
+	if a == nil {
+		return "unknown"
+	}
+	if uid := strings.TrimSpace(a.UID); uid != "" {
+		return uid
+	}
+	if nick := strings.TrimSpace(a.Nickname); nick != "" {
+		return nick
+	}
+	return "unknown"
 }
 
 // GrowthProfile 拉取国际版成长路径总览（GET /v2/activity/growth/profile）。

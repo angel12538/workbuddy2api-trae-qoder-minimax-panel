@@ -2,10 +2,7 @@ package panel
 
 import (
 	"encoding/json"
-	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -136,28 +133,5 @@ const probeDumpJS = `(() => {
   return JSON.stringify({ text, items: items.slice(0,400), links: links.slice(0,200) });
 })()`
 
-// launchChromeHeadless 起一个无头浏览器，返回清理函数。
-//
-// ⚠️ 必须把清理函数用 defer 掉：go test 结束时子进程会被**遗留**（孤儿
-// Chrome），一个个占着 9333-9341 调试端口，还吃内存 —— 实测漏了 97 个
-// 进程，最后把网关自己挤挂了。
-func launchChromeHeadless(chrome string, port int, dir string) (func(), error) {
-	cmd := exec.Command(chrome,
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir="+dir, "--no-first-run", "--no-default-browser-check",
-		"--headless=new", "--disable-gpu", "--window-size=1600,1000", "about:blank")
-	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	exited := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(exited) }()
-	cleanup := func() {
-		_ = cmd.Process.Kill()
-		select {
-		case <-exited:
-		case <-time.After(8 * time.Second):
-		}
-	}
-	return cleanup, nil
-}
+// launchChromeHeadless 已挪到生产代码（codearts_auto.go）：静默续期也要起无头浏览器，
+// 测试与生产共用同一份实现，避免两边各写一遍、各踩一遍孤儿进程的坑。

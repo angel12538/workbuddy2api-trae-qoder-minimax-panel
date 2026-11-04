@@ -70,6 +70,14 @@ body {
 .ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
 
 /* 任务中心 */
+/* 扫描错误横幅：scan_ok=false 时替代空态渲染，错误必须一眼可见 */
+.scan-error {
+  margin: 10px 0; padding: 10px 12px; border: 1px solid var(--bad);
+  border-left-width: 3px; border-radius: 8px; background: var(--bad-soft);
+  color: var(--bad); font-size: 12.5px;
+}
+.scan-error .nm { font-weight: 600; margin-bottom: 4px; }
+.scan-error .ln { font: 12px/1.6 var(--mono); color: var(--ink-2); word-break: break-all; }
 .tc-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 42px 16px; color: var(--ink-3); }
 .tc-empty svg { width: 42px; height: 42px; opacity: .55; margin-bottom: 6px; }
 .tc-empty .t { font-weight: 550; color: var(--ink-2); }
@@ -141,6 +149,20 @@ body {
 .trow .credits { font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .trow .err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); margin-top: -4px; }
 .thead { display: grid; grid-template-columns: minmax(150px, 230px) 1fr auto auto; gap: 14px; padding: 8px 16px; font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft); }
+/* CodeArts 账号行：默认只有一行摘要（账号 · 状态 · 今日积分），点行才展开技术详情。
+   正常状态不出现按钮与长文案 —— 这是「默认不打扰」的落地点。 */
+#ckCaList .ca-row { display: block; padding: 11px 16px; cursor: pointer; }
+#ckCaList .ca-sum { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#ckCaList .ca-sum .ca-name { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 340px; }
+#ckCaList .ca-sum .ca-today { font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+#ckCaList .ca-sum .ca-sep { color: var(--ink-3); }
+#ckCaList .ca-link { font-size: 12px; color: var(--ink-3); text-decoration: underline; cursor: pointer; }
+#ckCaList .ca-link:hover { color: var(--ink-2); }
+#ckCaList .ca-detail { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line-soft); }
+#ckCaList .ca-kv { display: flex; gap: 10px; font-size: 12px; line-height: 1.75; }
+#ckCaList .ca-k { min-width: 150px; flex: none; color: var(--ink-3); }
+#ckCaList .ca-v { color: var(--ink-2); font-family: var(--mono); word-break: break-all; }
+#ckCaList .ca-acts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 /* 统一账号行：账号 / 状态 / 操作（Qoder / Trae / WorkBuddy 三块共用，界面一致） */
 .ahead { display: grid; grid-template-columns: minmax(170px, 1fr) auto auto; gap: 14px; padding: 8px 16px; font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft); }
 .arow { display: grid; grid-template-columns: minmax(170px, 1fr) auto auto; gap: 14px; align-items: center; padding: 12px 16px; }
@@ -714,6 +736,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="qbar"><i id="qBarFill"></i></div>
           <span class="note" id="qProgText"></span>
         </div>
+        <!-- 扫描错误横幅：scan_ok=false / errors[] 非空时显示，错误态不渲染空态 -->
+        <div class="scan-error" id="tcScanErr" hidden></div>
         <div class="tc-empty" id="tcEmpty">
           <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <rect x="8" y="6" width="24" height="36" rx="3"/>
@@ -773,6 +797,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </header>
         <div class="state" id="ckQoderState"><span class="dots">加载中</span></div>
         <div id="ckQoderList"></div>
+        <!-- 一键签到的七相分桶结果（claimed/already/blocked/pending/failed/login_required/error） -->
+        <div id="ckQoderBuckets"></div>
       </div>
 
       <div class="box">
@@ -1441,6 +1467,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <tbody id="taskBody"></tbody>
         </table>
       </div>
+      <!-- 一键完成逐项明细：只有 verified=true 才显示「完成（已验证）」 -->
+      <div id="taskAutoResult" hidden></div>
     </div>
     <footer>
       <span class="grow"></span>
@@ -1448,6 +1476,57 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button id="btnTaskAutoAll" class="primary">一键完成可自动任务</button>
       <button id="btnTaskReload">重新查询</button>
       <button id="btnCloseTask">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Qoder 设备 / 出口设置（C-QD-EGRESS@1）：每账号独立设备指纹 / 出口 / profile -->
+<div class="veil" id="qdEgressVeil">
+  <div class="dlg" style="width:660px">
+    <header>
+      <h3>Qoder 设备 / 出口</h3>
+      <div class="hint">为单个账号配置独立设备指纹、出口代理与浏览器 profile；未配置时与现网一致（真实设备 + 进程默认网络）。</div>
+    </header>
+    <div class="body">
+      <div id="qdEgressBody"></div>
+      <div class="state err" id="qdEgressErr" hidden></div>
+      <label class="fld"><span class="lb">邮箱</span>
+        <input type="text" id="qdEgressEmail" readonly>
+      </label>
+      <label class="fld"><span class="lb">设备模式（device_mode）</span>
+        <select id="qdEgressMode">
+          <option value="real">real（真实设备，默认）</option>
+          <option value="derived">derived（按邮箱确定性派生）</option>
+        </select>
+        <span class="hint">derived 是隔离实验能力，不代表上游一定认可该设备</span>
+      </label>
+      <label class="fld"><span class="lb">出口代理（proxy_url，可空）</span>
+        <input type="text" id="qdEgressProxy" placeholder="http://127.0.0.1:1080">
+        <span class="hint">留空 = 进程默认网络；仅支持 http/https</span>
+      </label>
+      <label class="fld"><span class="lb">浏览器 profile 目录（可空）</span>
+        <input type="text" id="qdEgressProfile" placeholder="留空 = 按邮箱隔离的默认目录">
+      </label>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="xs" id="btnQdEgressClose">关闭</button>
+      <button class="xs primary" id="btnQdEgressSave">保存</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Qoder 领取历史（C-QD-LEDGER@1）：最近 7 天逐日账本 -->
+<div class="veil" id="qdHistVeil">
+  <div class="dlg" style="width:760px">
+    <header>
+      <h3>Qoder 领取历史 <span class="hint" id="qdHistNote"></span></h3>
+      <div class="hint">最近 7 天每次尝试的 phase / credits / 额度归属 / 策略；blocked 也会记录用于审计。</div>
+    </header>
+    <div class="body" id="qdHistBody"></div>
+    <footer>
+      <span class="grow"></span>
+      <button class="xs primary" id="btnQdHistClose">关闭</button>
     </footer>
   </div>
 </div>

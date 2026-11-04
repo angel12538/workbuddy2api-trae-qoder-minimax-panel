@@ -41,17 +41,40 @@ $('btnTheme').onclick = () => {
 applyTheme();
 
 /* ── 请求 ─────────────────────────────────────────────────────────── */
+// 在途请求合并：同一个 path 的并发请求共用**同一个** Promise。
+//
+// 为什么必须做（实测 2026-11-04 浏览器 Network 面板）：
+// 签到池首屏会同时跑 loadQoderPool / loadIdeaTasks / loadPoolIdea 三条渲染链，
+// 它们各自独立地请求 qoder/checkin-status、qoder/usage、workbuddy/usage ——
+// 于是同一个慢接口被并发打了 4~5 次（qoder/usage 4 次、workbuddy/usage 3 次），
+// 而每个请求都会真打上游。最慢的 checkin-status 2.6s 就把首屏卡住。
+// 合并在途请求后，同一路径只打一次上游，首屏等待时间直接砍掉一大截。
+const _apiInflight = new Map();
+
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   const k = localStorage.getItem(LS_KEY);
   // fetch 的请求头只允许 ISO-8859-1；密钥含中文等字符时跳过，避免整个请求抛异常。
   if (k && /^[\x00-\xff]*$/.test(k)) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-  return d;
+  // 只合并「读」请求：写操作（签到/切换/删除）必须各自独立发出。
+  const mergeable = !opts.method || String(opts.method).toUpperCase() === 'GET';
+  if (mergeable) {
+    const inflight = _apiInflight.get(path);
+    if (inflight) return inflight;
+  }
+  const p = (async () => {
+    const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    return d;
+  })();
+  if (mergeable) {
+    _apiInflight.set(path, p);
+    try { return await p; } finally { _apiInflight.delete(path); }
+  }
+  return p;
 }
 function toast(msg, cls) {
   const el = document.createElement('div');
@@ -2112,6 +2135,9 @@ const AUTO_TASKS = {
 function openTasks(uid) {
   taskUID = uid;
   $('taskWho').textContent = uid.slice(0, 16);
+  // 每次打开弹窗清空上一轮「一键完成明细」，避免把旧结果当成新结果。
+  const autoRes = $('taskAutoResult');
+  if (autoRes) { autoRes.hidden = true; autoRes.innerHTML = ''; }
   $('taskVeil').classList.add('on');
   $('btnTaskReload').hidden = false;
   loadTasks();
@@ -2143,6 +2169,84 @@ $('btnTaskAcceptAll').onclick = async () => {
 // 等）每条对话事件之间必须间隔约 45 秒（上游反作弊：数秒级连发会被判无效整体
 // 回滚），Tasks_6「10 次对话」单项就要约 8 分钟。后端按待办量动态放宽超时，
 // 前端把已用时长打在按钮上——长时间「执行中」是正常的，不要当卡死关掉。
+/* 一键完成结果状态（C-WB-AUTO@1 / C-UI-REPAIR@1）：
+   只有 done 且 verified !== false 才算“完成”。partial/unverified/manual/
+   locked/skipped/failed 必须分别报告，任何非 done 都不能显示成完成。 */
+const AUTO_STATUS_TEXT = {
+  done: '完成（已验证）', partial: '部分完成', unverified: '未证实',
+  manual: '需真实操作', locked: '未解锁', skipped: '跳过', failed: '失败',
+};
+
+function normalizeAutoStatus(x) {
+  let st = String((x && x.status) || '');
+  if (st === 'error') st = 'failed';
+  // 新后端一定带 verified；老后端没有该字段时按 done 处理（不凭空降级）。
+  if (st === 'done' && x && x.verified === false) st = 'unverified';
+  if (!AUTO_STATUS_TEXT[st]) st = 'unverified';
+  return st;
+}
+
+// autoCounts 优先读后端 summary（C-WB-AUTO@1）；缺失时从 results 兜底统计。
+// 过程条目（kind=control：批量接受/成长路径）不计入 summary。
+function autoCounts(r) {
+  const sum = (r && r.summary) || null;
+  const rs = (r && r.results) || [];
+  const c = { total: 0, done: 0, partial: 0, unverified: 0, manual: 0, locked: 0, skipped: 0, failed: 0 };
+  if (sum) {
+    for (const k of Object.keys(c)) {
+      if (k !== 'total' && typeof sum[k] === 'number') c[k] = sum[k];
+    }
+    c.total = typeof sum.total === 'number' ? sum.total
+      : (c.done + c.partial + c.unverified + c.manual + c.locked + c.skipped + c.failed);
+    return c;
+  }
+  for (const x of rs) {
+    if (!x || x.kind === 'control') continue;
+    c[normalizeAutoStatus(x)]++;
+    c.total++;
+  }
+  return c;
+}
+
+function autoSummaryText(r, secs) {
+  const c = autoCounts(r);
+  const parts = ['完成 ' + c.done + ' 项（已验证）'];
+  if (c.partial) parts.push('部分完成 ' + c.partial + ' 项');
+  if (c.unverified) parts.push('未证实 ' + c.unverified + ' 项');
+  if (c.manual) parts.push('需手动 ' + c.manual + ' 项');
+  if (c.locked) parts.push('未解锁 ' + c.locked + ' 项');
+  if (c.skipped) parts.push('跳过 ' + c.skipped + ' 项');
+  if (c.failed) parts.push('失败 ' + c.failed + ' 项');
+  return '执行完成（' + secs + 's）：' + parts.join(' · ');
+}
+
+// renderAutoResults 在积分任务弹窗里逐项展示状态/原因/前后进度。
+function renderAutoResults(r) {
+  const box = $('taskAutoResult');
+  if (!box) return;
+  const rs = (r && r.results) || [];
+  if (!rs.length) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  const rows = rs.filter(x => x && x.kind !== 'control').map(x => {
+    const st = normalizeAutoStatus(x);
+    const prog = (x.progress_before || '—') + ' → ' + (x.progress_after || '—');
+    const verified = st === 'done' ? '已验证' : (st === 'unverified' ? '未证实' : '');
+    return '<div class="qrow" data-auto-code="' + esc(x.task_code || '') + '" data-auto-status="' + esc(st) + '">' +
+      '<span class="code">' + esc(x.task_code || '') + '</span>' +
+      '<span class="name"><span class="t">' + esc(x.desc || x.task_code || '') + '</span>' +
+      (verified ? '<span class="tag ' + (st === 'done' ? 'ok' : 'mute') + '">' + verified + '</span>' : '') + '</span>' +
+      '<span class="prog">' + esc(prog) + '</span>' +
+      '<span class="st">' + esc(AUTO_STATUS_TEXT[st] || st) + '</span>' +
+      '<span class="msg">' + esc(x.message || '') + '</span>' +
+      '</div>';
+  }).join('');
+  box.innerHTML = '<div class="note" style="padding:8px 0 4px">一键完成明细（只有 verified=true 才计为完成）</div>' + rows;
+}
+
 $('btnTaskAutoAll').onclick = async () => {
   if (!taskUID) return;
   const btn = $('btnTaskAutoAll');
@@ -2156,22 +2260,11 @@ $('btnTaskAutoAll').onclick = async () => {
   const tick = setInterval(() => { btn.textContent = label(); }, 1000);
   try {
     const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all', { method: 'POST' });
-    const rs = r.results || [];
-    const okN = rs.filter(x => x.status === 'done').length;
-    const skipN = rs.filter(x => x.status === 'skipped').length;
-    const errN = rs.filter(x => x.status === 'error').length;
-    const lockN = rs.filter(x => x.status === 'locked').length;
-    const manN = rs.filter(x => x.status === 'manual').length;
+    const c = autoCounts(r);
     const secs = Math.round((Date.now() - t0) / 1000);
-    // 未解锁项不是失败：上游把任务真锁到某个时刻（accept 直接回 task locked until），
-    // 到点后由面板的成长队列自动执行，所以单独提示、不计入「失败」。
-    // 「需手动」也不是失败：那是关注公众号 / 真实捐款 / 国际版成长路径这类**网关
-    // 做不了真实行为**的任务，如实列出来（否则用户只看到 25 项全完成、却在任务中心
-    // 看到还有剩余，会以为两边对不上）。
-    const lockTip = lockN ? `，${lockN} 项未解锁（到点自动执行）` : '';
-    const manTip = manN ? `，${manN} 项需真实操作（面板做不了）` : '';
-    toast(`执行完成（${secs}s）：成功 ${okN} 项，跳过 ${skipN} 项${lockTip}${manTip}${errN ? '，失败 ' + errN + ' 项' : ''}`,
-      errN ? 'err' : 'ok');
+    // toast 必须同时报告 failed/partial/unverified/manual；未证实绝不计入成功。
+    toast(autoSummaryText(r, secs), (c.failed || c.partial || c.unverified) ? 'warn' : 'ok');
+    renderAutoResults(r);
     console.log('auto_all results:', r.results);
   } catch (e) { toast(e.message, 'err'); }
   finally {
@@ -2785,6 +2878,80 @@ $('btnVcRefresh').onclick = loadSchoolVouchers;
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
+/* 扫描结果错误可见（C-WB-SCAN@1 / C-UI-REPAIR@1）：
+   scan_ok=false 时必须渲染 .scan-error 横幅，且**禁止**渲染空态。
+   老后端没有 scan_ok/errors 时，退回到 accounts[].growth_error / mp_error /
+   auth_error —— 只要有一条真实错误，就不能显示“没有待办任务”。 */
+function scanErrors(d) {
+  const out = [];
+  for (const e of ((d && d.errors) || [])) {
+    out.push({ uid: e.uid || '', scope: e.scope || '', message: e.message || '' });
+  }
+  for (const a of ((d && d.accounts) || [])) {
+    const uid = a.uid || a.nickname || '';
+    if (a.growth_error) out.push({ uid: uid, scope: 'growth', message: a.growth_error });
+    if (a.mp_error) out.push({ uid: uid, scope: 'mp', message: a.mp_error });
+    if (a.auth_error) out.push({ uid: uid, scope: 'auth', message: a.auth_error });
+  }
+  const seen = new Set();
+  return out.filter(e => {
+    const k = e.uid + '\u0000' + e.scope + '\u0000' + e.message;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function scanHasError(d) {
+  if (d && d.scan_ok === false) return true;
+  if (((d && d.errors) || []).length) return true;
+  for (const a of ((d && d.accounts) || [])) {
+    if (a.scan_state === 'error' || a.growth_error || a.mp_error || a.auth_error) return true;
+  }
+  return false;
+}
+
+function renderScanErrors(d) {
+  const box = $('tcScanErr');
+  if (!box) return;
+  const errs = scanErrors(d);
+  if (!scanHasError(d)) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  const head = '<div class="nm">扫描失败：以下账号/口径没有取到任务列表（不再显示「没有待办」）</div>';
+  const rows = errs.length
+    ? errs.map(e => '<div class="ln">' + esc(e.uid || '号池') +
+        (e.scope ? ' · ' + esc(e.scope) : '') + '：' + esc(e.message || '未知错误') + '</div>').join('')
+    : '<div class="ln">后端未返回错误明细（scan_ok=false），请查看日志或按账号诊断。</div>';
+  box.innerHTML = head + rows;
+}
+
+// renderScanResult 渲染扫描结果。错误态与空态互斥：
+//   · 有任何 scan 错误 → 只显示错误横幅 + 可用的分组，绝不显示 tcEmpty；
+//   · 无错误且无分组 → 才显示“没有待办任务 🎉”。
+function renderScanResult(d) {
+  renderScanErrors(d);
+  const groups = groupItems(d || {});
+  const failed = scanHasError(d);
+  if (!groups.length) {
+    const empty = $('tcEmpty'), list = $('qcList');
+    $('qProg').hidden = true;
+    if (failed) {
+      if (empty) empty.style.display = 'none';
+      if (list) list.innerHTML = '';
+      $('qcSummary').textContent = '扫描失败 · 0 个可用任务';
+      return;
+    }
+    renderQueue(groups, null, '没有待办任务 🎉', '全部账号已无未完成任务（未解锁 / 需手动的任务也会一并列出）。Sequential 链条每日零点解锁下一环，可明天再来。');
+    return;
+  }
+  renderQueue(groups, null, null, null);
+  if (failed) $('qcSummary').textContent += ' · 扫描存在错误（见上方横幅）';
+}
+
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
@@ -2793,8 +2960,12 @@ $('btnScanAll').onclick = async () => {
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
-    renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号已无未完成任务（未解锁 / 需手动的任务也会一并列出）。Sequential 链条每日零点解锁下一环，可明天再来。');
-  } catch (e) { toast(e.message, 'err'); }
+    renderScanResult(d);
+  } catch (e) {
+    // 接口本身失败也必须落到错误态，不能留下上一次的空态文案。
+    renderScanResult({ scan_ok: false, errors: [{ uid: '', scope: 'api', message: e.message }] });
+    toast(e.message, 'err');
+  }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
 };
 $('btnRunQueue').onclick = async () => {
@@ -2804,7 +2975,17 @@ $('btnRunQueue').onclick = async () => {
   b.disabled = true; b.textContent = '启动中…';
   try {
     const r = await api('tasks/run_queue', { method: 'POST', body: JSON.stringify({ concurrency: conc }) });
-    if (!r.started) { toast(r.message || '没有待办任务', 'ok'); return; }
+    if (!r.started) {
+      // 契约 C-WB-QUEUE@1：started=false 且 errors 非空时不许只回“没有待办”。
+      const errs = (r && r.errors) || [];
+      if (errs.length) {
+        toast('队列未启动：' + errs.slice(0, 3).map(e =>
+          (e.uid || '号池') + (e.scope ? '/' + e.scope : '') + '：' + (e.message || '未知错误')).join('；'), 'err');
+      } else {
+        toast((r && r.message) || '队列未启动', 'warn');
+      }
+      return;
+    }
     lastQueueSeq = r.seq || 0;
     toast('队列已启动：' + r.total + ' 项（并发 ' + conc + '）', 'ok');
     startQueuePolling();
@@ -2825,38 +3006,73 @@ function groupItems(d) {
     const rows = [];
     for (const t of (a.growth || [])) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
-      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan' });
+      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan', action: t.action || '' });
     }
     for (const t of (a.growth_locked || [])) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
-      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'locked', unlock: t.unlock_at });
+      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'locked', unlock: t.unlock_at, action: t.action || '' });
     }
     for (const t of (a.manual || [])) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
-      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'manual', message: t.task_desc || t.description || '' });
+      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'manual', message: t.task_desc || t.description || '', action: t.action || 'manual' });
     }
-    if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows });
+    if (rows.length) groups.push({
+      uid: a.uid, nick: a.nickname, rows: rows,
+      global: !!a.global,
+      upstreamTotal: a.upstream_total,
+      incompleteTotal: a.incomplete_total,
+      scanState: a.scan_state || '',
+    });
   }
   return groups;
 }
-const ST_WORDS = { done: '完成', running: '执行中', error: '失败', skipped: '跳过', pending: '排队', scan: '待执行', locked: '未解锁', manual: '需手动' };
+const ST_WORDS = {
+  done: '完成', partial: '部分完成', unverified: '未证实', failed: '失败',
+  running: '执行中', error: '失败', skipped: '跳过', pending: '排队',
+  scan: '待执行', locked: '未解锁', manual: '需手动',
+};
 const LOCKED_MSG = '上游尚未解锁（Sequential 链条每日零点解锁下一环，解锁后自动执行）';
 const MANUAL_MSG = '需真实操作（关注公众号 / 真实捐款 / 客户端行为），网关无法代为完成';
+// ACTION_TIP 把 C-WB-SCAN@1 的 action 转成“这一项该怎么完成”的提示。
+const ACTION_TIP = {
+  auto: '可自动执行', claim_only: '进度已达标，自动领奖',
+  locked_auto: '有自动动作但上游未解锁', manual: '需真实操作',
+};
 function qrowHTML(it) {
   const isSchool = it.kind === 'school';
   const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
-  const dotCls = it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : it.status === 'skipped' ? 'skip' : it.status === 'done' ? 'done' : 'wait';
-  const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
-  const lk = it.status === 'locked' ? fmtUnlock(it.unlock) : '';
-  const msg = it.status === 'locked'
+  // done 必须 verified=true；老后端没有 verified 字段时不因此降级成“未证实”。
+  let status = it.status;
+  if (status === 'error') status = 'failed';
+  if (status === 'done' && it.verified === false) status = 'unverified';
+  const dotCls = status === 'running' ? 'run' : status === 'failed' ? 'err'
+    : status === 'skipped' ? 'skip' : status === 'done' ? 'done'
+    : status === 'unverified' ? 'skip' : 'wait';
+  const stWord = status === 'scan' ? '待执行' : (ST_WORDS[status] || status);
+  const lk = status === 'locked' ? fmtUnlock(it.unlock) : '';
+  const msg = status === 'locked'
     ? (lk ? '上游锁定至 ' + lk + '，到点由面板自动执行' : LOCKED_MSG)
-    : it.status === 'manual'
+    : status === 'manual'
       ? (it.message || MANUAL_MSG)
       : (it.message || '');
-  return '<div class="qrow" title="' + esc(msg) + '">' +
+  // 队列结果：行内显示 verified 与 progress_before → progress_after。
+  let prog = it.prog || '';
+  if (it.progress_before !== undefined || it.progress_after !== undefined) {
+    prog = (it.progress_before || '—') + ' → ' + (it.progress_after || '—');
+  }
+  const verifiedTag = (it.verified === false && (status === 'done' || status === 'partial'))
+    ? '<span class="tag mute">未证实</span>' : '';
+  const actionTag = it.action && ACTION_TIP[it.action]
+    ? '<span class="tag mute" title="' + esc(ACTION_TIP[it.action]) + '">' + esc(ACTION_TIP[it.action]) + '</span>'
+    : '';
+  return '<div class="qrow" title="' + esc(msg) + '" data-q-status="' + esc(status) + '">' +
     '<span class="code">' + esc(it.code) + '</span>' +
-    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + (it.status === 'locked' ? '<span class="tag mute">' + (lk ? lk + ' 解锁' : '未解锁') + '</span>' : '') + (it.status === 'manual' ? '<span class="tag mute">需手动</span>' : '') + '</span>' +
-    '<span class="prog">' + esc(it.prog || '') + '</span>' +
+    '<span class="name"><span class="t">' + esc(title) + '</span>' +
+    (isSchool ? '<span class="tag mute">开学季</span>' : '') +
+    (status === 'locked' ? '<span class="tag mute">' + (lk ? lk + ' 解锁' : '未解锁') + '</span>' : '') +
+    (status === 'manual' ? '<span class="tag mute">需手动</span>' : '') +
+    actionTag + verifiedTag + '</span>' +
+    '<span class="prog">' + esc(prog) + '</span>' +
     '<span class="st"><span class="qdot ' + dotCls + '"></span>' + stWord + '</span>' +
     '<span class="msg">' + esc(msg) + '</span>' +
     '</div>';
@@ -2881,8 +3097,16 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
     const parts = [runnable + ' 项待办'];
     if (locked) parts.push(locked + ' 项未解锁');
     if (manual) parts.push(manual + ' 项需手动');
-    const cnt = parts.join(' · ');
-    return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">' + cnt + '</span></header>' +
+    let cnt = parts.join(' · ');
+    // 契约 2.2.17：组标题额外显示 upstream_total / incomplete_total。
+    const up = Number(g.upstreamTotal), inc = Number(g.incompleteTotal);
+    if (Number.isFinite(up) && Number.isFinite(inc)) {
+      cnt += ' · 上游 ' + up + ' 项 · 未完成 ' + inc + ' 项';
+    }
+    const gtag = g.global ? '<span class="tag mute" style="margin-left:6px">国际版（global）</span>' : '';
+    const uid = g.uid || '';
+    return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || uid.slice(0, 12) || '未知账号') +
+      gtag + '</span><span class="cnt">' + cnt + '</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');
   const sum = [total + ' 项'];
@@ -2908,6 +3132,11 @@ function groupsFromQueue(items) {
       kind: it.kind, code: it.code,
       prog: it.kind === 'school' ? '—' : '',
       status: it.status, message: it.message,
+      action: it.action,
+      // C-WB-QUEUE@1：行内必须能显示 verified 与前后进度。
+      verified: it.verified,
+      progress_before: it.progress_before,
+      progress_after: it.progress_after,
     });
   }
   return Array.from(by.values());
@@ -4390,37 +4619,175 @@ async function doQoderCheckin(btn, email) {
     const body = email ? JSON.stringify({ emails: [], priority: email }) : '{}';
     const d = await api('ide/qoder/checkin', { method: 'POST', body });
     const results = (d && d.results) || [];
-    const okc = results.filter(r => r.phase === 'claimed').length;
-    const alc = results.filter(r => r.phase === 'already').length;
-    // pending = 上游没有下发每日签到活动（不是故障；官方限时活动已结束/未开放时
-    // 会一直如此）。单独列出不算失败，避免误读成"签不上"。
-    const nop = results.filter(r => r.phase === 'pending').length;
-    const bad = results.filter(r => r.phase !== 'claimed' && r.phase !== 'already' && r.phase !== 'pending');
+    // 分桶展示的数据源：后端原始 results[]，不做二次改写。
+    lastQoderCheckin = d || null;
+    const c = qdCounts(results);
+    // 优先使用后端聚合（C-QD-API@1 的七相计数），缺失时用本地计数兜底。
+    const pick = (k, fallback) => (d && typeof d[k] === 'number') ? d[k] : fallback;
+    const claimed = pick('claimed_accounts', c.claimed);
+    const already = pick('already_accounts', c.already);
+    // blocked 不是失败、更不是成功：单列并明确「未签到」。
+    const blocked = pick('blocked_accounts', c.blocked);
+    const pending = pick('pending_accounts', c.pending);
+    const failed = pick('failed_accounts', c.failed);
+    const needLogin = pick('login_required_accounts', c.login_required);
+    const errored = pick('error_accounts', c.error);
+    const credits = Number((d && d.credits) || 0);
     let text;
-    if (results.length > 1 || !email) {
-      text = 'Qoder 签到：成功 ' + okc + ' · 今日已领 ' + alc +
-        (nop ? ' · 暂无活动 ' + nop : '') + ' · 失败 ' + bad.length;
-      if (nop && !okc && !alc && !bad.length) text += '（上游当前没有可领的签到活动；每 30 分钟自动重试，一旦下发即自动领取）';
-      if (d && d.credits) text += '，新增 +' + d.credits + ' Credits';
-      else if (d && d.credits_already) text += '（今日已入账 ' + d.credits_already + '）';
-    } else {
+    if (results.length === 1 && email) {
       const r = results[0] || {};
-      text = r.phase === 'claimed' ? ('签到成功 +' + (r.credits || 0) + ' Credits')
-        : r.phase === 'already' ? '今日已领取'
-          : (r.msg || (d && d.msg) || r.phase || '签到失败');
+      const ph = r.phase || 'error';
+      const why = r.msg || (d && d.msg) || '';
+      if (ph === 'claimed') text = '签到成功 +' + Number(r.credits || 0) + ' Credits';
+      else if (ph === 'already') text = '今日已领取';
+      else if (ph === 'blocked') {
+        text = '同一人已领（未签到）' + (r.quota_taken_by ? '：今日额度由 ' + r.quota_taken_by + ' 领取' : '') +
+          (why ? '；' + why : '');
+      } else text = why || qdPhaseText(ph);
+    } else {
+      const parts = ['已领取 ' + claimed + (credits ? '（+' + credits + ' Credits）' : '')];
+      if (already) parts.push('今日已领 ' + already);
+      if (blocked) parts.push('同一人已领 ' + blocked + '（未签到）');
+      if (pending) parts.push('今日未下发 ' + pending);
+      if (failed) parts.push('失败 ' + failed);
+      if (needLogin) parts.push('需重新登录 ' + needLogin);
+      if (errored) parts.push('错误 ' + errored);
+      text = 'Qoder 签到：' + parts.join(' · ');
     }
-    if (bad.length && bad[0].msg) text += '；' + bad[0].email + '：' + bad[0].msg;
-    toast(text, bad.length ? 'err' : (nop && !okc ? 'warn' : 'ok'));
+    const hardFail = failed + needLogin + errored;
+    toast(text, hardFail ? 'err' : ((blocked || pending) && !claimed && !already ? 'warn' : 'ok'));
     // 切号冻结期间不自动重绘（画面要保持切换前），只弹结果。
     if (!viewFrozen()) {
       loadCkQoder(true);
       if (view === 'ideaccounts') loadQoderAccounts(true);
+    } else {
+      renderQoderBuckets();
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { if (btn) { btn.disabled = false; btn.textContent = old || '签到'; } }
 }
 
 if ($('btnQoderRefresh')) $('btnQoderRefresh').onclick = () => { thawView(); loadQoderAccounts(false); };
+
+/* ── Qoder 设备/出口设置（C-QD-EGRESS@1 / C-QD-API@1 D/E）──────────
+   只读展示 + 提交；字段名与后端 JSON 完全一致（device_mode / proxy_url /
+   profile_dir）。probe 结论来自 GET 返回的 last_probe，取 C-QD-PROBE@1
+   已冻结的 criterion_inferred / conclusion；没有结论时如实显示「尚无探测结论」。 */
+function qdProbeLine(p) {
+  const probe = (p && p.last_probe) || null;
+  if (!probe) return '探测结论：尚无探测结论（未执行隔离探测）';
+  const criterion = probe.criterion_inferred || probe.criterion || '';
+  const conclusion = probe.conclusion || '';
+  if (!criterion && !conclusion) return '探测结论：尚无探测结论（未执行隔离探测）';
+  return '探测结论：' + (criterion || 'unknown') + ' · ' + (conclusion || 'inconclusive');
+}
+
+async function openQoderEgress(email) {
+  const veil = $('qdEgressVeil');
+  if (!veil) { toast('设备/出口设置面板未加载', 'err'); return; }
+  veil.classList.add('on');
+  const errEl = $('qdEgressErr');
+  if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+  if ($('qdEgressEmail')) $('qdEgressEmail').value = email || '';
+  if ($('qdEgressMode')) $('qdEgressMode').value = 'real';
+  if ($('qdEgressProxy')) $('qdEgressProxy').value = '';
+  if ($('qdEgressProfile')) $('qdEgressProfile').value = '';
+  const body = $('qdEgressBody');
+  if (body) body.innerHTML = '<div class="note">查询中…</div>';
+  try {
+    const d = await api('ide/qoder/egress');
+    const profiles = (d && d.profiles) || [];
+    const key = String(email || '').toLowerCase();
+    const p = profiles.find(x => String((x && x.email) || '').toLowerCase() === key) || null;
+    if (p) {
+      if ($('qdEgressMode')) $('qdEgressMode').value = p.device_mode || 'real';
+      if ($('qdEgressProxy')) $('qdEgressProxy').value = p.proxy_url || '';
+      if ($('qdEgressProfile')) $('qdEgressProfile').value = p.profile_dir || '';
+    }
+    if (body) {
+      body.innerHTML = p
+        ? '<div class="note">当前：' + esc(p.email || '') + ' · 设备 ' + esc(p.device_mode || 'real') +
+          ' · 出口 ' + esc(p.proxy_url || '默认网络') +
+          (p.updated_at ? ' · 更新于 ' + esc(caTime(p.updated_at) || p.updated_at) : '') + '</div>' +
+          '<div class="note" data-qd-probe="' + esc(p.email || '') + '">' + esc(qdProbeLine(p)) + '</div>'
+        : '<div class="note">该账号尚无独立设备/出口配置（默认与现网一致：真实设备 + 进程默认网络）。</div>';
+    }
+  } catch (e) {
+    // 老后端未注册路由（404）：按“无配置”降级，不抛异常、不编造结论。
+    if (body) body.innerHTML = '<div class="note">读取设备/出口配置失败：' + esc(e.message) + '</div>';
+  }
+}
+
+async function saveQoderEgress() {
+  const email = ($('qdEgressEmail') && $('qdEgressEmail').value || '').trim();
+  const mode = ($('qdEgressMode') && $('qdEgressMode').value) || 'real';
+  const proxy = ($('qdEgressProxy') && $('qdEgressProxy').value || '').trim();
+  const profile = ($('qdEgressProfile') && $('qdEgressProfile').value || '').trim();
+  const errEl = $('qdEgressErr');
+  const btn = $('btnQdEgressSave');
+  if (!email) { toast('缺少邮箱', 'err'); return; }
+  if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const payload = { email: email, device_mode: mode };
+    if (proxy) payload.proxy_url = proxy;
+    if (profile) payload.profile_dir = profile;
+    const d = await api('ide/qoder/egress', { method: 'POST', body: JSON.stringify(payload) });
+    if (!d || d.ok !== true) {
+      throw new Error((d && (d.error || d.message)) || '保存失败');
+    }
+    toast('已保存设备/出口配置：' + email, 'ok');
+    if ($('qdEgressVeil')) $('qdEgressVeil').classList.remove('on');
+    if (!viewFrozen()) loadCkQoder(true);
+  } catch (e) {
+    // 400 invalid_device_mode / invalid_proxy_url 等原样展示。
+    if (errEl) { errEl.hidden = false; errEl.className = 'state err'; errEl.textContent = e.message; }
+    toast('保存失败：' + e.message, 'err');
+  } finally { if (btn) { btn.disabled = false; btn.textContent = '保存'; } }
+}
+
+/* ── Qoder 领取历史（C-QD-LEDGER@1 / C-QD-API@1 C）────────────────── */
+async function openQoderHistory(email) {
+  const veil = $('qdHistVeil');
+  if (!veil) { toast('历史面板未加载', 'err'); return; }
+  veil.classList.add('on');
+  const body = $('qdHistBody'), note = $('qdHistNote');
+  if (note) note.textContent = email || '';
+  if (body) body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
+  try {
+    const d = await api('ide/qoder/claim_history?email=' + encodeURIComponent(email || '') + '&days=7');
+    const rows = (d && d.records) || [];
+    if (!body) return;
+    if (!rows.length) {
+      body.innerHTML = '<div class="note">近 7 天暂无领取记录（blocked/pending/failed 会记录在这里用于审计）。</div>';
+      return;
+    }
+    body.innerHTML = '<div class="tbl-wrap"><table class="acc md"><thead><tr>' +
+      '<th>日期</th><th>结果</th><th>Credits</th><th>额度归属</th><th>策略</th><th>时间</th>' +
+      '</tr></thead><tbody>' + rows.map(r => {
+        const phase = String(r.phase || 'error');
+        return '<tr data-qd-hist="' + esc(r.date || '') + '">' +
+          '<td>' + esc(r.date || '—') + '</td>' +
+          '<td>' + esc(qdPhaseText(phase)) + '</td>' +
+          '<td class="num">' + esc(Number(r.credits || 0)) + '</td>' +
+          '<td>' + esc(r.quota_taken_by || '—') + '</td>' +
+          '<td>' + esc(qdStrategyText(r.strategy) || '—') + '</td>' +
+          '<td>' + esc(caTime(r.at) || r.at || '—') + '</td>' +
+          '</tr>';
+      }).join('') + '</tbody></table></div>';
+  } catch (e) {
+    // 老后端无端点：如实显示错误，不伪造历史。
+    if (body) body.innerHTML = '<div class="state err">' + esc('读取历史失败：' + e.message) + '</div>';
+  }
+}
+
+if ($('btnQdEgressSave')) $('btnQdEgressSave').onclick = saveQoderEgress;
+if ($('btnQdEgressClose')) $('btnQdEgressClose').onclick = () => {
+  if ($('qdEgressVeil')) $('qdEgressVeil').classList.remove('on');
+};
+if ($('btnQdHistClose')) $('btnQdHistClose').onclick = () => {
+  if ($('qdHistVeil')) $('qdHistVeil').classList.remove('on');
+};
 if ($('btnQoderAdd')) $('btnQoderAdd').onclick = doQoderAdd;
 if ($('btnCkQoderCheckinAll')) $('btnCkQoderCheckinAll').onclick = () => doQoderCheckin($('btnCkQoderCheckinAll'));
 if ($('btnCkQoderSwitched')) $('btnCkQoderSwitched').onclick = () => doQoderSwitchedCheckin($('btnCkQoderSwitched'));
@@ -4782,6 +5149,106 @@ async function doWbCheckinAll(btn) {
   }
 }
 
+/* ── Qoder 分桶 / 轮换 / 历史 / 设备出口（C-UI-REPAIR@1）────────────
+   数据一律来自 C-QD-API@1：checkin 响应的 results[] 与 checkin-status 的
+   results[]。blocked 是「服务端判定同一人，今日额度已被别人领走」，
+   既不是成功也不是失败，必须单列且不计入已签到。 */
+let lastQoderCheckin = null; // 最近一次一键签到的原始响应，用于分桶展示
+
+const QD_PHASE_ORDER = ['claimed', 'already', 'blocked', 'pending', 'failed', 'login_required', 'error'];
+const QD_PHASE_TEXT = {
+  claimed: '已领取', already: '今日已领', blocked: '同一人已领（未签到）',
+  pending: '今日未下发', failed: '失败', login_required: '需重新登录', error: '错误',
+};
+// strategy 文案：只在上游真有证据时才说「服务端判定同人」（2026-11-04 实测：
+// 服务端并未判这两个号同人 —— 两号 grantId 不同、各自 +100）。
+const QD_STRATEGY_TEXT = {
+  isolated: '额度独立（各号各一份）', shared_person: '服务端判定同人',
+  rotated: '按人轮换', unassigned: '今日未下发', unknown: '归属未核实',
+};
+
+function qdPhaseText(p) { return QD_PHASE_TEXT[p] || p || '未知'; }
+function qdStrategyText(s) { return QD_STRATEGY_TEXT[s] || s || ''; }
+// qdCounts 按 phase 计数；任何未知 phase 归入 error，保证七相之和 = 尝试数。
+function qdCounts(results) {
+  const c = { claimed: 0, already: 0, blocked: 0, pending: 0, failed: 0, login_required: 0, error: 0 };
+  for (const r of (results || [])) {
+    const p = r && QD_PHASE_TEXT[r.phase] ? r.phase : 'error';
+    c[p]++;
+  }
+  return c;
+}
+
+// qdBucketHTML 纯函数：把一次批量签到结果按 phase 分桶成 HTML。
+//
+// credits 严格按后端数值展示（blocked/pending/failed 恒为 0），活动面值
+// 只在 benefit_amount 存在时提示「未入账」，绝不把面值当成已领积分。
+//
+// ⚠️ 只画**汇总**，不重复逐号行（2026-11-04 用户反馈）：
+// 上方「账号 / 积分 / 状态 / 操作」表格已经逐号显示了状态与积分，
+// 下方再把每个号重列一遍（"今日已领 +100 Credits"）是同一件事说两遍。
+// 这里只保留：分桶计数、本轮顺序、总额度组数 —— 表格没有的**汇总信息**。
+function qdBucketHTML(d) {
+  const results = Array.isArray(d && d.results) ? d.results : [];
+  if (!results.length) return '';
+  const by = new Map();
+  for (const r of results) {
+    let p = String((r && r.phase) || 'error');
+    if (!QD_PHASE_TEXT[p]) p = 'error';
+    if (!by.has(p)) by.set(p, []);
+    by.get(p).push(r);
+  }
+  const order = QD_PHASE_ORDER.filter(p => by.has(p));
+  const sum = order.map(p => qdPhaseText(p) + ' ' + by.get(p).length).join(' · ');
+  // C-QD-API@1：rotation_order 是本轮实际尝试顺序（1 起，由后端给出）。
+  const rot = Array.isArray(d && d.rotation_order) ? d.rotation_order : [];
+  const orderLine = rot.length
+    ? '<div class="note" data-qd-rotation="1">本轮顺序：' +
+      rot.map((e, i) => (e ? (i + 1) + '. ' + e : '')).filter(Boolean).join(' · ') + '</div>'
+    : '';
+  // 新增积分：只有 claimed 才算（后端 credits 语义），already 的额度可能是同人另号领的。
+  const gained = Number(d && d.credits_total) || 0;
+  const gainLine = gained > 0
+    ? '<div class="note" data-qd-gain="1">本轮实际入账：+' + gained + ' Credits</div>'
+    : '';
+  // 额度组：组 = 服务端判定为**同一个人的号**的集合（组内只有 1 个 = 该号独享一份）。
+  // ⚠️ 2026-11-04 实测更正：额度**不是**无条件按人共享 —— 两个号各自拿到不同的
+  // grantId、各自 +100；只有服务端明确判同人（SAME_PERSON_ALREADY_CLAIMED）时
+  // 才只发一份。所以这里不能说「同一人一天只有一份」。
+  const groups = Array.isArray(d && d.quota_groups) ? d.quota_groups : [];
+  const takenOver = results.filter(r => r && (r.quota_taken_by || r.same_person_taken)).length;
+  const groupLine = groups.length
+    ? '<div class="note" data-qd-groups="1">额度组 ' + groups.length + ' 个（组 = 服务端判定同人的号，组内只有 1 个即独享一份' +
+      (takenOver > 0 ? '；今天有 ' + takenOver + ' 个号的额度被同组另一个号领走' : '') + '）</div>'
+    : '';
+  // 七相之和必须等于实际尝试数；缺相不显示，但总和行给出真实分桶。
+  mayCheckQoderBucketsSum(results, by);
+  return '<div class="qd-buckets" data-qd-buckets="1">' +
+    '<div class="note" style="padding:6px 0">本次尝试 ' + results.length + ' 个 · ' + esc(sum) + '</div>' +
+    gainLine + groupLine + orderLine + '</div>';
+}
+
+// mayCheckQoderBucketsSum 只在开发期把不变量写进控制台；不改变 UI 行为。
+function mayCheckQoderBucketsSum(results, by) {
+  let n = 0;
+  by.forEach(v => { n += v.length; });
+  if (n !== results.length && typeof console !== 'undefined') {
+    console.warn('qoder bucket sum mismatch', n, results.length);
+  }
+}
+
+// renderQoderBuckets 把最近一次一键签到结果画到卡片内（元素由 index.html 提供）。
+function renderQoderBuckets() {
+  const box = $('ckQoderBuckets');
+  if (!box) return;
+  if (!lastQoderCheckin) {
+    box.innerHTML = '<div class="note">尚未执行一键签到（点上方「全部签到」查看每号真实结果与分桶）。</div>';
+    return;
+  }
+  box.innerHTML = qdBucketHTML(lastQoderCheckin) ||
+    '<div class="note">本次没有账号参与签到。</div>';
+}
+
 async function loadCkQoder(quiet) {
   const st = $('ckQoderState'), list = $('ckQoderList');
   if (!st || !list) return;
@@ -4794,7 +5261,8 @@ async function loadCkQoder(quiet) {
     const rows = arr.length ? arr : (cur ? [{ email: cur, name: d.current_name || '当前登录', current: true }] : []);
     // 今日签到状态：上游核实结果（后端逐号向 Qoder 活动列表确认）。
     const st2 = await api('ide/qoder/checkin-status').catch(() => null);
-    const doneMap = {}, pendMap = {}, quotaMap = {}, msgMap = {}, holderMap = {};
+    const doneMap = {}, quotaMap = {}, msgMap = {}, holderMap = {};
+    const strategyMap = {}, rankMap = {}, lastClaimMap = {}, histDaysMap = {}, phaseMap = {};
     ((st2 && st2.results) || []).forEach(r => {
       if (!r || !r.email) return;
       const k = String(r.email).toLowerCase();
@@ -4803,10 +5271,14 @@ async function loadCkQoder(quiet) {
       //    且顶层 checked_in_today 是「今天整体没有可领的了」的**聚合值**，
       //    被当成当前登录号的状态用 —— 两个号的签到显示因此整个反了。
       doneMap[k] = !!r.checked_in_today;
-      pendMap[k] = (r.phase === 'pending' && !r.checked_in_today);
       quotaMap[k] = !!r.same_person_taken;
       msgMap[k] = r.msg || '';
       holderMap[k] = r.quota_taken_by || '';
+      phaseMap[k] = r.phase || '';
+      strategyMap[k] = r.strategy || '';
+      rankMap[k] = r.rotation_rank || 0;
+      lastClaimMap[k] = r.last_claimed_at || '';
+      histDaysMap[k] = r.claim_history_days || 0;
     });
     // 当前登录号：用 current.checked_in_today（**单号**口径），不用顶层聚合值。
     if (cur && st2 && st2.current && typeof st2.current.checked_in_today === 'boolean') {
@@ -4835,14 +5307,15 @@ async function loadCkQoder(quiet) {
     if (!rows.length) {
       st.hidden = false; st.className = 'state';
       st.textContent = '本机 Qoder 未登录，号池也为空。请先在 Qoder 登录，再到「IDE 账号池」点「添加账号」。';
-      list.innerHTML = ''; return;
+      list.innerHTML = '';
+      renderQoderBuckets();
+      return;
     }
     const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
     list.innerHTML = head + rows.map(a => {
       const email = a.email || '';
       const k = String(email).toLowerCase();
       const isDone = !!doneMap[k];
-      const noCamp = !!pendMap[k];
       const quota = !!quotaMap[k];
       const why = msgMap[k] || '';
       // 同一个人组：服务端判定为同一个人的号共享**一份**每日额度。
@@ -4851,30 +5324,56 @@ async function loadCkQoder(quiet) {
       const gsize = a.quota_group || 0;
       const groupTag = gsize > 1
         ? '<span class="tag mute" style="margin-left:6px" title="服务端判定为同一个人的 ' + gsize +
-          ' 个账号共享一份每日签到额度">同一人 ' + gsize + ' 号</span>'
+          ' 个账号共享一份每日签到额度">同一人组（' + gsize + ' 个号' +
+          (holder ? '，今日由 ' + esc(holder) + ' 领到' : '，今日尚无号领到') + '）</span>'
         : '';
       const quotaTip = quota
         ? (holder
-          ? '今日每日额度已被同一个人的另一个账号 ' + holder + ' 领取（服务端按人给，同一人一天只有一份）'
-          : '今日每日额度已被同一个人的另一个账号领取（服务端按人给，同一人一天只有一份、先打先得）')
+          ? '今日每日额度已被服务端判定为同一个人的另一个账号 ' + holder + ' 领走（同人一天只发一份）'
+          : '今日每日额度已被服务端判定为同一个人的另一个账号领走（同人一天只发一份、先打先得）')
         : '';
       const status = isDone
-        ? UI.badge('ok', '✓', '今日已签到', why || '上游活动列表确认今天已领取')
-        : (noCamp
+        // ⚠️ already 但额度是**同人的另一个号**领的（服务端按人发，一天一份）：
+        // 本号账上没新增积分，不能说"今日已签到"。2026-11-04 用户反馈的
+        // 「两个号都显示 +100」就是这里来的。
+        ? (phaseMap[k] === 'already' && holder
+          ? UI.badge('mute2', '○', '同一人已领（未入账）',
+              why || ('今日额度已由同一人另一个账号 ' + holder + ' 领取，本号账上未新增积分'))
+          : UI.badge('ok', '✓', '今日已签到', why || '上游活动列表确认今天已领取'))
+        : (phaseMap[k] === 'pending'
           ? (quota
-            ? UI.badge('mute2', '○', '额度已被同组另一账号领走', why || quotaTip)
-            : UI.badge('mute2', '○', '暂无签到活动', why || '上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取'))
-          : (a.expired
-            ? UI.badge('todo', '!', '凭证过期', why || '凭证已过期，请重新登录后添加')
-            : UI.badge('warn', '○', '可签到', why || '上游活动列表里有今天可领的签到活动')));
-      return '<div class="trow">' +
+            ? UI.badge('mute2', '○', '同一人已领（未签到）', why || quotaTip)
+            : UI.badge('mute2', '○', '今日未下发', why || '上游当前没有下发每日签到活动（限时活动已结束或未开放）；下发后 30 分钟内自动领取'))
+          : (phaseMap[k] === 'login_required'
+            ? UI.badge('todo', '!', '需重新登录', why || '凭证已失效，请重新登录该账号后再添加')
+            : (phaseMap[k] === 'error'
+              ? UI.badge('todo', '!', '查询失败', why || '上游查询失败')
+              : (a.expired
+                ? UI.badge('todo', '!', '凭证过期', why || '凭证已过期，请重新登录后添加')
+                : UI.badge('warn', '○', '可签到', why || '上游活动列表里有今天可领的签到活动')))));
+      // 策略/轮换/历史：字段缺失（老后端）时整行不显示，不编造默认值。
+      const strategy = strategyMap[k] || '';
+      const rank = Number(rankMap[k] || 0);
+      const lastClaim = lastClaimMap[k] || '';
+      const histDays = Number(histDaysMap[k] || 0);
+      const meta = [];
+      if (strategy) meta.push('策略：' + (qdStrategyText(strategy)));
+      if (rank > 0) meta.push('本轮顺序 #' + rank);
+      if (lastClaim) meta.push('上次领到 ' + (caTime(lastClaim) || lastClaim));
+      if (histDays > 0) meta.push('历史已领 ' + histDays + ' 天');
+      const metaHTML = meta.length
+        ? '<div class="note" style="margin-top:3px" data-qd-meta="' + esc(email) + '">' + esc(meta.join(' · ')) + '</div>'
+        : '';
+      return '<div class="trow" data-qd-row="' + esc(email) + '">' +
         '<div class="who"><div class="nm">' + esc(a.name || '未命名') +
         (a.current ? '<span class="tag mute" style="margin-left:6px">当前登录</span>' : '') + groupTag + '</div>' +
-        '<div class="id" title="' + esc(email) + '">' + esc(email) + '</div></div>' +
+        '<div class="id" title="' + esc(email) + '">' + esc(email) + '</div>' + metaHTML + '</div>' +
         '<div class="credits" data-qk-cred="' + esc(email) + '"><span class="note">查询中…</span></div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' +
         (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-ck-qoder', email, '签到', '今天让这个号先领（池里其余号也会一起打一遍）')) +
+        UI.sub('data-qd-egress', email, '设备/出口', '为该账号配置独立设备指纹 / 出口代理 / 浏览器 profile') +
+        UI.sub('data-qd-history', email, '历史', '查看最近 7 天领取历史') +
         '</div>' +
         '</div>';
     }).join('');
@@ -4882,6 +5381,13 @@ async function loadCkQoder(quiet) {
     list.querySelectorAll('button[data-ck-qoder]').forEach(b => {
       b.onclick = () => doQoderCheckin(b, b.dataset.ckQoder);
     });
+    list.querySelectorAll('button[data-qd-egress]').forEach(b => {
+      b.onclick = () => openQoderEgress(b.dataset.qdEgress);
+    });
+    list.querySelectorAll('button[data-qd-history]').forEach(b => {
+      b.onclick = () => openQoderHistory(b.dataset.qdHistory);
+    });
+    renderQoderBuckets();
     // 每行积分独立查询：各账号用自己的 token 查额度，不需要切号。
     list.querySelectorAll('[data-qk-cred]').forEach(cell => {
       const email = cell.dataset.qkCred;
@@ -5167,66 +5673,288 @@ async function doMainPoolCheckinAll() {
    用它拉一次无头浏览器自动点「活动福利 → 每日领取」。 */
 let caPollTimer = null;
 
+/* ── CodeArts 票据寿命展示（C-UI-REPAIR@1 / C-CA-API@1）────────────────
+   所有字段直接来自 GET ide/codearts/accounts，前端不派生、不自造同义字段。
+   老后端（T2 未上线）没有这些字段时必须降级成「未观测」，绝不显示
+   没有代码路径支撑的采集承诺。 */
+const CA_TICKET_SOURCE = { cookie: '登录采集', probe: '补采探测', session: '会话级', estimate: '估算' };
+const CA_PROBE_STATE = {
+  pending: '待探测', ok: '探测正常', session_only: '仅会话级票据',
+  login_dead: '会话已失效', failed: '探测失败',
+};
+const CA_RENEW_RESULT = {
+  alive: '会话可用', renewed: '已换回新会话', ticket_expired: '票据已过期',
+  needs_login: '需人工登录', failed: '续期失败',
+};
+
+// caTime RFC3339 → 「YYYY-MM-DD HH:mm」；空/非法返回 ''（比较一律按“未知”处理）。
+function caTime(iso) {
+  const ms = parseAPITime(iso);
+  return ms ? fmtLocalDateTime(ms) : '';
+}
+
+// caTicketLines 把票据寿命相关字段转成可读文案（纯函数，前端测试直接抽取）。
+// 判定顺序固定：绝对到期 > 会话级 > 估算 > 未观测。
+function caTicketLines(a) {
+  a = a || {};
+  const lines = [];
+  const deadline = String(a.ticket_deadline || '').trim();
+  const src = String(a.ticket_source || '').trim();
+  if (deadline) {
+    lines.push('票据到期：' + (caTime(deadline) || deadline) + '（' + (CA_TICKET_SOURCE[src] || src || '未知来源') + '）');
+  } else if (src === 'session') {
+    lines.push('票据为会话级（无绝对到期）；会话失效时会尝试续期');
+  } else if (src === 'estimate') {
+    lines.push('票据寿命为估算（仅供展示，不代表真实到期）');
+  } else {
+    // 契约 2.2.17：空 deadline + 空 source 时文案只能是这一句。
+    lines.push('票据寿命未观测（可点补采）');
+  }
+  const sess = caTime(a.session_expires_at);
+  if (sess) lines.push('会话约至 ' + sess + '（估算）');
+  const okAt = caTime(a.last_ok_at);
+  if (okAt) lines.push('上次成功 ' + okAt);
+  const nextAt = caTime(a.renew_next_at);
+  if (nextAt) lines.push('下次续期检查 ' + nextAt);
+  if (a.renew_result) {
+    lines.push('上次续期：' + (CA_RENEW_RESULT[a.renew_result] || a.renew_result));
+  }
+  if (a.renew_fail_msg) lines.push('续期失败原因：' + a.renew_fail_msg);
+  if (a.probe_state || a.probe_msg) {
+    const ps = a.probe_state ? (CA_PROBE_STATE[a.probe_state] || a.probe_state) : '未探测';
+    lines.push('探测状态：' + ps + (a.probe_msg ? '（' + a.probe_msg + '）' : ''));
+  }
+  if (a.expires_known_count !== undefined || a.session_cookie_count !== undefined) {
+    lines.push('已观测过期 ' + Number(a.expires_known_count || 0) + ' 条 · 会话级 ' + Number(a.session_cookie_count || 0) + ' 条');
+  }
+  if (a.can_auto_renew === false && !a.needs_manual) lines.push('当前不可自动续期');
+  return lines;
+}
+
+// CodeArts 三个新增动作：路径与 phase 成功集合见 C-CA-API@1 / C-CA-RENEW@1。
+const CA_ACTIONS = {
+  probe: { path: 'ide/codearts/probe', busy: '补采中…', label: '补采票据寿命', ok: ['probed', 'session_only'], wait: ['throttled'] },
+  keepalive: { path: 'ide/codearts/keepalive', busy: '验证中…', label: '验证会话', ok: ['alive'], wait: [] },
+  renew: { path: 'ide/codearts/renew', busy: '续期中…', label: '立即续期', ok: ['renewed', 'alive'], wait: ['probe_required', 'rejected', 'busy', 'throttled'] },
+};
+
+/* ── CodeArts 账号行：默认只有一行摘要 ─────────────────────────────────
+   原则（用户诉求）：**正常时不打扰**。一行的三段是
+     `昵称/账号 · 状态短语 · 今日积分`
+   只有「需重新登录」才给一个主按钮（重新登录）和一个次级文字链（重置身份）；
+   补采 / 验证 / 续期属于排障动作，收在点行展开的详情里，默认不可见。
+   技术字段（票据到期、槽目录、person_key…）也只在展开后出现。 */
+
+// caStatusPhrase 状态短语（**唯一来源**，前端不再派生同义字段）。
+// 需人工永远优先：即使 can_auto_renew=true，只要上游明确判定会话已死，
+// 显示「自动维护中」就是误导 —— 用户会一直等一个永远不会发生的自动续期。
+function caStatusPhrase(a) {
+  a = a || {};
+  const needsManual = !!a.needs_manual ||
+    String(a.probe_state || '') === 'login_dead' ||
+    String(a.renew_result || '') === 'needs_login';
+  if (needsManual) return '需重新登录';
+  if (a.can_auto_renew === true) return '自动维护中';
+  if (String(a.ticket_source || '') === 'session') return '会话票据（自动续期）';
+  if (String(a.renew_result || '') === 'failed') return '续期失败（自动重试）';
+  return '待维护';
+}
+
+// caStatusBadge 状态短语 → 徽章外观（kind/mark）。
+function caStatusBadge(phrase) {
+  if (phrase === '需重新登录') return { kind: 'todo', mark: '!' };
+  if (phrase === '自动维护中') return { kind: 'ok', mark: '✓' };
+  if (phrase === '续期失败（自动重试）') return { kind: 'warn', mark: '○' };
+  return { kind: 'mute2', mark: '·' };
+}
+
+// caTodayCreditsText 行内第三段「今日积分」。
+// 只表达今天发生了什么，不把余额/已用/将过期铺在默认行里。
+function caTodayCreditsText(a) {
+  a = a || {};
+  const gain = Number(a.today_gain);
+  if (Number.isFinite(gain) && gain > 0) return '今日 +' + fmtNum(gain);
+  if (a.checked_in_today) return '今日已签';
+  const daily = Number(a.daily_bonus !== undefined ? a.daily_bonus : a.benefit_amount);
+  if (Number.isFinite(daily) && daily > 0) return '今日可领 ' + fmtNum(daily);
+  return '今日 —';
+}
+
+// caSummaryHtml 默认可见的单行摘要（前端测试直接抽取本函数）。
+// 正常状态：三段文字，没有任何按钮；需重新登录：多一个主按钮 + 一个文字链。
+function caSummaryHtml(a) {
+  a = a || {};
+  const id = String(a.id || '');
+  const phrase = caStatusPhrase(a);
+  const badge = caStatusBadge(phrase);
+  const name = String(a.label || a.nickname || id || 'CodeArts 账号');
+  const tip = a.needs_manual ? String(a.probe_msg || a.renew_fail_msg || '') : '';
+  let ops = '';
+  if (phrase === '需重新登录') {
+    ops = UI.act('data-ca-relogin', id, '重新登录', '用这个号自己的身份槽重开登录窗口') +
+      '<span class="ca-link" data-ca-forget="' + esc(id) + '">重置身份</span>';
+  }
+  return '<div class="ca-sum" data-ca-sum="' + esc(id) + '">' +
+    '<span class="ca-name" title="' + esc(id) + '">' + esc(name) + '</span>' +
+    '<span class="ca-sep">·</span>' +
+    UI.badge(badge.kind, badge.mark, phrase, tip) +
+    '<span class="ca-sep">·</span>' +
+    '<span class="ca-today">' + esc(caTodayCreditsText(a)) + '</span>' +
+    '<span style="flex:1"></span>' + ops +
+    '</div>';
+}
+
+// caDetailHtml 点行展开后的技术详情（默认 hidden）。
+// slot 来自 GET ide/codearts/slots（按 id 对齐）；旧后端没有该端点时为空对象，
+// 这些字段显示「—」，不猜、不编路径。
+function caDetailHtml(a, slot) {
+  a = a || {};
+  slot = slot || {};
+  const row = (label, value) => {
+    const text = String(value == null ? '' : value).trim();
+    return '<div class="ca-kv"><span class="ca-k">' + esc(label) + '</span>' +
+      '<span class="ca-v">' + esc(text || '—') + '</span></div>';
+  };
+  const id = String(a.id || '');
+  const isDone = !!a.checked_in_today;
+  const ck = isDone
+    ? UI.off('已签到', '今日已签到')
+    : UI.act('data-ca-ck', id, '签到', '今天签到');
+  return '<div class="ca-detail-body">' +
+    row('票据到期', caTime(a.ticket_deadline)) +
+    row('会话约至（估算）', caTime(a.session_expires_at)) +
+    row('上次成功', caTime(a.last_ok_at)) +
+    row('下次续期检查', caTime(a.renew_next_at)) +
+    row('续期结论', CA_RENEW_RESULT[a.renew_result] || a.renew_result) +
+    row('续期失败原因', a.renew_fail_msg) +
+    row('探测状态', CA_PROBE_STATE[a.probe_state] || a.probe_state) +
+    row('探测信息', a.probe_msg) +
+    row('Cookie 构成', '已观测过期 ' + Number(a.expires_known_count || 0) +
+      ' 条 · 会话级 ' + Number(a.session_cookie_count || 0) + ' 条') +
+    row('按人分桶（person_key）', slot.person_key || a.person_key) +
+    row('身份槽目录（slot_dir）', slot.slot_dir || a.slot_dir) +
+    row('槽 ID（slot_id）', slot.slot_id || a.slot_id) +
+    row('设备 ID（device_guid）', slot.device_guid || a.device_guid) +
+    row('签名来源（client_source）', slot.client_source || a.client_source) +
+    row('积分余额', a.credits) +
+    '<div class="ca-acts">' + ck +
+    UI.sub('data-ca-probe', id, '补采票据寿命', '无头浏览器重采 Cookie 过期时间') +
+    UI.sub('data-ca-keepalive', id, '验证会话', '调用上游验证会话是否仍可用') +
+    UI.sub('data-ca-renew', id, '立即续期', '执行一次静默续期（force=true）') +
+    UI.sub('data-ca-rm', id, '移除') +
+    '</div></div>';
+}
+
+// caRowHtml 一行的完整 HTML：摘要 + 折叠详情。
+function caRowHtml(a, slot) {
+  const id = String((a && a.id) || '');
+  return '<div class="trow ca-row" data-ca-row="' + esc(id) + '">' +
+    caSummaryHtml(a) +
+    '<div class="ca-detail" data-ca-detail="' + esc(id) + '" hidden>' +
+    caDetailHtml(a, slot) + '</div></div>';
+}
+
+async function doCaAction(kind, id, btn) {
+  const cfg = CA_ACTIONS[kind];
+  if (!cfg) return;
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = cfg.busy; }
+  try {
+    const d = await api(cfg.path, {
+      method: 'POST',
+      body: JSON.stringify({ ids: [id], force: true }),
+    });
+    const rs = (d && d.results) || [];
+    // 多账号响应按 id 取本条；单条响应直接取第一条。
+    const r = rs.find(x => String(x.id) === String(id)) || rs[0] || {};
+    const phase = String(r.phase || '');
+    const msg = r.message || r.msg || '';
+    const good = cfg.ok.indexOf(phase) >= 0;
+    // 失败必须逐字展示后端 message，不得把未执行/失败显示成成功。
+    const text = cfg.label + '：' + (msg || (good ? '完成' : ('未完成（' + (phase || '无 phase') + '）')));
+    toast(text, good ? 'ok' : (cfg.wait.indexOf(phase) >= 0 ? 'warn' : 'err'));
+    if (!viewFrozen()) loadCkCodeArts(true);
+  } catch (e) {
+    // 老后端未注册路由（404）或网络错误：如实报错，不伪装成功。
+    toast(cfg.label + '失败：' + e.message, 'err');
+  } finally { if (btn) { btn.disabled = false; btn.textContent = old || cfg.label; } }
+}
+
 async function loadCkCodeArts(quiet) {
   const st = $('ckCaState'), list = $('ckCaList');
   if (!st || !list) return;
   if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
   try {
-    const d = await api('ide/codearts/accounts');
+    // 账号状态与身份槽并行取：槽信息只服务展开详情，取不到（旧后端无此端点）
+    // 也不影响默认行 —— 详情里显示「—」，绝不编造路径。
+    const [d, sd] = await Promise.all([
+      api('ide/codearts/accounts'),
+      api('ide/codearts/slots').catch(() => null),
+    ]);
     const arr = (d && d.accounts) || [];
+    const slotById = {};
+    ((sd && sd.slots) || []).forEach(s => { if (s && s.id) slotById[String(s.id)] = s; });
     const done = arr.filter(a => a.checked_in_today).length;
+    const manual = arr.filter(a => caStatusPhrase(a) === '需重新登录').length;
     if ($('ckCaSummary')) {
-      $('ckCaSummary').textContent = arr.length ? ('共 ' + arr.length + ' 个 · 已签 ' + done) : '未添加账号';
+      // 统计句收敛为一行；只在确有人工介入时才多一段。
+      let summary = arr.length ? ('共 ' + arr.length + ' 个 · 已签 ' + done) : '未添加账号';
+      if (manual) summary += ' · 需人工 ' + manual;
+      $('ckCaSummary').textContent = summary;
     }
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
       st.textContent = '还没有账号。点右上角「添加账号」，在「华为 CodeArts」页签里登录华为云即可。';
       list.innerHTML = ''; return;
     }
-    const head = '<div class="thead"><div>账号</div><div>状态</div><div>操作</div></div>';
-    list.innerHTML = head + arr.map(a => {
-      const id = a.id || '';
-      const isDone = !!a.checked_in_today;
-      // 判活只看**会话 Cookie 还能不能调通接口**（login_expired 由后端探测
-      // 积分/活动接口得出）。以前还看"本地有没有浏览器 profile"，但实测
-      // 归档 profile 恢复不了登录态，拿它判活会把好号误判成僵尸。
-      const alive = !a.login_expired;
-      const status = isDone
-        ? UI.badge('ok', '✓', '今日已签到')
-        : (alive ? UI.badge('warn', '○', '可签到') : UI.badge('warn', '○', '需重新登录'));
-      const act = isDone
-        ? UI.off('已签到', '今日已签到')
-        : (alive
-          ? UI.act('data-ca-ck', id, '签到', '今天签到')
-          : UI.off('需重登', '华为云会话已失效，点右上角「添加账号」重新登录一次'));
-      // 积分行：每天能领多少 + 一共还剩多少。
-      let credits = '';
-      if (a.credits !== undefined && a.credits !== null) {
-        let s = '剩余 ' + fmtNum(a.credits) + ' 积分';
-        if (a.daily_bonus) s += ' · 每天可领 ' + fmtNum(a.daily_bonus);
-        if (a.credits_used) s += ' · 已用 ' + fmtNum(a.credits_used);
-        if (a.credits_expiring > 0) s += ' · 将过期 ' + fmtNum(a.credits_expiring);
-        if (a.today_gain) s += ' · 今日 +' + fmtNum(a.today_gain);
-        credits = '<div class="note" style="margin-top:4px">' + esc(s) + '</div>';
-      } else if (!alive) {
-        credits = '<div class="note" style="margin-top:4px">会话已失效，积分查不到</div>';
-      }
-      return '<div class="trow">' +
-        '<div class="who"><div class="nm">' + esc(a.label || 'CodeArts 账号') + '</div>' +
-        '<div class="id" title="' + esc(id) + '">' + esc(id) + '</div></div>' +
-        '<div>' + status + credits + '</div>' +
-        '<div class="acts">' + act +
-        UI.sub('data-ca-rm', id, '移除') +
-        '</div>' +
-        '</div>';
-    }).join('');
+    list.innerHTML = arr.map(a => caRowHtml(a, slotById[String(a.id || '')])).join('');
     st.hidden = true;
+    // 点行展开/收起详情；点行内按钮或「重置身份」文字链时不折叠。
+    list.querySelectorAll('[data-ca-row]').forEach(row => {
+      row.addEventListener('click', ev => {
+        const hit = ev.target && ev.target.closest ? ev.target.closest('button, [data-ca-forget]') : null;
+        if (hit) return;
+        const det = row.querySelector('[data-ca-detail]');
+        if (det) det.hidden = !det.hidden;
+      });
+    });
     list.querySelectorAll('button[data-ca-ck]').forEach(b => { b.onclick = () => doCaCheckin(b, b.dataset.caCk); });
+    list.querySelectorAll('button[data-ca-probe]').forEach(b => { b.onclick = () => doCaAction('probe', b.dataset.caProbe, b); });
+    list.querySelectorAll('button[data-ca-keepalive]').forEach(b => { b.onclick = () => doCaAction('keepalive', b.dataset.caKeepalive, b); });
+    list.querySelectorAll('button[data-ca-renew]').forEach(b => { b.onclick = () => doCaAction('renew', b.dataset.caRenew, b); });
     list.querySelectorAll('button[data-ca-rm]').forEach(b => { b.onclick = () => doCaRemove(b.dataset.caRm); });
+    list.querySelectorAll('button[data-ca-relogin]').forEach(b => { b.onclick = () => doCaRelogin(b.dataset.caRelogin); });
+    list.querySelectorAll('[data-ca-forget]').forEach(el => { el.onclick = () => doCaSlotForget(el.dataset.caForget); });
   } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
 }
 
 // doCaAdd 拉浏览器 → 轮询登录态（用户登录成功后自动入库）。
+// watchCaLogin 轮询登录窗口状态：登录成功即入库并刷新签到池。
+// 「添加账号」和「重新登录」（带 id）共用同一套轮询，避免两处判定口径漂移。
+function watchCaLogin() {
+  if (caPollTimer) clearInterval(caPollTimer);
+  caPollTimer = setInterval(async () => {
+    try {
+      const r = await api('ide/codearts/browser/poll');
+      if (r && r.added !== undefined) {
+        clearInterval(caPollTimer); caPollTimer = null;
+        if ($('btnCaStop')) $('btnCaStop').hidden = true;
+        const done = $('addCaDone');
+        if (done) { done.hidden = false; done.className = 'state ok'; done.textContent = r.message || '已添加账号'; }
+        const box = $('addCaState');
+        if (box) box.hidden = true;
+        toast(r.message || '已添加账号', 'ok');
+        loadCkCodeArts(true);
+      } else if (r && r.message) {
+        const b2 = $('addCaState');
+        if (b2) { b2.hidden = false; b2.className = 'state'; b2.textContent = r.message; }
+        const s2 = $('ckCaState');
+        if (s2) { s2.hidden = false; s2.className = 'state'; s2.textContent = r.message; }
+      }
+    } catch (e) { /* 轮询失败继续等 */ }
+  }, 4000);
+}
+
 async function doCaAdd() {
   try {
     const d = await api('ide/codearts/browser/start', { method: 'POST', body: '{}' });
@@ -5240,31 +5968,42 @@ async function doCaAdd() {
     const st = $('ckCaState');
     if (st) { st.hidden = false; st.className = 'state'; st.textContent = '请在弹出的浏览器窗口里登录华为云，登录成功后会自动保存…'; }
     if ($('btnCaStop')) $('btnCaStop').hidden = false;
-    if (caPollTimer) clearInterval(caPollTimer);
-    caPollTimer = setInterval(async () => {
-      try {
-        const r = await api('ide/codearts/browser/poll');
-        if (r && r.added !== undefined) {
-          clearInterval(caPollTimer); caPollTimer = null;
-          if ($('btnCaStop')) $('btnCaStop').hidden = true;
-          const done = $('addCaDone');
-          if (done) { done.hidden = false; done.className = 'state ok'; done.textContent = r.message || '已添加账号'; }
-          if (box) box.hidden = true;
-          toast(r.message || '已添加账号', 'ok');
-          loadCkCodeArts(true);
-        } else if (r && r.message) {
-          const b2 = $('addCaState');
-          if (b2) { b2.hidden = false; b2.className = 'state'; b2.textContent = r.message; }
-          const s2 = $('ckCaState');
-          if (s2) { s2.hidden = false; s2.className = 'state'; s2.textContent = r.message; }
-        }
-      } catch (e) { /* 轮询失败继续等 */ }
-    }, 4000);
+    watchCaLogin();
   } catch (e) {
     const err = $('addCaErr');
     if (err) { err.hidden = false; err.className = 'state err'; err.textContent = e.message; }
     toast(e.message, 'err');
   }
+}
+
+// doCaRelogin 单账号重新登录：带 id 打开登录窗口，复用该号**自己的身份槽**
+// （同一台设备重登，不凭空多出一台"新设备"）。只在「需重新登录」时出现。
+async function doCaRelogin(id) {
+  if (!id) return;
+  try {
+    const d = await api('ide/codearts/browser/start', { method: 'POST', body: JSON.stringify({ id }) });
+    toast(d.message || '已打开登录窗口，请登录华为云');
+    const box = $('addCaState'), err = $('addCaErr');
+    if (err) err.hidden = true;
+    if (box) {
+      box.hidden = false; box.className = 'state';
+      box.innerHTML = '<span class="dots">请在弹出的窗口里重新登录该账号，登录成功后会自动保存…</span>';
+    }
+    if ($('btnCaStop')) $('btnCaStop').hidden = false;
+    watchCaLogin();
+  } catch (e) { toast('打开登录窗口失败：' + e.message, 'err'); }
+}
+
+// doCaSlotForget 重置身份（换设备）：改 SlotID/DeviceGUID，旧槽目录自动备份。
+// 属于不可逆的身份切换 → 必须二次确认；面板只在人工介入的行给这个入口。
+async function doCaSlotForget(id) {
+  if (!id) return;
+  if (!confirm('重置身份会给该账号换一台「新设备」（DeviceGUID 变化），旧槽目录会备份保留。只在该号确实需要换身份时才做，继续？')) return;
+  try {
+    const r = await api('ide/codearts/slot_forget', { method: 'POST', body: JSON.stringify({ id, confirm: true }) });
+    toast('身份已重置' + (r && r.slot_id ? '（新槽 ' + r.slot_id + '）' : ''), 'ok');
+    loadCkCodeArts(true);
+  } catch (e) { toast('重置身份失败：' + e.message, 'err'); }
 }
 
 // doCaStop 关掉 CodeArts 登录窗口。
@@ -5346,15 +6085,16 @@ async function doCheckinAll(btn) {
     parts.push('WorkBuddy 成功 ' + wb.ok + ' · 已签 ' + wb.skip + ' · 失败 ' + wb.fail);
 
     try {
-      // Qoder 现在是「号池逐号签到」，按 results 汇总（不再有单一 phase）。
+      // Qoder 现在是「号池逐号签到」，按 results 七相汇总（不再有单一 phase）。
       const q = await api('ide/qoder/checkin', { method: 'POST', body: '{}' });
       const qr = (q && q.results) || [];
-      const qok = qr.filter(r => r.phase === 'claimed').length;
-      const qal = qr.filter(r => r.phase === 'already').length;
-      const qnop = qr.filter(r => r.phase === 'pending').length;
-      const qf = qr.filter(r => r.phase !== 'claimed' && r.phase !== 'already' && r.phase !== 'pending').length;
-      failCount += qf;
-      let qtxt = '成功 ' + qok + ' · 已签 ' + qal + (qnop ? ' · 暂无活动 ' + qnop : '') + ' · 失败 ' + qf;
+      const qc = qdCounts(qr);
+      const qfail = qc.failed + qc.login_required + qc.error;
+      failCount += qfail;
+      let qtxt = '已领 ' + qc.claimed + ' · 今日已领 ' + qc.already +
+        (qc.blocked ? ' · 同一人已领 ' + qc.blocked + '（未签到）' : '') +
+        (qc.pending ? ' · 今日未下发 ' + qc.pending : '') +
+        (qfail ? ' · 失败 ' + qfail : '');
       if (q && q.credits) qtxt += '（+' + q.credits + '）';
       parts.push('Qoder ' + qtxt);
     } catch (e) { failCount++; parts.push('Qoder 失败：' + e.message); }

@@ -22,8 +22,43 @@ import (
 //   - 误报源头已修复（qoderCheckinAuth 只认「今天下发的活动」CLAIMED）；
 //   - 本地记录改为带时间戳；10:05 前写入的记录视为「可疑」，不参与跳过判定
 //     —— 每天上午重试循环照常巡检，真实签到只可能发生在活动下发之后。
+//
+// v3（2026-11-04）修的是「用户看不到任何动静」：
+//   - 旧版只在"领到了 / 已领过"时才打日志。于是"上游还没下发"这一种状态
+//     **完全静默** —— 日志里连一条记录都没有，用户打开面板只看到"没签上"，
+//     根本不知道后台还在盯着。实测 11-04 10:00→10:10 全天零条 qoder-retry 日志。
+//     现在 pending 也要打，并且写清"上游未下发 + 下次重试时刻"。
+//   - 重试节奏按活动窗口加密：10:00 前后是活动下发的高峰（实测 11-03 是
+//     10:00:02 失败、10:02:01 重试就领到了），这段用 5 分钟；其余时段 30 分钟。
+const (
+	// qoderRetryIdleInterval 非活动窗口的重试间隔。
+	qoderRetryIdleInterval = 30 * time.Minute
+	// qoderRetryHotInterval 活动窗口（10:00 前后）的重试间隔。
+	qoderRetryHotInterval = 5 * time.Minute
+	// qoderHotWindowStart/qoderHotWindowEnd 活动窗口（按 UTC+8 的钟点）。
+	// 上游的活动窗口是 10:00 → 次日 09:59，所以 09:40 起就该进入加密巡检。
+	qoderHotWindowStart = 9*60 + 40
+	qoderHotWindowEnd   = 11*60 + 30
+)
+
+// qoderCST Qoder 活动窗口用的时区（上游按 UTC+8 刷新，实测 11-03 10:00 下发）。
+var qoderCST = time.FixedZone("UTC+8", 8*60*60)
+
+// qoderInHotWindow 当前是否处在活动下发的高峰时段。
+func qoderInHotWindow(now time.Time) bool {
+	m := now.In(qoderCST).Hour()*60 + now.In(qoderCST).Minute()
+	return m >= qoderHotWindowStart && m <= qoderHotWindowEnd
+}
+
+// qoderRetryInterval 下一轮重试的间隔：活动窗口内 5 分钟，其余 30 分钟。
+func qoderRetryInterval(now time.Time) time.Duration {
+	if qoderInHotWindow(now) {
+		return qoderRetryHotInterval
+	}
+	return qoderRetryIdleInterval
+}
+
 func startQoderAutoCheckin(ctx context.Context) {
-	const interval = 30 * time.Minute
 	go func() {
 		// 启动后先等 3 分钟，避开启动瞬间的模型目录预热/余额刷新。
 		select {
@@ -32,6 +67,7 @@ func startQoderAutoCheckin(ctx context.Context) {
 		case <-time.After(3 * time.Minute):
 		}
 		run := func() {
+			now := time.Now()
 			pool, err := ideauth.LoadQoderPool()
 			if err != nil || pool == nil || len(pool.Accounts) == 0 {
 				return
@@ -58,16 +94,19 @@ func startQoderAutoCheckin(ctx context.Context) {
 				}
 				return
 			}
-			if res.Claimed > 0 || res.Already > 0 {
-				log.Printf("[qoder-retry] %s", qoderRetrySummary(res))
-			}
+			// **任何一种结果都要留痕**：包括"上游还没下发"（pending）。
+			// 静默是这次修复的核心 —— 用户看不到日志就以为功能坏了。
+			log.Printf("[qoder-retry] %s；下次重试 %s", qoderRetrySummary(res),
+				now.Add(qoderRetryInterval(now)).Format("15:04:05"))
 		}
 		run()
-		t := time.NewTicker(interval)
-		defer t.Stop()
 		for {
+			// 间隔按当前时刻动态决定：活动窗口内 5 分钟，其余 30 分钟。
+			wait := qoderRetryInterval(time.Now())
+			t := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
+				t.Stop()
 				return
 			case <-t.C:
 				run()

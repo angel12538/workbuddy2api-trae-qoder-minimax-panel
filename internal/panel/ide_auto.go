@@ -111,8 +111,16 @@ func (p *Panel) ideQoderCheckinAll() {
 		log.Printf("panel: Qoder 自动签到失败: %v", err)
 		return
 	}
-	log.Printf("panel: Qoder 自动签到完成：成功 %d / 已签 %d / 同额度组另号已领 %d / 失败 %d（新增 %.0f Credits）",
-		res.Claimed, res.Already, res.Blocked, res.Failed, res.Credits)
+	// "未下发"必须单独报出来：Qoder 的每日活动**不是 10:00 准时下发**，
+	// 10:00 这一轮常常一个都拿不到（实测 11-04：10:00/10:05/10:07/10:10 四次
+	// 上游 campaigns 都是 0）。旧日志只写"成功 0 / 失败 0"，看起来像"啥也没发生"，
+	// 用户只能得出"签不了"的结论，而实际上后台正在每 5 分钟重试。
+	log.Printf("panel: Qoder 自动签到完成：成功 %d / 已签 %d / 同额度组另号已领 %d / 未下发 %d / 失败 %d（新增 %.0f Credits）",
+		res.Claimed, res.Already, res.Blocked, res.Pending, res.Failed, res.Credits)
+	if res.Pending > 0 {
+		log.Printf("panel: Qoder 有 %d 个号上游尚未下发今天的活动（claim_campaigns=0）：已排后台重试，"+
+			"活动一出现就自动领，不用手动操作", res.Pending)
+	}
 }
 
 // ideWorkBuddyCheckinAll WorkBuddy 号池逐号签到。

@@ -137,7 +137,7 @@ func TestQoderSamePersonBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QoderCheckinPool: %v", err)
 	}
-	by := map[string]QoderCheckinResult{}
+	by := map[string]QoderCheckinItem{}
 	for _, r := range out.Results {
 		by[r.Email] = r
 	}
@@ -201,7 +201,7 @@ func TestQoderDifferentPersonNotBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QoderCheckinPool: %v", err)
 	}
-	by := map[string]QoderCheckinResult{}
+	by := map[string]QoderCheckinItem{}
 	for _, r := range out.Results {
 		by[r.Email] = r
 	}
@@ -365,7 +365,7 @@ func TestQoderScanPersonExplanation(t *testing.T) {
 		personSnap("b@x.com", "tok-b", "scope-B"),
 		personSnap("c@x.com", "tok-c", "scope-C"),
 	)
-	writeLog(t, dir, "qoder:a@x.com", time.Now().Format("2006-01-02")+"T23:00:00+08:00")
+	writeLog(t, dir, "qoder:a@x.com", time.Now().In(qoderCST).Format("2006-01-02")+"T23:00:00+08:00")
 
 	rows := QoderPoolScan(nil)
 	by := map[string]QoderScanAccount{}

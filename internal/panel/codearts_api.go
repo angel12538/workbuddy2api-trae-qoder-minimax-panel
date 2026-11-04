@@ -21,10 +21,22 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/codearts"
 )
 
 // caWelfareListJS 在页面里拉活动列表，吐出「每日签到」活动的信息。
@@ -138,14 +150,14 @@ const caWelfareClaimJS = `(async () => {
 
 // caWelfareActivity 页面侧解析出的「每日签到」活动。
 type caWelfareActivity struct {
-	CampaignID   string `json:"campaignId"`
-	Type         string `json:"type"`
-	Status       string `json:"status"`
-	Claimed      bool   `json:"claimed"`
-	Claimable    *bool  `json:"claimable"`
-	BenefitAmt   any    `json:"benefitAmount"`
-	Title        string `json:"title"`
-	Description  string `json:"description"`
+	CampaignID  string `json:"campaignId"`
+	Type        string `json:"type"`
+	Status      string `json:"status"`
+	Claimed     bool   `json:"claimed"`
+	Claimable   *bool  `json:"claimable"`
+	BenefitAmt  any    `json:"benefitAmount"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
 }
 
 // caWelfareIsClaimed 判定这个活动今天是否已经领过。
@@ -311,3 +323,525 @@ func (p *Panel) codeartsClaimViaAPI(ws *wsConn) (phase, msg, sample string, ok b
 
 // itoa 小的整数转字符串（避免为此引 strconv 之外的东西）。
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// ── 账号视图 / 验活 / 补采端点（C-CA-API@1 A/B/C） ───────────────────────
+//
+// 路由由 T11 注册（panel.go 不归本任务）；这里只提供 handler：
+//
+//	GET  /panel/api/ide/codearts/accounts   → p.codeartsAccounts（既有，本任务补齐字段）
+//	POST /panel/api/ide/codearts/keepalive  → p.codeartsKeepaliveHTTP
+//	POST /panel/api/ide/codearts/probe      → p.codeartsProbeHTTP
+
+// codeartsNeedsManual 是否需要人工重新登录（C-CA-API@1 A 的派生规则）。
+//
+// 三个来源任一成立即为真：
+//  1. 补采确认会话已死（ProbeState=login_dead）；
+//  2. 续期停在人工登录页（RenewResult=needs_login）；
+//  3. 已知的绝对票据时间已经过去。
+//
+// ⚠️ 不包含"ticket_deadline 为空"：那是**会话级票据**的正常状态（R1.1.3），
+// 把它当成需人工会导致"会话级账号永远显示要重新登录"。
+func codeartsNeedsManual(a *codearts.Account) bool {
+	if a == nil {
+		return false
+	}
+	if a.ProbeState == "login_dead" || a.RenewResult == "needs_login" {
+		return true
+	}
+	if strings.TrimSpace(a.TicketDeadline) == "" {
+		return false
+	}
+	ddl, err := time.Parse(time.RFC3339, a.TicketDeadline)
+	if err != nil {
+		return false // 解析不了按"未知"处理，不得 panic、也不得当成已过期
+	}
+	return time.Now().After(ddl)
+}
+
+// codeartsKeepaliveResult POST keepalive 的单账号结果（C-CA-API@1 B）。
+type codeartsKeepaliveResult struct {
+	ID                string `json:"id"`
+	OK                bool   `json:"ok"`
+	Phase             string `json:"phase"` // alive|expired|network|error
+	Message           string `json:"message"`
+	CookieCount       int    `json:"cookie_count"`
+	TicketDeadline    string `json:"ticket_deadline"`
+	ExpiresKnownCount int    `json:"expires_known_count"`
+	Refreshed         bool   `json:"refreshed"`
+}
+
+// codeartsProbeResult POST probe 的单账号结果（C-CA-API@1 C）。
+type codeartsProbeResult struct {
+	ID                 string `json:"id"`
+	Phase              string `json:"phase"` // 见 Contract（含 throttled）
+	Message            string `json:"message"`
+	TicketDeadline     string `json:"ticket_deadline"`
+	TicketSource       string `json:"ticket_source"`
+	ExpiresKnownCount  int    `json:"expires_known_count"`
+	SessionCookieCount int    `json:"session_cookie_count"`
+	Evidence           string `json:"evidence"`
+	ProbeAt            string `json:"probe_at"`
+	RenewNextAt        string `json:"renew_next_at"`
+}
+
+// codeartsIDsFromBody 解析 {"ids":[…],"force":bool}。
+//
+// 空 body / 缺省 ids 都表示"全部账号"（契约 B/C 的约定），不是错误。
+func codeartsIDsFromBody(r *http.Request) (ids []string, force bool, err error) {
+	if r == nil || r.Body == nil {
+		return nil, false, nil
+	}
+	raw, rerr := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if rerr != nil {
+		return nil, false, rerr
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, false, nil
+	}
+	var req struct {
+		IDs   []string `json:"ids"`
+		Force bool     `json:"force"`
+	}
+	if uerr := json.Unmarshal(raw, &req); uerr != nil {
+		return nil, false, fmt.Errorf("请求体不是合法 JSON")
+	}
+	return req.IDs, req.Force, nil
+}
+
+// codeartsSelectAccounts 按 ids 挑账号（空 = 全部）。
+//
+// 匹配用 AllIDs（本体 + 历史别名）：号池合并会把旧 ID 记进 Aliases，而前端
+// 手里的 id 可能还是合并前那个；只比本体 ID 会让"点了没反应"。
+func codeartsSelectAccounts(pool *codearts.Pool, ids []string) []*codearts.Account {
+	if pool == nil {
+		return nil
+	}
+	if len(ids) == 0 {
+		out := make([]*codearts.Account, 0, len(pool.Accounts))
+		for _, a := range pool.Accounts {
+			if a != nil {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			want[id] = true
+		}
+	}
+	var out []*codearts.Account
+	for _, a := range pool.Accounts {
+		if a == nil {
+			continue
+		}
+		for _, id := range a.AllIDs() {
+			if want[id] {
+				out = append(out, a)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// codeartsCloneAccount 浅拷贝账号并把 Cookie 切片复制一份。
+//
+// 探活会往账号里写 LastOKAt / 新 Cookie（codearts.Keepalive 内部就改传入的
+// 指针），不复制就会直接改到号池内存对象 —— 随后的 UpdatePool 又从磁盘读一份
+// 新对象，改了等于白改。
+func codeartsCloneAccount(a *codearts.Account) *codearts.Account {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	cp.Cookies = append([]codearts.Cookie(nil), a.Cookies...)
+	cp.Aliases = append([]string(nil), a.Aliases...)
+	return &cp
+}
+
+// codeartsKeepaliveHTTP POST /panel/api/ide/codearts/keepalive
+//
+// 只做"验活 + 收新 Cookie"，不决定什么时候续期（那是 T3 的事）。
+func (p *Panel) codeartsKeepaliveHTTP(w http.ResponseWriter, r *http.Request) {
+	ids, _, err := codeartsIDsFromBody(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	pool, err := codearts.LoadPool()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "读号池失败: "+err.Error())
+		return
+	}
+	targets := codeartsSelectAccounts(pool, ids)
+	results := make([]codeartsKeepaliveResult, len(targets))
+	// 每号独立探活，互不依赖 → 并发；写盘由 UpdatePool 的包级锁串行化。
+	var wg sync.WaitGroup
+	for i, a := range targets {
+		wg.Add(1)
+		go func(i int, a *codearts.Account) {
+			defer wg.Done()
+			results[i] = p.codeartsKeepaliveOne(a)
+		}(i, a)
+	}
+	wg.Wait()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+}
+
+// codeartsKeepaliveOne 对一个账号做一次验活并持久化结果。
+func (p *Panel) codeartsKeepaliveOne(a *codearts.Account) codeartsKeepaliveResult {
+	out := codeartsKeepaliveResult{Phase: "error"}
+	if a == nil {
+		out.Message = "账号为空"
+		return out
+	}
+	out.ID = a.ID
+	out.CookieCount = len(a.Cookies)
+	out.TicketDeadline = a.TicketDeadline
+	out.ExpiresKnownCount = codeartsExpiresKnownCount(a.Cookies)
+	if len(a.Cookies) == 0 {
+		out.Message = "账号没有 Cookie"
+		return out
+	}
+	snap := codeartsCloneAccount(a)
+	before := codeartsCookieDigest(snap.Cookies)
+	ok, err := codearts.Keepalive(snap)
+	out.Phase, out.Message = codeartsKeepalivePhase(ok, err)
+	out.OK = out.Phase == "alive"
+
+	if out.OK {
+		// 成功必写 LastOKAt；只有 Cookie 集合真的变了才算 refreshed 并刷新 SavedAt。
+		out.Refreshed = codeartsPersistKeepalive(snap, before)
+		// 只有成功才把新 Cookie 落盘；失败时号池里仍是旧的这批（别在结果里
+		// 显示一个"已经吸进来了"的条数，那会让人以为结果已保存）。
+		out.CookieCount = len(snap.Cookies)
+		out.TicketDeadline = snap.TicketDeadline
+		out.ExpiresKnownCount = codeartsExpiresKnownCount(snap.Cookies)
+	}
+	return out
+}
+
+// codeartsPersistKeepalive 把一次成功验活写回号池。
+//
+// 并发保护：如果本次请求期间号池里的 Cookie 已被别人（补采/续期/登录）换过，
+// 不再用我们这份更旧的快照覆盖，只更新 LastOKAt。
+func codeartsPersistKeepalive(snap *codearts.Account, beforeDigest string) (refreshed bool) {
+	if snap == nil || snap.ID == "" {
+		return false
+	}
+	lastOK := strings.TrimSpace(snap.LastOKAt)
+	if lastOK == "" {
+		lastOK = codearts.Now()
+	}
+	err := codearts.UpdatePool(func(pool *codearts.Pool) error {
+		x := codeartsFindAccount(pool, snap.ID)
+		if x == nil {
+			return nil
+		}
+		if codeartsCookieDigest(x.Cookies) == beforeDigest &&
+			codeartsCookieDigest(snap.Cookies) != beforeDigest {
+			x.Cookies = append([]codearts.Cookie(nil), snap.Cookies...)
+			x.SavedAt = codearts.Now()
+			x.RefreshTicketDeadline()
+			refreshed = true
+		}
+		x.LastOKAt = lastOK
+		return nil
+	})
+	if err != nil {
+		log.Printf("[codearts] 账号 %s 验活结果写号池失败: %v", snap.ID, err)
+		return refreshed
+	}
+	return refreshed
+}
+
+// codeartsKeepalivePhase 验活结果 → (phase, message)。
+//
+// phase 只允许 alive|expired|network|error（C-CA-API@1 B）：
+//   - expired 必须来自 errors.Is(err, codearts.ErrSessionExpired)；
+//   - 网络错误（DNS/连接拒绝/超时）必须报 network，**不得**报 expired：
+//     那会把一次 DNS 抖动写成"要重新登录"，用户就去重扫一次码了
+//     （实测这台机器一天出现过两次 no such host）。
+func codeartsKeepalivePhase(ok bool, err error) (string, string) {
+	switch {
+	case ok && err == nil:
+		return "alive", "会话可用"
+	case err != nil && errors.Is(err, codearts.ErrSessionExpired):
+		return "expired", err.Error()
+	case err != nil && codeartsNetworkError(err):
+		return "network", "网络错误（不是会话失效）: " + err.Error()
+	case err != nil:
+		return "error", err.Error()
+	}
+	return "error", "接口返回非 200"
+}
+
+// codeartsNetworkError 是不是网络层错误（而不是"会话失效"）。
+func codeartsNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, kw := range []string{"no such host", "connection refused", "i/o timeout",
+		"tls handshake timeout", "connection reset", "broken pipe", "network is unreachable"} {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// codeartsProbeHTTP POST /panel/api/ide/codearts/probe
+//
+// 补采到期时间。浏览器是独占资源 → 逐个账号串行执行（不能并发起两个 Chrome）。
+func (p *Panel) codeartsProbeHTTP(w http.ResponseWriter, r *http.Request) {
+	ids, force, err := codeartsIDsFromBody(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	pool, err := codearts.LoadPool()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "读号池失败: "+err.Error())
+		return
+	}
+	targets := codeartsSelectAccounts(pool, ids)
+	now := time.Now()
+	results := make([]codeartsProbeResult, 0, len(targets))
+	for _, a := range targets {
+		results = append(results, p.codeartsProbeOne(a, force, now))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+}
+
+// codeartsProbeOne 对一个账号做一次补采（含 6 小时节流）。
+func (p *Panel) codeartsProbeOne(a *codearts.Account, force bool, now time.Time) codeartsProbeResult {
+	at := now.Format(time.RFC3339)
+	out := codeartsProbeResult{ProbeAt: at}
+	if a == nil {
+		out.Phase = "error"
+		out.Message = "账号为空"
+		return out
+	}
+	out.ID = a.ID
+	out.RenewNextAt = codeartsNextProbeAt(a, now).Format(time.RFC3339)
+	if len(a.Cookies) == 0 {
+		out.Phase = "no_cookie"
+		out.Message = "这个账号没有 Cookie，无法补采；请先重新登录或粘贴 Cookie"
+		out.TicketDeadline = a.TicketDeadline
+		out.TicketSource = a.TicketSource
+		return out
+	}
+	if !force {
+		if throttled, next := codeartsProbeThrottled(a, now); throttled {
+			out.Phase = "throttled"
+			out.Message = "补采节流中（成功探测后 6 小时、失败后 2 小时各只探测一次）：下次可探测 " +
+				next.Format(time.RFC3339) + "，需要立即执行请带 force=true"
+			out.ProbeAt = a.ProbeAt
+			out.RenewNextAt = next.Format(time.RFC3339)
+			out.TicketDeadline = a.TicketDeadline
+			out.TicketSource = a.TicketSource
+			out.ExpiresKnownCount = codeartsExpiresKnownCount(a.Cookies)
+			out.SessionCookieCount = codeartsSessionCookieCount(a.Cookies)
+			return out
+		}
+	}
+
+	res, err := p.codeartsBackfillAccount(a)
+	if err != nil {
+		// 浏览器/端口不可用：不改写号池，如实报错。
+		out.Phase = "error"
+		out.Message = err.Error()
+		out.TicketDeadline = a.TicketDeadline
+		out.TicketSource = a.TicketSource
+		out.RenewNextAt = now.Add(codeartsProbeFailGap).Format(time.RFC3339)
+		return out
+	}
+	out.Phase = res.Phase
+	out.Message = res.Message
+	out.TicketDeadline = res.TicketDeadline
+	out.TicketSource = res.TicketSource
+	out.ExpiresKnownCount = res.ExpiresKnownCount
+	out.SessionCookieCount = res.SessionCookieCount
+	out.Evidence = res.Evidence
+	// 以号池**实际落盘**的值为准：补采期间可能并发登录/续期改过同一账号，
+	// 直接把内存里的 res 当结果会让面板显示与号池文件不一致。
+	if latest, lerr := codearts.LoadPool(); lerr == nil {
+		if x := codeartsFindAccount(latest, a.ID); x != nil {
+			if x.ProbeAt != "" {
+				out.ProbeAt = x.ProbeAt
+			}
+			out.TicketDeadline = x.TicketDeadline
+			out.TicketSource = x.TicketSource
+			out.ExpiresKnownCount = codeartsExpiresKnownCount(x.Cookies)
+			out.SessionCookieCount = codeartsSessionCookieCount(x.Cookies)
+		}
+	}
+	if res.Phase == "login_dead" || res.Phase == "no_cookie" {
+		// 失败后续期间隔 2 小时（R1.3.2），不是 6 小时。
+		out.RenewNextAt = now.Add(codeartsProbeFailGap).Format(time.RFC3339)
+	} else {
+		out.RenewNextAt = now.Add(codeartsProbeGap).Format(time.RFC3339)
+	}
+	return out
+}
+
+// ── 身份槽端点（C-CA-SLOT@1）────────────────────────────────────────────
+//
+// 路由由 registerRepairRoutes 注册（见 routes_repair.go），这里只提供 handler：
+//
+//	GET  /panel/api/ide/codearts/slots        → 号池里每个账号的身份槽
+//	POST /panel/api/ide/codearts/slot_forget  → 重置某账号的身份（换设备）
+//
+// 为什么要把槽暴露给面板：槽是"这台机器用哪个华为云身份"的唯一载体
+// （evidence/huawei-client-extract-recon.md §H）。只有把 slot_dir / device_guid
+// 展示出来，用户才能核对「两个号确实不在同一台设备上」，而不是凭感觉。
+
+// codeartsSlotsHTTP GET /panel/api/ide/codearts/slots
+//
+// 数据全部来自 p.codeartsSlotsOverview()（号池 + 槽目录现状），额外计算只在
+// 该函数内部；本 handler 不做派生，避免两处口径不一致。
+func (p *Panel) codeartsSlotsHTTP(w http.ResponseWriter, r *http.Request) {
+	slots := p.codeartsSlotsOverview()
+	// 读号池失败时 overview 返回 nil：必须回空数组而不是 null，
+	// 前端 `(d.slots || [])` 对 null 也能处理，但空数组才是"没有账号"的正常表达。
+	if slots == nil {
+		slots = make([]slotInfo, 0)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slots": slots})
+}
+
+// codeartsSlotForgetRequest POST slot_forget 的请求体。
+type codeartsSlotForgetRequest struct {
+	ID      string `json:"id"`
+	Confirm bool   `json:"confirm"`
+}
+
+// codeartsSlotForgetHTTP POST /panel/api/ide/codearts/slot_forget
+//
+// 语义：把该账号的旧槽目录备份成 `<slotDir>.bak-<ts>`，然后换一个新的
+// SlotID/DeviceGUID —— 对华为云而言等于"这台设备不再使用该身份"。
+//
+// 因为这件事**不可逆地换掉设备身份**（虽然旧槽有备份，但服务端已经认了
+// 新设备），所以必须显式 confirm=true；缺确认一律 400 且回明确的
+// code=confirm_required，让调用方知道不是参数格式问题而是"你还没答应"。
+func (p *Panel) codeartsSlotForgetHTTP(w http.ResponseWriter, r *http.Request) {
+	var req codeartsSlotForgetRequest
+	if r.Body != nil {
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "读请求体失败: "+err.Error())
+			return
+		}
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if uerr := json.Unmarshal(raw, &req); uerr != nil {
+				writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
+				return
+			}
+		}
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "缺少 id：需要指明要重置哪个账号的身份槽")
+		return
+	}
+	if err := codeartsSlotForgetConfirmError(req.Confirm); err != nil {
+		// code 字段是给调用方的稳定判据；error 是给人看的原因。
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"code":  "confirm_required",
+			"error": err.Error(),
+		})
+		return
+	}
+
+	pool, err := codearts.LoadPool()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "读号池失败: "+err.Error())
+		return
+	}
+	acc := codeartsFindAccount(pool, id)
+	if acc == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+id)
+		return
+	}
+	acc.EnsureSlot()
+	// 备份目录按"旧槽目录 + .bak-*"回溯：codeartsSlotForget 只负责改名，
+	// 不改方法签名（本任务不改 codearts_slot.go），所以由 HTTP 层从磁盘找真实结果。
+	oldSlotDir := codeartsSlotAbsoluteDir(acc)
+
+	if err := p.codeartsSlotForget(acc); err != nil {
+		// 前提已确认账号存在，到这里失败基本都是槽目录被占用/IO 错误 —— 如实回 500。
+		writeErr(w, http.StatusInternalServerError, "重置身份槽失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"id":         acc.ID,
+		"slot_id":    acc.SlotID,
+		"backup_dir": codeartsSlotLatestBackup(oldSlotDir),
+	})
+}
+
+// codeartsSlotAbsoluteDir 账号槽目录的绝对路径（含 EnsureSlot 的就地补全）。
+//
+// 与 codeartsSlotInfo 里 slot_dir 的口径一致（都是 `<SlotRoot>/<SlotDir>`），
+// 保证「列表里看到的目录」和「重置时备份的目录」是同一个。
+func codeartsSlotAbsoluteDir(a *codearts.Account) string {
+	if a == nil {
+		return ""
+	}
+	a.EnsureSlot()
+	dir := filepath.Join(codearts.SlotRoot(), a.SlotDir)
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
+// codeartsSlotLatestBackup 在旧槽目录旁边找最近一次重置产生的备份目录。
+//
+// 返回空串表示"旧槽本来就不存在，没有可备份的东西"（codeartsSlotForget 的
+// 正常分支），调用方照实回空串，不能编一个路径出来。
+//
+// 用 ReadDir + 前缀匹配而不是 filepath.Glob：Windows 路径里出现 `[`、`*`
+// 等 Glob 元字符会静默匹配不到，这里只做字符串前缀判断。
+func codeartsSlotLatestBackup(oldDir string) string {
+	oldDir = strings.TrimSpace(oldDir)
+	if oldDir == "" {
+		return ""
+	}
+	parent, base := filepath.Dir(oldDir), filepath.Base(oldDir)
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return ""
+	}
+	prefix := base + ".bak-"
+	var best string
+	var bestMod time.Time
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		if best == "" || info.ModTime().After(bestMod) {
+			best, bestMod = filepath.Join(parent, e.Name()), info.ModTime()
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	if abs, aerr := filepath.Abs(best); aerr == nil {
+		return abs
+	}
+	return best
+}

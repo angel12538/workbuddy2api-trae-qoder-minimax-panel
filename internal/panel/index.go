@@ -48,6 +48,10 @@ func setSecurityHeaders(w http.ResponseWriter) {
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 面板是**嵌入式本地服务**：升级二进制后必须立刻拿到新的 HTML/JS，
+	// 否则浏览器会用启发式缓存继续跑**旧版 app.js**（界面与后端对不上，
+	// 表现为"改了没生效"）。no-cache = 每次都回源校验。
+	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(indexHTML)
 }
@@ -56,6 +60,7 @@ func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appJS)
 }

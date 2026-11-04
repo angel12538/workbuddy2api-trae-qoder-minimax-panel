@@ -222,9 +222,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
-	p.mux.HandleFunc("GET /panel/api/trae/accounts", p.withAuth(p.traeAccounts))
+	p.mux.HandleFunc("GET /panel/api/trae/accounts", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.traeAccounts)))
 	// Trae 积分：实时查上游优先，凭证不可用时回落本地快照（助手 remaining_credits.json）。
-	p.mux.HandleFunc("GET /panel/api/trae/credits", p.withAuth(p.traeCredits))
+	p.mux.HandleFunc("GET /panel/api/trae/credits", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.traeCredits)))
 	p.mux.HandleFunc("POST /panel/api/trae/checkin", p.withAuth(p.traeCheckin))
 	// Trae 账号添加：OAuth 授权码 + 本地回调（与上面 WorkBuddy 的 login/* 是两套体系）。
 	p.mux.HandleFunc("POST /panel/api/trae/login/start", p.withAuth(p.traeLoginStart))
@@ -255,19 +255,19 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 
 	// Qoder 本地 IDE 账号（读 h号池 / 添加 / 切号）
-	p.mux.HandleFunc("GET /panel/api/ide/qoder/accounts", p.withAuth(p.qoderAccounts))
+	p.mux.HandleFunc("GET /panel/api/ide/qoder/accounts", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.qoderAccounts)))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/add", p.withAuth(p.qoderAdd))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/switch", p.withAuth(p.qoderSwitch))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/remove", p.withAuth(p.qoderRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/checkin", p.withAuth(p.qoderCheckin))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/checkin_switched", p.withAuth(p.qoderCheckinSwitched))
-	p.mux.HandleFunc("GET /panel/api/ide/qoder/checkin-status", p.withAuth(p.qoderCheckinStatus))
-	p.mux.HandleFunc("GET /panel/api/ide/qoder/usage", p.withAuth(p.qoderUsage))
+	p.mux.HandleFunc("GET /panel/api/ide/qoder/checkin-status", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.qoderCheckinStatus)))
+	p.mux.HandleFunc("GET /panel/api/ide/qoder/usage", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.qoderUsage)))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/renew", p.withAuth(p.qoderRenew))
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/device", p.withAuth(p.qoderDevice))
 
 	// MiniMax Code：多账号号池 + 每日签到 + 积分（token 级操作，无需切号）
-	p.mux.HandleFunc("GET /panel/api/ide/minimax/accounts", p.withAuth(p.minimaxAccounts))
+	p.mux.HandleFunc("GET /panel/api/ide/minimax/accounts", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.minimaxAccounts)))
 	p.mux.HandleFunc("POST /panel/api/ide/minimax/add", p.withAuth(p.minimaxAdd))
 	p.mux.HandleFunc("POST /panel/api/ide/minimax/add_manual", p.withAuth(p.minimaxAddManual))
 	p.mux.HandleFunc("POST /panel/api/ide/minimax/remove", p.withAuth(p.minimaxRemove))
@@ -292,7 +292,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/checkin", p.withAuth(p.doubaoCheckin))
 
 	// CodeArts（华为云码道）：浏览器登录取 Cookie + 每日领取
-	p.mux.HandleFunc("GET /panel/api/ide/codearts/accounts", p.withAuth(p.codeartsAccounts))
+	p.mux.HandleFunc("GET /panel/api/ide/codearts/accounts", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.codeartsAccounts)))
 	p.mux.HandleFunc("POST /panel/api/ide/codearts/remove", p.withAuth(p.codeartsRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/codearts/browser/start", p.withAuth(p.codeartsBrowserStart))
 	p.mux.HandleFunc("POST /panel/api/ide/codearts/browser/stop", p.withAuth(p.codeartsBrowserStop))
@@ -303,6 +303,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/ide/codearts/api_test", p.withAuth(p.codeartsAPITest))
 	p.mux.HandleFunc("GET /panel/api/ide/codearts/sniff", p.withAuth(p.codeartsSniffHeaders))
 	p.mux.HandleFunc("POST /panel/api/ide/codearts/refresh", p.withAuth(p.codeartsRefresh))
+	// 粘贴 Cookie 导入：用户在**自己的浏览器**里登的华为云，面板也能收进来
+	// （不要求调试端口，不限浏览器；方式从来不止一种）。
+	p.mux.HandleFunc("POST /panel/api/ide/codearts/import_cookie", p.withAuth(p.codeartsImportCookie))
 	p.mux.HandleFunc("GET /panel/api/ide/doubao/status", p.withAuth(p.doubaoStatus))
 
 	// Trae IDE 本地账号（读号池 / 添加 / 切号）
@@ -319,8 +322,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/ide/workbuddy/switch", p.withAuth(p.workbuddySwitch))
 	p.mux.HandleFunc("POST /panel/api/ide/workbuddy/remove", p.withAuth(p.workbuddyRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/workbuddy/sync-pool", p.withAuth(p.workbuddySyncPool))
-	p.mux.HandleFunc("GET /panel/api/ide/workbuddy/usage", p.withAuth(p.workbuddyUsage))
+	p.mux.HandleFunc("GET /panel/api/ide/workbuddy/usage", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.workbuddyUsage)))
 	p.mux.HandleFunc("POST /panel/api/ide/workbuddy/checkin", p.withAuth(p.workbuddyCheckin))
+
+	// 三项缺陷修复新增的契约端点（T11）：集中接线，不改任何业务逻辑。
+	// 方法/路径见计划 2.2.4 C-CA-API@1、2.2.11 C-QD-API@1、2.2.14 C-WB-DIAG@1。
+	p.registerRepairRoutes(p.mux)
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -338,6 +345,11 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		if !httpauth.VerifyBearer(r, p.apiKey()) {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
+		}
+		// 任何**写**请求都会改变号池/签到/额度的状态 → 把读接口缓存清掉，
+		// 否则用户点完签到立刻刷新，拿到的还是缓存里的旧值。
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			apiCacheClear()
 		}
 		next(w, r)
 	}

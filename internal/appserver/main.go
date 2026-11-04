@@ -36,11 +36,58 @@ import (
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 //
+// 1.15.8-panel：把 Qoder「额度归属」的结论改成**只说有证据的话** ——
+//  1) 面板上「策略：服务端判定同人」是**默认值**，不是实测结论：旧实现对
+//     claimed/already/claimable 一律回 shared_person，于是每个号都挂着这句。
+//     但 2026-11-04 实测：服务端**从没判过**这两个号同人 —— 两号看到同一条
+//     campaign，grantId / claimedAt 各不相同，各自 +100（额度余额也各自独立：
+//     1700 / 900）。现在只有拿到**本号自己的 grantId** 才叫 isolated，只有服务端
+//     明确回 SAME_PERSON_ALREADY_CLAIMED（或额度归属另有其人）才叫 shared_person，
+//     其余一律 unknown（归属未核实）—— 不再拿没证据的结论当事实说。
+//  2) POST 侧补上「already」的**只读归属探测**（GET .../campaigns/{cid}/reward）：
+//     上游对同一人组的所有号返回同一条已领活动，「already」不等于「本号领过」。
+//     不问就会出现「同一个号两个说法」（POST 说未核实、扫描说独立）和「+100 虚记」。
+//  3) 面板文案同步：不再笼统说「服务端按人发，同一人一天只有一份」—— 那只在
+//     服务端判同人时成立。
+//
+// 1.15.7-panel：修用户实测报出的两个真问题 ——
+//  1) 华为云登录窗口「我登录了但还提示未登录、提取不到」：根因是登录判定
+//     **只看页面文案**。实测现场：浏览器里已有完整登录凭据（domain_tag /
+//     user_tag / hwid_cas_sid / SSOTGC），authui 的 /authui/isLogin 也回
+//     success，但扫码后的 CAS ticket 回跳（302 → redirect_url）失败，页面
+//     停在 authui 登录页 —— 文案判定永远说"未登录"，面板既不报错也不提示。
+//     现在：① 判定加一路**接口实测**（拿活 Cookie 真打控制台只读接口）；
+//     ② 直接读 authui 的**扫码状态机**（/authui/qrcode/status），把
+//     「没扫 / 扫了没授权 / 授权了但回跳失败」区分开；
+//     ③ 授权成功但没回跳时，面板**代为跳转** redirect_url 并复验会话；
+//     ④ 二维码失效时明确提示「点刷新重新出码」（实测扫的是过期码，
+//     服务端 status 一直是 new，从未扫成功）。
+//  2) Qoder 面板「两个号都显示 +100 / 上下重复」：
+//     ① 虚记 —— 服务端按**人**发额度，后打的号回 already 但拿到的是**同一个
+//     campaign 实例**，那 100 积分只进了先打那个号的账。旧实现 already 也记
+//     credits=100，两个号相加凭空多出 100。现在按 campaign 实例回填归属，
+//     额度是同人另号领的 ⇒ credits 归零 + 点名是谁领的 + 文案说清未入账。
+//     ② 重复 —— 上方表格已逐号显示状态与积分，下方「本次尝试」块再逐号重列
+//     一遍。现在该块只画汇总（分桶计数 / 实际入账 / 额度组 / 本轮顺序）。
+//
+// 1.15.6-panel：修三个实测出来的真问题 ——
+//  1) 华为云 CodeArts 续期被**陈旧结论永久锁死**：renew_result=needs_login 是
+//     「上一次尝试的结论」却被当成账号的固有属性，于是用户明明重新登录成功了，
+//     面板还是显示"只能重新登录"，手动「立即续期」386ms 就甩一句 needs_login
+//     （什么都没做）。现在：重新登录后旧结论作废；force 会真的发起一次尝试；
+//     判定结论不再伪装成"刚刚试过"（不再写 RenewAttemptAt）。
+//  2) Qoder 每日活动**不是 10:00 准时下发**，但"上游还没下发"这一状态此前
+//     **完全静默**（日志里一条都没有），用户只能得出"签不了"的结论。
+//     现在 pending 也要留痕，并把重试节奏在活动窗口内加密到 5 分钟。
+//  3) 面板进页"加载很久"：首屏三条渲染链各自独立请求同一批慢接口，
+//     qoder/usage 被并发打 4 次、workbuddy/usage 3 次，最慢的 checkin-status
+//     2.6s 卡住首屏。现在前端合并在途请求，服务端加 15s 短 TTL 缓存。
+//
 // 1.15.5-panel：Qoder 每日额度改按**人**判定（服务端 SAME_PERSON_ALREADY_CLAIMED
 // 实测）—— 不再拿 agentAccountScope 猜分组（实测两个号 scope 不同却共享一份额度）；
 // 跨号判定改成**只读**（GET .../campaigns/{cid}/reward），不会动到别人的额度；
 // 号池里的 scope 改为按账号自身解析（原来读的是主文件的 scope，会记错号）。
-const appVersion = "1.15.5-panel"
+const appVersion = "1.15.8-panel"
 
 // traeRateRange 汇总 Trae 目录的消耗倍率区间（启动日志用）。
 func traeRateRange(ms []traechat.ModelInfo) string {
@@ -405,6 +452,10 @@ func Run() {
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	// Qoder 每日活动「不是准时下发」：后台每 30 分钟补试一次（已签账号不打上游）。
 	startQoderAutoCheckin(ctx)
+	// 时钟核对闸：这套面板所有「每天几点」的判定都按本机时钟算，钟一偏就成片错位
+	// —— 实测这台机器慢整 8 小时，真领到的签到被 10:05 可信线判成「旧版误报」，
+	// 面板整天显示「没签上」。偏了就在日志里大声报警，别让下一次排查从头猜。
+	StartClockSkewGuard(ctx)
 	// Trae 签到自动排程（面板侧独立循环，不进 scheduler 核心，回归面最小）。
 	if cfg.Trae.Enabled {
 		if len(cfg.Trae.AutoHours) > 0 {
@@ -428,6 +479,14 @@ func Run() {
 	} else {
 		log.Printf("IDE 号池自动签到已禁用（schedule.ide_checkin_enabled=false）")
 	}
+	// CodeArts（华为云码道）自动领取 + 趁票据新鲜时静默续期。
+	// 之前它**没有进过任何自动排程**：每日 100 积分只有面板按钮一个入口，
+	// 而网页会话实测只有约 7 小时，靠人记着点必然漏。号池为空时循环自己空返回。
+	pn.StartCodeArtsAuto(ctx)
+	// 预热面板的慢读接口缓存：缓存是进程内的，服务刚重启时是空的，
+	// 用户第一次打开面板要干等上游（实测 checkin-status 冷启动 4.0s）。
+	// 这里提前算好，用户第一次打开就是热的。
+	pn.WarmIDECaches(60 * time.Second)
 	// MiniMax 凭证自动续期：access token 只有 1 小时，refresh token 每刷必轮换，
 	// 号池副本不续就死。每 30 分钟巡检临期账号，与客户端共享同一条 RT 链。
 	pn.StartMinimaxRenewAuto(ctx)

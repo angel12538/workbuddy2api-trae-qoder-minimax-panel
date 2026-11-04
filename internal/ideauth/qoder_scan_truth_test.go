@@ -174,7 +174,7 @@ func TestQoderScanLegacyDateRecordIsNotProof(t *testing.T) {
 
 	writeQoderPool(t, dir, snap("none@x.com", "tok-none"))
 	// 旧格式：纯日期，无时刻信息 → 不可信
-	writeLog(t, dir, "qoder:none@x.com", time.Now().Format("2006-01-02"))
+	writeLog(t, dir, "qoder:none@x.com", time.Now().In(qoderCST).Format("2006-01-02"))
 
 	rows := QoderPoolScan(nil)
 	if len(rows) != 1 {
@@ -204,7 +204,7 @@ func TestQoderScanDeviceQuotaExplained(t *testing.T) {
 
 	writeQoderPool(t, dir, snap("a@x.com", "tok-a"), snap("b@x.com", "tok-b"))
 	// a 号今日已领（可信记录：10:05 之后）
-	writeLog(t, dir, "qoder:a@x.com", time.Now().Format("2006-01-02")+"T23:00:00+08:00")
+	writeLog(t, dir, "qoder:a@x.com", time.Now().In(qoderCST).Format("2006-01-02")+"T23:00:00+08:00")
 
 	rows := QoderPoolScan(nil)
 	byEmail := map[string]QoderScanAccount{}
@@ -238,7 +238,7 @@ func TestQoderScanTrustedLocalFallback(t *testing.T) {
 	t.Setenv("QODER_OPENAPI_BASE", srv.URL)
 
 	writeQoderPool(t, dir, snap("none@x.com", "tok-none"))
-	writeLog(t, dir, "qoder:none@x.com", time.Now().Format("2006-01-02")+"T23:00:00+08:00")
+	writeLog(t, dir, "qoder:none@x.com", time.Now().In(qoderCST).Format("2006-01-02")+"T23:00:00+08:00")
 
 	rows := QoderPoolScan(nil)
 	if len(rows) != 1 {

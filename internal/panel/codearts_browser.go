@@ -12,15 +12,17 @@
 //   - 纯 HTTP 带同一批 Cookie 与不带 Cookie，响应完全一致。
 // ⇒ Cookie 快照只能当**身份标识**，签到必须复用登录时那个浏览器的 profile。
 //
-// 流程：
-//  1. 「添加账号」→ 面板用一个**新 profile 目录**拉起可见浏览器，用户登录一次；
+// 流程（2026-11-03 起改为「每号一个身份槽」，见 codearts_slot.go / §H）：
+//  1. 「添加账号」→ 面板在槽根下的 pending 目录拉起可见浏览器，用户登录一次；
+//     若指定了账号（重登），直接用**该号自己的槽** profile，保证是同一台设备；
 //  2. 面板检测到登录（页面右上角不再有「登录华为云」）→ 提取 Cookie 认人
 //     （用华为云稳定账号 ID domain_tag/user_tag，同一账号重复登录不新增条目）
-//     → 关掉浏览器，**把 profile 目录归档到该账号名下**；
-//  3. 每天签到：用该账号的 profile 拉一个无头浏览器，打开控制台点「每日领取」。
+//     → 关掉浏览器，**把登录产生的 profile 收编进该账号的身份槽**（设备身份载体）；
+//  3. 补采/签到后的浏览器动作一律在该账号的槽内执行，不再新建临时 profile。
 package panel
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -55,17 +57,29 @@ var codeartsBrowserSession struct {
 	cmd       *exec.Cmd
 	exited    chan struct{}
 	startedAt time.Time
+	// dirIsSlot 本次窗口用的是**账号的长期身份槽**（重登路径）。
+	// 这种目录在任何关闭路径上都不能删：删了 = 该号下次动作变成"新设备"。
+	dirIsSlot bool
+	// accountID 重登时指定的账号 ID（"添加账号"时为空）。
+	accountID string
 }
 
 // ── profile 目录 ─────────────────────────────────────────────────────────
 
-// codeartsProfileRoot 浏览器 profile 根目录（config.json 同级的 data/ 下）。
+// codeartsProfileRoot 历史 profile 根目录（config.json 同级的 data/ 下）。
+//
+// 2026-11-03 起新登录不再往这里写：每号身份槽在 <SlotRoot>/<SlotDir>/profile。
+// 这个目录只保留给旧号池的 Slot 字段（历史数据）做只读兼容，见
+// codeartsLegacyWebProfileDir。
 func codeartsProfileRoot(p *Panel) string {
 	return filepath.Join(traeBrowserBaseDir(p), "codearts-web")
 }
 
-// codeartsSlotDir 某个账号的 profile 目录。
-func codeartsSlotDir(p *Panel, slot string) string {
+// codeartsLegacyWebProfileDir 旧版（data/codearts-web/<slot>）的 profile 目录。
+//
+// 只用于兼容历史号池的 Slot 字段（如 slot=ca1d671920b4），新代码一律用
+// (*Panel).codeartsSlotDir(账号)。
+func codeartsLegacyWebProfileDir(p *Panel, slot string) string {
 	if slot == "" {
 		return ""
 	}
@@ -76,35 +90,39 @@ func codeartsSlotDir(p *Panel, slot string) string {
 	return dir
 }
 
-// codeartsPendingDir 新登录用的临时 profile 目录（登录成功后归档到账号名下）。
+// codeartsPendingDir 登录窗口的临时 profile 目录（账号还没认出来时用）。
+//
+// 放在**槽根下**（<SlotRoot>/pending-<ts>），与 §H.3 的物理布局一致：
+// 登录成功后整个目录会被 codeartsAdoptPendingProfile 收编进该号的槽，
+// 成功即消失；残留的 pending-* 就是"登录没完成"，按 §H.6.1 属于可清理对象。
 func codeartsPendingDir(p *Panel) string {
-	dir := filepath.Join(codeartsProfileRoot(p), fmt.Sprintf("pending-%d", time.Now().UnixNano()))
+	dir := filepath.Join(codearts.SlotRoot(), fmt.Sprintf("pending-%d", time.Now().UnixNano()))
 	if abs, err := filepath.Abs(dir); err == nil {
 		dir = abs
 	}
 	return dir
 }
 
-// codeartsProfileUsable 该账号的 profile 目录是否还在（会话还在里面）。
+// codeartsProfileUsable 该账号的身份槽 profile 是否还在。
 func codeartsProfileUsable(p *Panel, acc *codearts.Account) bool {
 	if acc == nil {
 		return false
 	}
-	slot := acc.Slot
-	if slot == "" {
-		slot = acc.ID // 老账号：没有 Slot 就按 ID 找
-	}
-	dir := codeartsSlotDir(p, slot)
-	if dir == "" {
-		return false
-	}
-	st, err := os.Stat(dir)
-	return err == nil && st.IsDir()
+	return acc.SlotExists()
 }
 
 // ── 浏览器 ──────────────────────────────────────────────────────────────
 
 func (p *Panel) codeartsBrowserStart(w http.ResponseWriter, r *http.Request) {
+	// 可选 body：{"id":"<accountID>"}。带 id = 重登某个已知号（复用它的槽 =
+	// 同一台设备）；不带 = "添加账号"，账号此刻还不知道。
+	var req struct {
+		ID string `json:"id"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
 	codeartsBrowserSession.mu.Lock()
 	defer codeartsBrowserSession.mu.Unlock()
 	if codeartsBrowserSession.cmd != nil {
@@ -123,19 +141,30 @@ func (p *Panel) codeartsBrowserStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 每次「添加账号」用**全新**的 profile 目录：不同账号必须彼此隔离
-	// （共用 profile 会串号：后登录的账号覆盖前一个）。
-	dir := codeartsPendingDir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	// 目录选择是身份隔离的核心（§H.I2）：能确定账号就用该号的长期槽；
+	// 确定不了才用 pending 占位，且登录成功后必须收编进槽。
+	dir, inSlot, err := p.codeartsLoginProfileDir(req.ID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	cmd := exec.Command(chrome,
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir="+dir,
-		"--no-first-run", "--no-default-browser-check",
-		codeartsConsoleURL,
-	)
+	if !inSlot {
+		if err := os.MkdirAll(dir, codeartsSlotDirMode); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	// 指纹/出口按账号槽派生：重登已知号必须是"同一台设备"的同一组启动参数，
+	// 否则登录窗口这一侧就已经把设备身份换掉了。
+	// 账号认不出来（添加账号）时 acc=nil，参数与引入指纹前逐字节一致。
+	var acc *codearts.Account
+	if id := strings.TrimSpace(req.ID); id != "" {
+		if pool, perr := codearts.LoadPool(); perr == nil {
+			acc = codeartsFindAccount(pool, id)
+		}
+	}
+	args := codeartsChromeArgsForAccount(codeartsChromeArgs(port, dir, codeartsConsoleURL, false), acc)
+	cmd := exec.Command(chrome, args...)
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {
 		writeErr(w, http.StatusBadGateway, "启动浏览器失败: "+err.Error())
@@ -145,10 +174,13 @@ func (p *Panel) codeartsBrowserStart(w http.ResponseWriter, r *http.Request) {
 	go func() { _ = cmd.Wait(); close(exited) }()
 	codeartsBrowserSession.port = port
 	codeartsBrowserSession.dir = dir
+	codeartsBrowserSession.dirIsSlot = inSlot
+	codeartsBrowserSession.accountID = strings.TrimSpace(req.ID)
 	codeartsBrowserSession.cmd = cmd
 	codeartsBrowserSession.exited = exited
 	codeartsBrowserSession.startedAt = time.Now()
-	log.Printf("[codearts] 浏览器已启动 (port %d, profile %s)，等待登录", port, dir)
+	log.Printf("[codearts] 浏览器已启动 (port %d, profile %s, in_slot=%v, account=%s)，等待登录",
+		port, dir, inSlot, codeartsBrowserSession.accountID)
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "running": true,
 		"message": "浏览器已打开，请登录华为云账号；登录成功后会自动保存"})
@@ -163,8 +195,10 @@ func (p *Panel) codeartsBrowserStop(w http.ResponseWriter, r *http.Request) {
 
 // codeartsStopBrowserLocked 关掉登录窗口。
 //
-// keepProfile=false 时连 profile 目录一起删（超时未登录的临时目录要清掉）；
-// keepProfile=true 时保留目录 —— 登录成功的 profile 要归档给账号长期用。
+// keepProfile=false 时清掉**临时** profile 目录（超时未登录的 pending 目录）。
+// 两种情况**绝不删目录**：
+//   - keepProfile=true（登录成功，由调用方收编进槽或保留）；
+//   - dirIsSlot=true（本次窗口用的就是账号的长期槽，删了等于让该号换设备）。
 func codeartsStopBrowserLocked(keepProfile bool) {
 	if codeartsBrowserSession.cmd != nil {
 		_ = codeartsBrowserSession.cmd.Process.Kill()
@@ -178,11 +212,79 @@ func codeartsStopBrowserLocked(keepProfile bool) {
 		codeartsBrowserSession.cmd = nil
 		codeartsBrowserSession.exited = nil
 	}
-	if !keepProfile && codeartsBrowserSession.dir != "" {
+	if !keepProfile && !codeartsBrowserSession.dirIsSlot && codeartsBrowserSession.dir != "" {
 		_ = os.RemoveAll(codeartsBrowserSession.dir)
 	}
 	codeartsBrowserSession.dir = ""
+	codeartsBrowserSession.dirIsSlot = false
+	codeartsBrowserSession.accountID = ""
 	codeartsBrowserSession.port = 0
+}
+
+// codeartsBrowserWaitLogin 处理"还没登录"这一步：读 authui 的扫码状态机，
+// 把「没扫 / 扫了没授权 / 授权了但回跳失败」三种情况区分开，并给出能照做的提示。
+//
+// 这是 2026-11-04 用户报「我登陆了但仍提示登录、提取不到」的正面修法。
+// 根因（实测）：扫码成功后 authui 靠 302 → redirect_url（带 CAS ticket）
+// 回跳控制台换会话；这一步失败时页面停在登录页，旧的文案判定永远说"未登录"，
+// 面板既不报错也不提示，用户完全看不到卡在哪。
+//
+// 三种状态的处理：
+//   - authorized + redirect_url：面板**代为跳转**并复验会话；通了就继续走保存流程。
+//   - authorizing：正在授权，等下一轮。
+//   - new / 427：二维码没被扫成功（最常见是扫了张过期码），明确让用户刷新重扫。
+func (p *Panel) codeartsBrowserWaitLogin(w http.ResponseWriter, r *http.Request, port int, text string, cookies []codearts.Cookie) {
+	msg := "还没检测到华为云登录态，请在浏览器窗口里完成登录"
+	qr := codeartsQRProbe(port)
+	if qr.Known && qr.Status == "authorized" && qr.RedirectURL != "" {
+		// 扫码授权成功，但页面没自己跳回去（CAS ticket 回跳失败）。
+		log.Printf("[codearts] 扫码已授权但页面未回跳（port %d），面板代为跳转", port)
+		if err := codeartsNavigateTo(port, qr.RedirectURL); err == nil {
+			time.Sleep(3 * time.Second)
+			if codeartsConsoleSessionAlive(mustCDPCookies(port)) {
+				log.Printf("[codearts] 代跳后控制台会话已通（port %d）", port)
+				// 回跳成功 → 重跑一次完整判定（Cookie 已更新），这次会走保存流程。
+				p.codeartsBrowserPoll(w, r)
+				return
+			}
+		}
+		msg = "扫码已成功，但华为云回跳控制台失败（票据交换被拒）。请在窗口里刷新二维码后重扫一次"
+	} else if m := codeartsLoginMessage(qr, text); m != "" {
+		msg = m
+	}
+	if msg == "还没检测到华为云登录态，请在浏览器窗口里完成登录" && strings.Contains(text, "登录华为云") {
+		msg = "浏览器还停在登录页，请完成登录后自动保存"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "running": true, "cookies": len(cookies),
+		"sample": trimText(text, 200), "message": msg,
+	})
+}
+
+// codeartsLoginMessage 按 authui 的扫码状态给出能照做的提示（纯函数，便于测试）。
+//
+// authui 的 /authui/qrcode/status 实测会回这些状态：
+//
+//	new        二维码刚出，没被扫过
+//	authorizing 扫到了，正在授权
+//	authorized  授权完成（带 redirect_url = CAS 回跳地址）
+//	expired    二维码已过期（2026-11-04 实测现场就是这个）
+//
+// 另外 error_code=427 也是「二维码失效，需要刷新」，页面文案里同时会出现
+// 「二维码已失效 刷新」。三条判据（状态 / 错误码 / 文案）取并集，避免任何
+// 一条变化就漏判 —— 漏判的表现是笼统地说"还没登录"，用户完全看不到卡在哪。
+//
+// 返回空串 = 没有可给的具体状态（调用方用默认文案）。
+func codeartsLoginMessage(qr codeartsQRState, text string) string {
+	switch {
+	case qr.Known && qr.Status == "authorizing":
+		return "已扫到二维码，正在授权，请稍等（授权完成后会自动保存）"
+	case qr.Known && (qr.Status == "expired" || qr.ErrorCode == "427" || codeartsQRExpired(text)):
+		return "二维码已失效，请点一下二维码旁的「刷新」重新出码后扫码（旧的扫了也不会成功）"
+	case qr.Known && qr.Status == "new":
+		return "请用华为云 App 扫描窗口里的二维码（面板会自动保存，不需要手动确认）"
+	}
+	return ""
 }
 
 // codeartsBrowserPoll 检测登录并把账号写入号池。
@@ -236,14 +338,24 @@ func (p *Panel) codeartsBrowserPoll(w http.ResponseWriter, r *http.Request) {
 	// 消失、换成「活动福利 / 新建任务 / 工作台」等模块（实测页面文案）。
 	text, nick, logged := codeartsLoginProbe(port)
 	if !logged {
-		msg := "还没检测到华为云登录态，请在浏览器窗口里完成登录"
-		if strings.Contains(text, "登录华为云") {
-			msg = "浏览器还停在登录页，请完成登录后自动保存"
+		// ⚠️ 只看页面文案会漏掉**登录成功但页面没跳回来**的情况（实测 2026-11-04）：
+		// 扫码后 authui 会 302 到 redirect_url（带 CAS ticket）换控制台会话，
+		// 这一步失败时页面停在 authui 登录页 —— 文案判定永远说"未登录"。
+		// 但此时浏览器里**已经有**控制台会话 Cookie（devclouddevuibjJ_SESSION_ID）
+		// 和**认证侧**身份 Cookie（domain_tag/user_tag）。
+		//
+		// 所以这里补一路**实测**：拿浏览器当下的活 Cookie 直接打控制台只读接口，
+		// 通 → 就是真登录了（保存）；不通 → 确实还没登录。
+		if codeartsConsoleSessionAlive(cookies) {
+			logged = true
+			if nick == "" {
+				nick = codeartsNicknameOf(cookies)
+			}
+			log.Printf("[codearts] 页面文案未判登录，但控制台接口实测已登录（port %d），按已登录处理", port)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": true, "running": true, "cookies": len(cookies),
-			"sample": trimText(text, 200), "message": msg,
-		})
+	}
+	if !logged {
+		p.codeartsBrowserWaitLogin(w, r, port, text, cookies)
 		return
 	}
 	// **关掉窗口**：登录已经完成，会话凭据存在号池里（Cookie 快照），
@@ -254,9 +366,27 @@ func (p *Panel) codeartsBrowserPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 关窗口前先记住本次用的目录，并**一律保留**（keepProfile=true）：
+	// 登录产生的 profile 就是这台"设备"的身份载体（Local State / Network
+	// Persistent State / Local Storage），要么收编进该号的槽，要么（收编失败时）
+	// 明确清掉，不能由 StopBrowser 顺手删。
 	codeartsBrowserSession.mu.Lock()
-	codeartsStopBrowserLocked(false) // profile 不再归档，临时目录直接清掉
+	pendingDir := codeartsBrowserSession.dir
+	inSlot := codeartsBrowserSession.dirIsSlot
+	codeartsStopBrowserLocked(true)
 	codeartsBrowserSession.mu.Unlock()
+
+	if acc != nil && !inSlot && pendingDir != "" {
+		if aerr := p.codeartsAdoptPendingProfile(acc, pendingDir); aerr != nil {
+			log.Printf("[codearts] 账号 %s 的登录 profile 收编进身份槽失败: %v"+
+				"（该槽将按空 profile 新建 —— 下次动作等同新设备）", acc.ID, aerr)
+			_ = os.RemoveAll(pendingDir)
+		}
+	}
+
+	// 会话最值钱的就是刚抓到的这一刻：当场把今天的份领掉，不等下一个排程。
+	// （实测会话寿命约 7 小时，等定时任务很可能等到会话已死。）
+	p.codeartsAutoClaimAfterLogin(acc)
 
 	msg := "已保存：" + acc.Label
 	if !added {
@@ -276,20 +406,19 @@ func (p *Panel) codeartsBrowserPoll(w http.ResponseWriter, r *http.Request) {
 // 同一个 Identity 再次登录 → **更新原记录**（保留原 ID，保住签到历史），
 // 不再新增一条"看起来像另一个号"的僵尸记录。
 //
-// 关于 profile 归档：2026-10-30 实测证明**归档下来的 profile 恢复不了登录态**
+// 关于 profile：2026-10-30 实测证明归档下来的 profile **恢复不了登录态**
 // （浏览器一关，domain_tag / user_tag 这些会话 Cookie 一起消失，用归档目录
-// 打开控制台照样显示「登录华为云」）。所以不再归档——它只占磁盘（实测残留
-// 1.5GB）却不带来任何免登录能力。签到主路径是纯 HTTP。
+// 打开控制台照样显示「登录华为云」）。所以 profile 不用于免登录；
+// 2026-11-03 起它有了新用途——**设备身份容器**（§H.4）：登录成功后由
+// codeartsBrowserPoll 把 pending profile 收编进该号的槽，签到主路径仍是纯 HTTP。
 func (p *Panel) codeartsSaveLogin(cookies []codearts.Cookie, nick, pendingDir string, port int, pageText string) (*codearts.Account, bool, error) {
-	pool, err := codearts.LoadPool()
-	if err != nil {
-		return nil, false, err
+	if len(cookies) == 0 {
+		return nil, false, fmt.Errorf("没有 Cookie 可保存")
 	}
-	// 先把历史上的重复记录合并掉（同一个人被拆成多条时用）。
-	if merged := codearts.MergePool(pool); merged > 0 {
-		log.Printf("[codearts] 号池合并：%d 条重复记录已并入同一个人", merged)
-	}
-
+	// 先算归一结论：登录保存与补采必须用**同一套**判定。否则重新登录这条路径
+	// 只会把 TicketDeadline 算成空、TicketSource 留空 —— 这正是缺陷一里
+	// "重新登录也不采集过期时间"的语义缺口（路径 B/C）。
+	capture := codeartsCaptureResultFromCookies(cookies)
 	identity := codearts.IdentityOf(cookies)
 	if identity == "" {
 		// 退一步：页面上的稳定账号标识。
@@ -299,90 +428,109 @@ func (p *Panel) codeartsSaveLogin(cookies []codearts.Cookie, nick, pendingDir st
 	}
 	fp := codearts.Fingerprint(cookies)
 
-	// 找同一个人已有的账号。
-	var existing *codearts.Account
-	for _, a := range pool.Accounts {
-		if a == nil {
-			continue
+	var saved *codearts.Account
+	var added bool
+	// 整个"读号池 → 认人 → 合并 → 写回"放在 UpdatePool 事务里：登录、补采、
+	// 续期、保活都在并发写同一个文件，裸 Load→Save 会互相丢更新（R4.3）。
+	err := codearts.UpdatePool(func(pool *codearts.Pool) error {
+		// 先把历史上的重复记录合并掉（同一个人被拆成多条时用）。
+		if merged := codearts.MergePool(pool); merged > 0 {
+			log.Printf("[codearts] 号池合并：%d 条重复记录已并入同一个人", merged)
 		}
-		if identity != "" && a.Identity != "" && a.Identity == identity {
-			existing = a
-			break
-		}
-	}
-	if existing == nil && identity != "" {
-		// 老号池没有 Identity 字段，用现存的 Cookie 反算一次再比。
+
+		// 找同一个人已有的账号。
+		var existing *codearts.Account
 		for _, a := range pool.Accounts {
 			if a == nil {
 				continue
 			}
-			if codearts.IdentityOf(a.Cookies) == identity {
+			if identity != "" && a.Identity != "" && a.Identity == identity {
 				existing = a
 				break
 			}
 		}
-	}
-
-	accID := fp
-	slot := fp
-	if existing != nil {
-		// 同一个人：沿用原 ID 与 slot（签到记录按 ID 存，不能换）。
-		accID = existing.ID
-		slot = existing.Slot
-		if slot == "" {
-			slot = existing.ID
+		if existing == nil && identity != "" {
+			// 老号池没有 Identity 字段，用现存的 Cookie 反算一次再比。
+			for _, a := range pool.Accounts {
+				if a == nil {
+					continue
+				}
+				if codearts.IdentityOf(a.Cookies) == identity {
+					existing = a
+					break
+				}
+			}
 		}
-	}
-	// 新账号的 ID 不能和别人的撞：撞了就用 identity 派生一个。
-	if existing == nil {
-		taken := false
+
+		accID := fp
+		slot := fp
+		if existing != nil {
+			// 同一个人：沿用原 ID 与 slot（签到记录按 ID 存，不能换）。
+			accID = existing.ID
+			slot = existing.Slot
+			if slot == "" {
+				slot = existing.ID
+			}
+		}
+		// 新账号的 ID 不能和别人的撞：撞了就用 identity 派生一个。
+		if existing == nil {
+			taken := false
+			for _, a := range pool.Accounts {
+				if a != nil && a.ID == accID {
+					taken = true
+					break
+				}
+			}
+			if taken {
+				if identity != "" {
+					accID = codearts.Fingerprint([]codearts.Cookie{{Name: "identity", Value: identity}})
+				} else {
+					// 认不出身份时只能用「指纹 + 序号」保证唯一，
+					// 否则所有认不出身份的账号会拿到**同一个** ID，又会撞车。
+					accID = fp + "-" + codearts.Seq(len(pool.Accounts)+1)
+				}
+				if accID == fp {
+					accID = accID + "b"
+				}
+				slot = accID
+			}
+		}
+
+		acc := &codearts.Account{
+			ID: accID, Identity: identity, Cookies: cookies, SavedAt: codearts.Now(),
+			Nickname: nick, DomainID: codearts.DomainIDOf(cookies), Slot: slot, Port: port,
+			// 来源标记：这条会话是面板登录窗口拿到的（§H.2 ClientSource）。
+			ClientSource: codearts.ClientSourceBrowser,
+		}
+		if nick != "" {
+			acc.Label = nick
+		}
+		// 端口是**独占**的：上一个登录窗口关掉后端口立刻被回收复用，
+		// 这个端口现在属于本次登录。别的账号还留着同一个端口记录的话，
+		// 签到时会连到**别人的窗口**、用别人的会话替它签到（假签到）。
+		// 所以这里把其它账号的同端口记录清掉。
 		for _, a := range pool.Accounts {
-			if a != nil && a.ID == accID {
-				taken = true
-				break
+			if a != nil && port > 0 && a.Port == port {
+				a.Port = 0
 			}
 		}
-		if taken {
-			if identity != "" {
-				accID = codearts.Fingerprint([]codearts.Cookie{{Name: "identity", Value: identity}})
-			} else {
-				// 认不出身份时只能用「指纹 + 序号」保证唯一，
-				// 否则所有认不出身份的账号会拿到**同一个** ID，又会撞车。
-				accID = fp + "-" + codearts.Seq(len(pool.Accounts) + 1)
-			}
-			if accID == fp {
-				accID = accID + "b"
-			}
-			slot = accID
+		saved, added = codearts.Upsert(pool, acc)
+		// Upsert 里命中的老账号要补上 Identity（老号池没这个字段）。
+		if saved.Identity == "" && identity != "" {
+			saved.Identity = identity
 		}
-	}
-
-	acc := &codearts.Account{
-		ID: accID, Identity: identity, Cookies: cookies, SavedAt: codearts.Now(),
-		Nickname: nick, DomainID: codearts.DomainIDOf(cookies), Slot: slot, Port: port,
-	}
-	if nick != "" {
-		acc.Label = nick
-	}
-	// 端口是**独占**的：上一个登录窗口关掉后端口立刻被回收复用，
-	// 这个端口现在属于本次登录。别的账号还留着同一个端口记录的话，
-	// 签到时会连到**别人的窗口**、用别人的会话替它签到（假签到）。
-	// 所以这里把其它账号的同端口记录清掉。
-	for _, a := range pool.Accounts {
-		if a != nil && port > 0 && a.Port == port {
-			a.Port = 0
-		}
-	}
-	saved, added := codearts.Upsert(pool, acc)
-	// Upsert 里命中的老账号要补上 Identity（老号池没这个字段）。
-	if saved.Identity == "" && identity != "" {
-		saved.Identity = identity
-	}
-	// 再跑一遍号池整理：新账号加进来后 slot 可能和老账号撞了
-	// （老账号的 slot 是历史遗留的，新账号的 slot 是按指纹派生的）。
-	// slot 撞车 = 两个账号共用同一个本地目录。
-	codearts.MergePool(pool)
-	if err := codearts.SavePool(pool); err != nil {
+		// 会话来自面板登录窗口 —— 覆盖旧的 ClientSource（import/paste → browser）。
+		saved.ClientSource = codearts.ClientSourceBrowser
+		// Upsert 内部的 RefreshTicketDeadline 只能判"有绝对票据"，判不出
+		// "全是会话级"；这里用归一结论覆盖，登录后 ticket_source 才立即可见。
+		codeartsApplyCaptureMeta(saved, capture, codearts.Now())
+		// 再跑一遍号池整理：新账号加进来后 slot 可能和老账号撞了
+		// （老账号的 slot 是历史遗留的，新账号的 slot 是按指纹派生的）。
+		// slot 撞车 = 两个账号共用同一个本地目录。
+		codearts.MergePool(pool)
+		return nil
+	})
+	if err != nil {
 		return nil, false, err
 	}
 	log.Printf("[codearts] 账号已保存: id=%s identity=%s slot=%s added=%v", saved.ID, identity, saved.Slot, added)
@@ -411,7 +559,12 @@ func copyDir(src, dst string) error {
 	})
 }
 
-// codeartsCookiesOf 只取 huaweicloud 域下的 Cookie。
+// codeartsCookiesOf 只取 huaweicloud 域下的 Cookie，并**统一走归一入口**。
+//
+// 为什么不在这里自己判断 expires：CDP 的 `expires=-1` 表示会话 Cookie、`0`
+// 表示没给（或字段缺失），两者的语义完全不同；各调用点自己解释的结果就是
+// "采到了 -1 但号池里什么都没有"（旧版正是因为丢了 expires，号池里 51/55 条
+// Cookie 没有一条带过期信息）。归一只有一个入口：codearts.NewObservedCookie。
 func codeartsCookiesOf(all []cdpCookie) []codearts.Cookie {
 	var out []codearts.Cookie
 	for _, c := range all {
@@ -422,10 +575,242 @@ func codeartsCookiesOf(all []cdpCookie) []codearts.Cookie {
 		if !strings.Contains(d, "huaweicloud") && !strings.Contains(d, "huawei") {
 			continue
 		}
-		out = append(out, codearts.Cookie{Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path})
+		// 保留 expires=-1（会话 Cookie）：归一函数会把它落成
+		// {Expires:-1, ExpiresKnown:true, Session:true}。
+		out = append(out, codearts.NewObservedCookie(c.Name, c.Value, c.Domain, c.Path, c.Expires))
 	}
 	return out
 }
+
+// mustCDPCookies 读浏览器当前 Cookie；读失败返回空切片（调用方自己判空）。
+func mustCDPCookies(port int) []codearts.Cookie {
+	all, err := cdpAllCookies(port)
+	if err != nil {
+		return nil
+	}
+	return codeartsCookiesOf(all)
+}
+
+// codeartsNavigateTo 把登录窗口里**当前正在登录的那个页面**导航到目标 URL。
+//
+// 为什么只导航当前页而不是新开标签：新开标签会打断 authui 的页面上下文
+//（client_key、service 参数都在原页面的 URL 上），而且用户会看到多一个标签页。
+func codeartsNavigateTo(port int, target string) error {
+	pages, err := caListPages(port)
+	if err != nil {
+		return err
+	}
+	for _, p := range pages {
+		if !strings.Contains(p.URL, "auth.huaweicloud.com") {
+			continue
+		}
+		ws, derr := wsDial(p.WS, 6*time.Second)
+		if derr != nil {
+			continue
+		}
+		nerr := caNavigate(ws, target)
+		_ = ws.Close()
+		if nerr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("没有可导航的登录页面")
+}
+
+// codeartsConsoleSessionAlive 用**浏览器当下的活 Cookie** 打控制台只读接口，
+// 判断控制台侧会话是不是真的活着。
+//
+// 为什么需要它（实测 2026-11-04 11:0x）：
+//   - 页面文案判定只在"登录成功**且**页面跳回控制台"时才成立；
+//   - 但 authui 扫码成功后的 CAS ticket 回跳（302 → redirect_url）可能失败，
+//     此时页面停在 authui 登录页、文案永远说"未登录"，而浏览器里其实已经有
+//     可用的控制台会话（devclouddevuibjJ_SESSION_ID + cftk 齐全）。
+//   - 反过来，光看 Cookie 名字也会误判：未登录时同样有 SessionID / HWWAFSESID。
+//
+// 判据用**接口实测**：真打一次 /chat/snap-manager/v1/package/overview，
+// 拿到非空 JSON 才算活。这是唯一不会骗人的判据。
+//
+// ⚠️ 只读接口：不 claim、不改号池、不刷新任何凭据。
+func codeartsConsoleSessionAlive(cookies []codearts.Cookie) bool {
+	if len(cookies) == 0 {
+		return false
+	}
+	// 缺控制台侧会话 Cookie 就不用发请求了（省一次网络往返）。
+	names := map[string]string{}
+	for _, c := range cookies {
+		names[c.Name] = c.Value
+	}
+	if names["devclouddevuibjJ_SESSION_ID"] == "" && names["devclouddevuibjtcftk"] == "" {
+		return false
+	}
+	// 自己拼请求而不是复用 codearts.Credits：那个走 8 秒超时的共享 client，
+	// 放在登录轮询里会让界面卡住。这里给 4 秒。
+	parts := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		if c.Name == "" || c.Value == "" {
+			continue
+		}
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	req, err := http.NewRequest(http.MethodGet,
+		codearts.APIBase+"/chat/snap-manager/v1/package/overview", nil)
+	if err != nil {
+		return false
+	}
+	h := req.Header
+	h.Set("Cookie", strings.Join(parts, "; "))
+	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+	h.Set("Accept", "application/json, text/plain, */*")
+	h.Set("Referer", codearts.APIBase+"/chat/home")
+	h.Set("language", "zh-cn")
+	h.Set("x-language", "zh-cn")
+	h.Set("x-codearts-doer-scenario-type", "web")
+	h.Set("x-requested-with", "XMLHttpRequest")
+	h.Set("Agent-Type", "PromptCenter")
+	if cftk := names["devclouddevuibjtcftk"]; cftk != "" {
+		h.Set("cftk", cftk)
+	}
+	cl := &http.Client{Timeout: 4 * time.Second}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 实测：会话失效的特征是 HTTP 200 + **空 body**（见 codearts.ErrSessionExpired）。
+	// 有内容 = 接口真的返回了数据 = 会话活着。
+	return resp.StatusCode == http.StatusOK && len(bytes.TrimSpace(raw)) > 0
+}
+
+// codeartsQRExpired 判断登录页上的二维码是否已失效。
+//
+// 实测文案：华为云 authui 二维码过期时页面出现「二维码已失效 刷新」。
+// 这是最高频的卡点 —— 用户扫的是一张过期码，服务端 /authui/qrcode/status
+// 一直是 {"status":"new"}（从未扫成功），用户却以为"我登录了"。
+func codeartsQRExpired(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, kw := range []string{"二维码已失效", "二维码已过期", "扫码已失效"} {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// codeartsNicknameOf 从 Cookie 里取账号昵称（masked_user 形如 h*********uvj421wxe）。
+func codeartsNicknameOf(cookies []codearts.Cookie) string {
+	for _, c := range cookies {
+		if c.Name == "masked_user" && c.Value != "" {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// ── 扫码登录状态（authui）────────────────────────────────────────────────
+
+// codeartsQRState authui 扫码状态机（实测 2026-11-04 反查 app.bundle.js + 真实响应）。
+//
+//	{"status":"new"}        二维码刚出，还没扫
+//	{"status":"authorizing"} 扫到了，正在授权
+//	{"status":"authorized"}  授权成功 —— **redirect_url 里带 CAS ticket**，
+//	                        前端就是 window.location.href = redirect_url 回跳控制台
+//
+// 为什么面板要自己读它（而不是只看页面文案）：
+// 用户扫码成功后，authui 会 302 到 redirect_url 换控制台会话。这一步失败时
+// 页面停在登录页、文案判定永远说"未登录"，用户看到的就是"我登录了但还是提示
+// 登录、也提取不到"—— 面板既不报错也不提示，用户完全不知道卡在哪。
+// 读 qrcode/status 能把「扫码没成功」「扫了没授权」「授权了但回跳失败」
+// 三种状态区分开，给出准确提示。
+type codeartsQRState struct {
+	// Status new / authorizing / authorized / 其它
+	Status string `json:"status"`
+	// RedirectURL 授权成功后的回跳地址（带 ticket）
+	RedirectURL string `json:"redirect_url"`
+	// ErrorCode authui 的错误码（427 = 二维码失效需要刷新）
+	ErrorCode string `json:"error_code"`
+	// Known 页面里没有 authui 登录页（false = 不在扫码流程里）
+	Known bool `json:"known"`
+}
+
+// codeartsQRProbe 在**登录窗口的 authui 页面里**读扫码状态。
+//
+// ⚠️ 必须用页面上下文发（fetch with credentials），因为 client_key 是页面
+// 轮询时自己生成并带在 URL 上的；纯 HTTP 拿不到当前页面的 client_key。
+//
+// 只读：只 GET /authui/qrcode/status，不点任何按钮、不领任何东西。
+func codeartsQRProbe(port int) codeartsQRState {
+	pages, err := caListPages(port)
+	if err != nil {
+		return codeartsQRState{}
+	}
+	for _, p := range pages {
+		if !strings.Contains(p.URL, "auth.huaweicloud.com") {
+			continue
+		}
+		ws, derr := wsDial(p.WS, 6*time.Second)
+		if derr != nil {
+			continue
+		}
+		raw, eerr := caEval(ws, codeartsQRStatusJS)
+		_ = ws.Close()
+		if eerr != nil {
+			continue // 页面正在跳转，下一轮再读
+		}
+		var st codeartsQRState
+		if json.Unmarshal(raw, &st) != nil {
+			continue
+		}
+		st.Known = true
+		return st
+	}
+	return codeartsQRState{}
+}
+
+// codeartsQRStatusJS 在 authui 页面里取 client_key 并读扫码状态。
+const codeartsQRStatusJS = `(async () => {
+  const q = new URLSearchParams(location.search);
+  const service = q.get('service') || '';
+  // client_key 在页面自己的轮询 URL 上：从 performance 资源里反查。
+  let ck = '';
+  try {
+    const r = performance.getEntriesByType('resource').map(e => e.name)
+      .filter(n => n.indexOf('/authui/qrcode/status') >= 0);
+    for (const n of r) {
+      const m = n.match(/[?&]client_key=([^&]+)/);
+      if (m) { ck = decodeURIComponent(m[1]); break; }
+    }
+  } catch (e) {}
+  if (!ck) {
+    // 轮询还没发出去过：从 qrcode 请求里找
+    try {
+      const r2 = performance.getEntriesByType('resource').map(e => e.name)
+        .filter(n => n.indexOf('/authui/qrcode') >= 0);
+      for (const n of r2) {
+        const m = n.match(/[?&]client_key=([^&]+)/);
+        if (m) { ck = decodeURIComponent(m[1]); break; }
+      }
+    } catch (e) {}
+  }
+  if (!ck) return JSON.stringify({ status: '', known: true });
+  try {
+    const u = '/authui/qrcode/status?client_key=' + encodeURIComponent(ck) +
+      (service ? '&service=' + encodeURIComponent(service) : '');
+    const r = await fetch(u, { credentials: 'same-origin' });
+    const t = await r.text();
+    let p = null;
+    try { p = JSON.parse(t); } catch (e) {}
+    if (!p) return JSON.stringify({ status: '', known: true, error_code: 'not-json' });
+    return JSON.stringify({
+      status: p.status || '', redirect_url: p.redirect_url || '',
+      error_code: p.error_code || '', known: true
+    });
+  } catch (e) {
+    return JSON.stringify({ status: '', known: true, error_code: String(e) });
+  }
+})()`
 
 // codeartsLoginProbe 读**已打开**的页面，判定是否已登录。
 //
@@ -724,15 +1109,16 @@ func (p *Panel) codeartsAccounts(w http.ResponseWriter, r *http.Request) {
 //
 // login_expired 的判据是**接口真的查不通**（会话失效），而不是"本地有没有
 // profile"——实测归档 profile 恢复不了登录态，拿它判活会把好号误判成僵尸。
+// codeartsAccountItem 组装单个账号在面板上要显示的信息（C-CA-API@1 A）。
+//
+// 拆成两步：codeartsAccountItemBase 只算**离线**字段（纯派生、可单测），
+// 这里再补上游接口查到的积分/签到状态 —— 后者要发网络请求，线上是必需的，
+// 但不该让字段契约的测试被网络拖慢。
+//
+// login_expired 的判据是**接口真的查不通**（会话失效），而不是"本地有没有
+// profile"——实测归档 profile 恢复不了登录态，拿它判活会把好号误判成僵尸。
 func (p *Panel) codeartsAccountItem(a *codearts.Account) map[string]any {
-	item := map[string]any{
-		"id": a.ID, "label": a.Label, "nickname": a.Nickname,
-		"saved_at": a.SavedAt, "cookie_count": len(a.Cookies),
-		"checked_in_today": codeartsCheckedInToday(a),
-	}
-	if len(a.Aliases) > 0 {
-		item["aliases"] = a.Aliases
-	}
+	item := codeartsAccountItemBase(a)
 
 	// 每日能领多少积分 + 当前余额。
 	daily := a.DailyBonus
@@ -750,9 +1136,10 @@ func (p *Panel) codeartsAccountItem(a *codearts.Account) map[string]any {
 	} else if errors.Is(cerr, codearts.ErrSessionExpired) {
 		expired = true
 	}
-	if daily > 0 {
-		item["daily_bonus"] = daily
-	}
+	item["daily_bonus"] = daily
+	// 活动面值单独放 benefit_amount（契约澄清 #4）：daily_bonus 是既有的"今日
+	// 签到面值"字段，而 credits 必须表示**真实结果**，两者不能混用。
+	item["benefit_amount"] = daily
 	if serverClaimed {
 		item["checked_in_today"] = true
 	}
@@ -772,26 +1159,83 @@ func (p *Panel) codeartsAccountItem(a *codearts.Account) map[string]any {
 			item["credits_used"] = a.CreditsUsed
 			item["credits_expiring"] = a.CreditsExpiring
 		}
+		if errors.Is(cerr, codearts.ErrSessionExpired) {
+			// 会话已失效（等价于 failed）：credits 必须是 0，**不能**拿旧快照
+			// 冒充"当前余额"（契约澄清 #4）。旧值仍在 credits_total 等快照字段里。
+			item["credits"] = 0.0
+		}
 		expired = true
 	}
 	item["login_expired"] = expired
+
+	// 存回快照（下次接口不通时还有底）。必须走 UpdatePool：续期/补采/签到
+	// 也在并发写同一个号池，裸 Load→Save 会把别人的修改冲掉。
+	codeartsSaveAccountSnapshot(a)
+	return item
+}
+
+// codeartsAccountItemBase 账号行里**不依赖上游接口**的全部字段。
+//
+// 字段名以 C-CA-API@1 A 为准，且**空值也必须出现**（前端按字段名渲染"未知"，
+// 缺字段会被当成"后端没实现"）。
+func codeartsAccountItemBase(a *codearts.Account) map[string]any {
+	item := map[string]any{
+		"id":                   a.ID,
+		"label":                a.Label,
+		"nickname":             a.Nickname,
+		"saved_at":             a.SavedAt,
+		"cookie_count":         len(a.Cookies),
+		"checked_in_today":     codeartsCheckedInToday(a),
+		"login_expired":        false,
+		"credits":              0.0,
+		"daily_bonus":          0.0,
+		"benefit_amount":       0.0,
+		"ticket_deadline":      a.TicketDeadline,
+		"ticket_source":        a.TicketSource,
+		"session_expires_at":   codearts.SessionExpiresAt(a),
+		"last_ok_at":           a.LastOKAt,
+		"renew_next_at":        a.RenewNextAt,
+		"renew_result":         a.RenewResult,
+		"renew_fail_at":        a.RenewFailAt,
+		"renew_fail_msg":       a.RenewFailMsg,
+		"probe_state":          a.ProbeState,
+		"probe_msg":            a.ProbeMsg,
+		"probe_at":             a.ProbeAt,
+		"expires_known_count":  codeartsExpiresKnownCount(a.Cookies),
+		"session_cookie_count": codeartsSessionCookieCount(a.Cookies),
+		"can_auto_renew":       codearts.CanAutoRenew(a),
+		"needs_manual":         codeartsNeedsManual(a),
+	}
+	if len(a.Aliases) > 0 {
+		item["aliases"] = a.Aliases
+	}
 	if a.LastGain > 0 {
 		item["today_gain"] = a.LastGain
 		item["today_gain_at"] = a.LastGainAt
 	}
-	// 存回快照（下次接口不通时还有底）。
-	if pool, perr := codearts.LoadPool(); perr == nil {
-		for _, x := range pool.Accounts {
-			if x != nil && x.ID == a.ID {
-				x.CreditsRemain, x.CreditsTotal = a.CreditsRemain, a.CreditsTotal
-				x.CreditsUsed, x.CreditsExpiring = a.CreditsUsed, a.CreditsExpiring
-				x.DailyBonus = a.DailyBonus
-				_ = codearts.SavePool(pool)
-				break
-			}
-		}
-	}
 	return item
+}
+
+// codeartsSaveAccountSnapshot 把积分/活动快照写回号池（值没变就不写）。
+func codeartsSaveAccountSnapshot(a *codearts.Account) {
+	if a == nil || a.ID == "" {
+		return
+	}
+	_ = codearts.UpdatePool(func(pool *codearts.Pool) error {
+		x := codeartsFindAccount(pool, a.ID)
+		if x == nil {
+			return nil
+		}
+		if x.CreditsRemain == a.CreditsRemain && x.CreditsTotal == a.CreditsTotal &&
+			x.CreditsUsed == a.CreditsUsed && x.CreditsExpiring == a.CreditsExpiring &&
+			x.DailyBonus == a.DailyBonus {
+			return nil
+		}
+		x.CreditsRemain, x.CreditsTotal = a.CreditsRemain, a.CreditsTotal
+		x.CreditsUsed, x.CreditsExpiring = a.CreditsUsed, a.CreditsExpiring
+		x.DailyBonus = a.DailyBonus
+		return nil
+	})
 }
 
 // codeartsCheckedInToday 今天签没签（认全部历史别名）。
@@ -815,33 +1259,38 @@ func (p *Panel) codeartsRemove(w http.ResponseWriter, r *http.Request) {
 		ID string `json:"id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	pool, err := codearts.LoadPool()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	var target *codearts.Account
-	for _, a := range pool.Accounts {
-		if a != nil && a.ID == req.ID {
-			target = a
-			break
+
+	// 删除账号 + 定位槽目录放在同一个 UpdatePool 事务里：与补采/续期/保活并发
+	// 时，裸 Load→Save 会把别人刚写进去的更新整条抹掉（R4.3）。
+	// 回调内只改传入的 *Pool，不再调 LoadPool/SavePool（锁不可重入）。
+	errAccountMissing := errors.New("账号不存在")
+	var slotDir string
+	err := codearts.UpdatePool(func(pool *codearts.Pool) error {
+		acc := codeartsFindAccount(pool, req.ID)
+		if acc == nil || !codearts.Remove(pool, req.ID) {
+			return errAccountMissing
 		}
-	}
-	if target == nil {
-		writeErr(w, http.StatusNotFound, "账号不存在")
-		return
-	}
-	if !codearts.Remove(pool, req.ID) {
-		writeErr(w, http.StatusNotFound, "账号不存在")
-		return
-	}
-	if err := codearts.SavePool(pool); err != nil {
+		acc.EnsureSlot()
+		slotDir = filepath.Join(codearts.SlotRoot(), acc.SlotDir)
+		if abs, aerr := filepath.Abs(slotDir); aerr == nil {
+			slotDir = abs
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errAccountMissing) {
+			writeErr(w, http.StatusNotFound, "账号不存在")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 连 profile 一起清掉（里面是登录态，属于敏感数据）。
-	if slot := target.Slot; slot != "" {
-		_ = os.RemoveAll(codeartsSlotDir(p, slot))
+	// 身份槽**不直接删**：改名成 .bak-<ts>（里面是登录态，属于敏感数据，
+	// 但误删不可逆；§H.I5 要求一切删除都可回滚）。
+	if slotDir != "" {
+		if _, aerr := codeartsSlotArchiveDir(slotDir); aerr != nil {
+			log.Printf("[codearts] 账号 %s 的槽目录备份失败（账号记录已删除）: %v", req.ID, aerr)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1101,18 +1550,19 @@ func codeartsCheckinHTTP(acc *codearts.Account) (phase, msg string, ok bool) {
 	before, _ := codearts.Credits(acc)
 
 	persist := func() {
-		if pool, perr := codearts.LoadPool(); perr == nil {
-			for _, a := range pool.Accounts {
-				if a != nil && a.ID == acc.ID {
-					a.CreditsRemain, a.CreditsTotal = acc.CreditsRemain, acc.CreditsTotal
-					a.CreditsUsed, a.CreditsExpiring = acc.CreditsUsed, acc.CreditsExpiring
-					a.DailyBonus = acc.DailyBonus
-					a.LastGain, a.LastGainAt = acc.LastGain, acc.LastGainAt
-					_ = codearts.SavePool(pool)
-					break
-				}
+		// 与补采/续期/保活并发写同一份号池：必须走 UpdatePool（R4.3）。
+		// 回调内只改传入的 *Pool，不再调 LoadPool/SavePool（锁不可重入）。
+		_ = codearts.UpdatePool(func(pool *codearts.Pool) error {
+			x := codeartsFindAccount(pool, acc.ID)
+			if x == nil {
+				return nil // 账号已被删除：没有可写的东西
 			}
-		}
+			x.CreditsRemain, x.CreditsTotal = acc.CreditsRemain, acc.CreditsTotal
+			x.CreditsUsed, x.CreditsExpiring = acc.CreditsUsed, acc.CreditsExpiring
+			x.DailyBonus = acc.DailyBonus
+			x.LastGain, x.LastGainAt = acc.LastGain, acc.LastGainAt
+			return nil
+		})
 	}
 
 	acc.DailyBonus = float64(daily.BenefitAmount)
@@ -1232,7 +1682,20 @@ func (p *Panel) codeartsRefresh(w http.ResponseWriter, r *http.Request) {
 			"id": acc.ID, "message": msg})
 		return
 	}
-	if err := codearts.SavePool(pool); err != nil {
+	// Keepalive 本身不改 acc（只是探活 + 吸收服务端下发的续期 Cookie）。
+	// 回写仍必须走 UpdatePool：与补采/续期/保活并发时，裸 Load→Save 会把
+	// 别人刚写进去的更新整条覆盖（R4.3）。回调内只改传入的 *Pool。
+	if err := codearts.UpdatePool(func(latest *codearts.Pool) error {
+		x := codeartsFindAccount(latest, acc.ID)
+		if x == nil {
+			return nil // 并发删除：没有可写的账号
+		}
+		x.Cookies = append([]codearts.Cookie(nil), acc.Cookies...)
+		x.SavedAt = acc.SavedAt
+		x.TicketDeadline = acc.TicketDeadline
+		x.TicketSource = acc.TicketSource
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1271,20 +1734,32 @@ func (p *Panel) codeartsKnownPorts() []int {
 // masked_user 全同（就是同一个人），slot 也相同 —— 面板上看着像加了两个号，
 // 其实是一个，还互相覆盖。这里一次性收敛掉。
 func (p *Panel) codeartsMigratePool() {
-	pool, err := codearts.LoadPool()
-	if err != nil || pool == nil {
+	// ① 先只读探测：没有需要整理的记录就**不写盘**（启动时不产生无谓写入）。
+	// 这一步只是判断"要不要动"，真正的修改在下面的事务里重做，避免用过期
+	// 快照盲写（R4.3：裸 Load→改→Save 会覆盖并发的补采/续期）。
+	probe, err := codearts.LoadPool()
+	if err != nil || probe == nil {
 		return
 	}
-	merged := codearts.MergePool(pool)
-	if merged == 0 {
+	if codearts.MergePool(probe) == 0 && codearts.DedupeLabels(probe) == 0 {
 		return
 	}
-	if err := codearts.SavePool(pool); err != nil {
+
+	// ② 有变化 → 在 UpdatePool 事务里重做，只改传入的 *Pool。
+	var merged, relabeled int
+	err = codearts.UpdatePool(func(pool *codearts.Pool) error {
+		merged = codearts.MergePool(pool)
+		relabeled = codearts.DedupeLabels(pool)
+		return nil
+	})
+	if err != nil {
 		log.Printf("[codearts] 号池整理后写回失败: %v", err)
 		return
 	}
-	log.Printf("[codearts] 号池整理：合并了 %d 条重复账号，现剩 %d 个", merged, len(pool.Accounts))
+	log.Printf("[codearts] 号池整理：合并 %d 条重复账号、改名 %d 个消重，现剩 %d 个",
+		merged, relabeled, len(probe.Accounts))
 }
+
 
 // codeartsKeepalive 后台保活：定时用 Cookie 调一次轻量接口。
 //
@@ -1313,6 +1788,10 @@ func (p *Panel) codeartsKeepaliveOnce() {
 		return
 	}
 	changed := false
+	// changedIDs 记录本轮保活**确实**改过 Cookie 的账号；落盘只写这些账号，
+	// 不再整池回写（整池回写会把补采/续期刚写的新快照覆盖回旧值）。
+	changedIDs := make([]*codearts.Account, 0, len(pool.Accounts))
+	now0 := time.Now()
 	for _, a := range pool.Accounts {
 		if a == nil || len(a.Cookies) == 0 {
 			continue
@@ -1321,7 +1800,12 @@ func (p *Panel) codeartsKeepaliveOnce() {
 		ok, kerr := codearts.Keepalive(a)
 		if kerr != nil {
 			if errors.Is(kerr, codearts.ErrSessionExpired) {
-				log.Printf("[codearts] 账号 %s 会话已失效，需要重新登录", a.ID)
+				// 会话判死是**不可自愈**的状态：旧版每 15 分钟播一条，一天 96 条，
+				// 把日志里真正有用的东西冲没了。每天只播第一条。
+				if codeartsNoteOnce("codearts:dead:" + a.ID) {
+					log.Printf("[codearts] 账号 %s 会话已失效，需要重新登录（今天已提醒过，后续静默；"+
+						"自动续期见 panel: CodeArts 相关日志）", a.ID)
+				}
 			} else {
 				log.Printf("[codearts] 账号 %s 保活失败: %v", a.ID, kerr)
 			}
@@ -1332,11 +1816,33 @@ func (p *Panel) codeartsKeepaliveOnce() {
 		}
 		if codeartsCookieDigest(a.Cookies) != before {
 			changed = true
+			changedIDs = append(changedIDs, a)
 			log.Printf("[codearts] 账号 %s 保活时收到续期 Cookie，已更新", a.ID)
 		}
 	}
 	if changed {
-		if err := codearts.SavePool(pool); err != nil {
+		// 原子落盘（C-CA-TICKET@1 的 UpdatePool）：与补采/续期/登录并发写同一份
+		// 号池时，各自 Load→改→Save 会互相覆盖；这里持包级锁读-改-写。
+		// 回调内只改传入的 *Pool，不再调 LoadPool/SavePool（同包锁不可重入）。
+		if err := codearts.UpdatePool(func(latest *codearts.Pool) error {
+			for _, a := range changedIDs {
+				x := codeartsFindAccount(latest, a.ID)
+				if x == nil {
+					continue
+				}
+				// 保活期间若补采/续期写了更新的快照，保留它（不能用本轮旧值覆盖）。
+				if saved, serr := time.Parse(time.RFC3339, x.SavedAt); serr == nil && saved.After(now0) {
+					continue
+				}
+				x.Cookies = append([]codearts.Cookie(nil), a.Cookies...)
+				x.SavedAt = codearts.Now()
+				x.RefreshTicketDeadline()
+				if t := strings.TrimSpace(a.LastOKAt); t != "" {
+					x.LastOKAt = t
+				}
+			}
+			return nil
+		}); err != nil {
 			log.Printf("[codearts] 保活后写号池失败: %v", err)
 		}
 	}

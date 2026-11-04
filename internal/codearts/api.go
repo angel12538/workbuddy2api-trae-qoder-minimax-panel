@@ -94,6 +94,8 @@ func doAPI(acc *Account, method, path string, body any) (int, []byte, error) {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	// 服务端可能随响应下发新 Cookie（续期），顺手收进账号里。
 	absorbSetCookies(acc, resp)
+	// 吸收后重算票据寿命：服务端常用 Set-Cookie 续新票据，不重算就还按老值判断。
+	acc.RefreshTicketDeadline()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return resp.StatusCode, raw, fmt.Errorf("%w（HTTP %d）", ErrSessionExpired, resp.StatusCode)
 	}
@@ -101,33 +103,31 @@ func doAPI(acc *Account, method, path string, body any) (int, []byte, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return resp.StatusCode, raw, ErrSessionExpired
 	}
+	// 通了 = 这一刻会话还活着，记下时刻（面板据此算"会话大约还能用多久"）。
+	acc.LastOKAt = Now()
 	return resp.StatusCode, raw, nil
 }
 
-// absorbSetCookies 把响应里的 Set-Cookie 合并进账号（同名覆盖）。
-func absorbSetCookies(acc *Account, resp *http.Response) {
+// ticketDeadlineOf 把持久票据的最早过期时间格式化成 RFC3339（没有则空串）。
+func ticketDeadlineOf(cookies []Cookie) string {
+	if t, ok := IDPDeadline(cookies); ok {
+		return t.Format(time.RFC3339)
+	}
+	return ""
+}
+
+// absorbSetCookies 把响应里的 Set-Cookie 合并进账号，返回变更条数。
+//
+// 合并语义统一收在 Account.AbsorbSetCookies（C-CA-COOKIE@1）：
+//   - 键是 (name, lower(domain), path)，不再按 Name 单键 —— 旧实现会把不同域的
+//     同名 Cookie（实测 cbc-sid 有 2 条）互相覆盖；
+//   - 补上 Max-Age：旧实现只认 Expires，服务端用 Max-Age 续期的寿命全丢；
+//   - 没有过期信息时不覆盖已观测的三元组。
+func absorbSetCookies(acc *Account, resp *http.Response) int {
 	if resp == nil || acc == nil {
-		return
+		return 0
 	}
-	scs := resp.Cookies()
-	if len(scs) == 0 {
-		return
-	}
-	idx := map[string]int{}
-	for i, c := range acc.Cookies {
-		idx[c.Name] = i
-	}
-	for _, sc := range scs {
-		if sc.Name == "" || sc.Value == "" {
-			continue
-		}
-		if i, ok := idx[sc.Name]; ok {
-			acc.Cookies[i].Value = sc.Value
-		} else {
-			acc.Cookies = append(acc.Cookies, Cookie{Name: sc.Name, Value: sc.Value, Domain: sc.Domain})
-			idx[sc.Name] = len(acc.Cookies) - 1
-		}
-	}
+	return acc.AbsorbSetCookies(resp.Cookies(), time.Now())
 }
 
 // Keepalive 调一次轻量接口，保持服务端会话活跃，并吸收新下发的 Cookie。
