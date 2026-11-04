@@ -19,9 +19,17 @@ import (
 // token 号池里每个账号都存了；设备指纹由 QoderDeviceForEmail 按账号解析
 // （默认 = 真实设备，配置了 device_mode=derived / proxy_url 才走独立设备/出口）。
 //
-// ⚠️ 每日额度不是每个号一份（2026-11-02 实测）：服务端按**人**发 —— 同一个人的
-// 多个账号共享**一份**（判定码 SAME_PERSON_ALREADY_CLAIMED），与设备、账号、
-// agentAccountScope 都无关。详见 QoderQuotaGroupKey 与 qoder_person.go。
+// ⚠️ 每日额度是不是每个号一份（2026-11-02 vs 2026-11-04 实测）：
+//
+//	2026-11-02：服务端回过 SAME_PERSON_ALREADY_CLAIMED，当时判成「按人发，
+//	同一人一天只有一份」；
+//	2026-11-04：两个号（一个 real、一个 derived 设备）各自拿到**不同的
+//	grantId**、各自 claimedAt、额度余额也各自独立（1700 / 900）⇒ 服务端
+//	**没有**判这两个号同人，额度是**按账号**各发一份。
+//
+//	所以「同一人只发一份」只在服务端**明确回** SAME_PERSON_ALREADY_CLAIMED
+//	时成立，不能拿它当默认前提。判据见 qoder_person.go 与
+//	qoderStrategySnapshot。
 //
 // T6 起「一键签到」的口径（逐条对应契约 C-QD-API@1）：
 //   - **每个号都打一遍**，结果分七相：claimed / already / blocked / pending /
@@ -33,10 +41,9 @@ import (
 //     会把 pending 也算成已签）；
 //   - 每次尝试都写逐日账本（AppendQoderClaim），用来做按人轮换与审计。
 //
-// ⚠️ 策略默认值：T5 的只读探测还没得出结论（文件缺失 / inconclusive）时，
-// 一律按 strategy=shared_person + 轮换处理 —— **不假设隔离可用**。
-// 只有探测结论为 isolated_viable 且该号确实配置了独立设备/出口时，才把
-// claimed/already 标成 isolated。
+// ⚠️ strategy 只能反映**有证据的**结论：拿到本号自己的 grantId → isolated
+// （本号独占一份）；服务端明确判同人 / 额度归属另有其人 → shared_person；
+// 其余一律 unknown（归属未核实），绝不默认扣上「服务端判定同人」的帽子。
 
 // 七相结果（契约 C-QD-API@1 的 phase 枚举，禁止新增/改名）。
 const (
@@ -214,6 +221,24 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 	}
 	var probes []pendingProbe
 
+	// 「今天已领（already）」的账号：也要问一次「这份额度是不是**我自己的」。
+	//
+	// 为什么：上游活动列表对同一人组的所有号都返回**同一条**已领活动，所以
+	// 「already」不等于「本号领过」。不问的话：
+	//   - POST 侧只能写「归属未核实」，而 GET 扫描侧问得出「是我自己的」，
+	//     同一个号两个说法（前端和用户都会懵）；
+	//   - 同人组里后打的号会显示 +100，而那 100 其实进了另一个号的账。
+	//
+	// 探测是**只读**的（GET .../campaigns/{cid}/reward），不碰任何额度。
+	type alreadyProbe struct {
+		item qoderPoolItem
+		res  *QoderCheckinResult
+		auth *QoderAuth
+		dev  *QoderDevice
+		rank int
+	}
+	var alreadyProbes []alreadyProbe
+
 	rank := 0
 	for _, it := range items {
 		rank++
@@ -315,12 +340,23 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			probes = append(probes, pendingProbe{item: it, res: res, auth: auth, dev: dev, rank: rank})
 			continue
 		}
+		if res.Phase == QoderPhaseAlready {
+			// 「今天已领」不等于「本号领过」：上游对同一人组的所有号返回同一条已领
+			// 活动。放到主循环**之后**统一只读探测，那时 knownCID 才是全的
+			// （要拿别人实例 id 去找真正的主人）。
+			alreadyProbes = append(alreadyProbes, alreadyProbe{item: it, res: res, auth: auth, dev: dev, rank: rank})
+			continue
+		}
 
 		// 签到侧自己就拿到「同人已领」结论时（claim 返回 BLOCKED），把 verdict 记下来，
 		// 供最终 strategy 重算使用（blocked 恒为 shared_person）。
 		directVerdict := QoderVerdictUnknown
-		if res.Phase == QoderPhaseBlocked {
+		switch res.Phase {
+		case QoderPhaseBlocked:
 			directVerdict = QoderVerdictSamePerson
+		case QoderPhaseClaimed:
+			// 本次真的领到了：额度就在**本号**账上（自己的 grantId）⇒ 本号独占一份。
+			directVerdict = QoderVerdictOwner
 		}
 		verdicts[key] = directVerdict
 		item := qoderItemFromResult(it, res, rank, groupSize[key], probeConclusion, prevClaimed[key], directVerdict)
@@ -485,7 +521,7 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 				p.res.Phase = QoderPhasePending
 				p.res.QuotaTakenBy = holder
 				p.res.Msg = "今日每日额度已被同一个人的另一个账号 " + holder +
-					" 领取（服务端按人发，同一人一天只有一份、先打先得）"
+					" 领取（服务端判定同一人，一天只发一份、先打先得）"
 				p.res.CheckedInToday = false
 			} else {
 				p.res.Phase = QoderPhasePending
@@ -500,6 +536,72 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		out.Results = append(out.Results, item)
 	}
 
+	// 「already」号的归属探测（只读）：问服务端「这条已领活动是不是我自己的」。
+	//
+	// 判据与 GET 扫描侧 path A 完全一致（同一个 cid、同一套 grantId 比对）：
+	//   - 拿到自己的 grantId ⇒ 本号独占一份（verdict=owner）；
+	//   - 服务端回 BLOCKED + SAME_PERSON_ALREADY_CLAIMED ⇒ 本号被拒，那份额度
+	//     是同人的另一个号领的 ⇒ 点名 + credits 归零（由 qoderFillAlreadyQuotaOwner
+	//     完成）+ checked_in_today=false；
+	//   - 问不出结论 ⇒ 归属未核实（unknown），**不猜**。
+	//
+	// ⚠️ 必须在这里做（主循环之后）：找主人要用到别的号的实例 id，knownCID 到
+	// 这时才是全的。
+	for i := range alreadyProbes {
+		ap := &alreadyProbes[i]
+		email := ap.item.email
+		key := normalizeQoderEmail(email)
+		scope := QoderQuotaScopeKey(ap.item.snap)
+		verdict := QoderVerdictUnknown
+		if ap.res.ClaimCID != "" {
+			probe := qoderProbeReward(ap.auth, ap.dev, ap.res.ClaimCID, scope)
+			switch {
+			case strings.EqualFold(probe.Status, "BLOCKED") &&
+				strings.Contains(strings.ToUpper(probe.FailureCode), "SAME_PERSON"):
+				verdict = QoderVerdictSamePerson
+				// 找出真正领走这份额度的号：用**它自己的凭证**只读问同一个 cid。
+				holder := ""
+				for em := range knownCID {
+					if strings.EqualFold(em, email) {
+						continue
+					}
+					ha := qoderPoolAuth(pool.Accounts, em)
+					if ha == nil {
+						continue
+					}
+					hp := qoderProbeReward(ha, baseDev, ap.res.ClaimCID, scope)
+					if hp.GrantID != "" {
+						holder = em
+						break
+					}
+				}
+				ap.res.QuotaTakenBy = holder
+				ap.res.CheckedInToday = false
+				ap.res.Msg = "今日额度已被同一个人的另一个账号 " + holder +
+					" 领走（服务端判定同一人，一天只发一份；本号账上未新增积分）"
+				if err := saveQoderPersonLink(email, holder); err != nil {
+					log.Printf("[qoder-person] 记录同人关系 %s ↔ %s 失败（不影响签到结论）：%v", email, holder, err)
+				}
+			case probe.GrantID != "":
+				verdict = QoderVerdictOwner
+				// 上游给了本号这份额度的**领取时刻**：落进 Claims，账本才知道
+				// 「上次领到」是什么时候（否则这个号永远显示没有领到时间）。
+				if t, err := time.Parse(time.RFC3339, strings.TrimSpace(probe.ClaimedAt)); err == nil {
+					_ = MarkClaimedAt("qoder", email, t)
+				}
+			}
+		}
+		verdicts[key] = verdict
+		item := qoderItemFromResult(ap.item, ap.res, ap.rank, groupSize[key], probeConclusion, prevClaimed[key], verdict)
+		if verdict == QoderVerdictSamePerson {
+			// 服务端判本号被拒 ⇒ 本号今天**没签上**（那份额度在同人另一个号账上）。
+			// 绝不能显示成「今日已签到」。
+			item.CheckedInToday = false
+		}
+		qoderApplyCheckinSideEffects(item, ap.res)
+		out.Results = append(out.Results, item)
+	}
+
 	// 判定出「同一人」关系（或被反证撤销）后重算组大小：组是**判定**出来的，
 	// 不是按 scope 猜的。strategy 依赖组大小（组内 >1 = 服务端已判同人，绝不可能是
 	// isolated），因此在这里统一重算一次 —— 与 GET checkin-status 用同一个函数。
@@ -511,6 +613,27 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 			r.Strategy = qoderStrategySnapshot(r.Email, r.Phase, r.QuotaTakenBy, r.QuotaGroup, verdicts[key], probeConclusion)
 		}
 	}
+
+	// 同人组内「already」号的额度归属回填（实测 2026-11-04）：
+	// 服务端按人发额度，先打的号 claimed（真入账），后打的号回 already，
+	// 但拿到的是**同一个 campaign 实例** —— 那 100 积分只进了先打那个号的账。
+	//
+	// 判据用**活动实例 id**：同一个 cid = 同一份额度 = 同一个人的那一份。
+	// 找到组内今天 claimed 且 cid 相同的号 ⇒ already 号不是主人：
+	//   - credits 归零（不是它入账的）；
+	//   - quota_taken_by 点名是谁领的；
+	//   - 文案改成人话。
+	// 找不到 ⇒ already 就是本号自己今天早先领的，credits 照实显示。
+	//
+	// ⚠️ 必须在**汇总之前**做：汇总里的 AlreadyCredits 直接累加 r.Credits，
+	// 回填晚了就会把虚记的 100 算进"今日已领额度"。
+	qoderFillAlreadyQuotaOwner(out.Results)
+
+	// 结果按本轮顺序（rotation_rank）排：pending / already 的结果是二次判定后
+	// 才补进来的，不排序的话表格顺序会和「本轮顺序」对不上。
+	sort.SliceStable(out.Results, func(i, j int) bool {
+		return out.Results[i].RotationRank < out.Results[j].RotationRank
+	})
 
 	// 汇总：七相计数天然满足「之和 == len(results)」，因为每个结果只落一个相位。
 	for _, r := range out.Results {
@@ -534,9 +657,15 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		}
 	}
 	// 顶层 checked_in_today：只有全部都是 claimed/already 时才是 true。
+	// ⚠️ 而且 already 还必须是**本号自己**的那份：额度归属同人另一个号的 already
+	// 号没签到（服务端把它拒了），不能算进「已签到」。
 	out.CheckedInToday = len(out.Results) > 0
 	for _, r := range out.Results {
 		if r.Phase != QoderPhaseClaimed && r.Phase != QoderPhaseAlready {
+			out.CheckedInToday = false
+			break
+		}
+		if r.QuotaTakenBy != "" && !strings.EqualFold(normalizeQoderEmail(r.QuotaTakenBy), normalizeQoderEmail(r.Email)) {
 			out.CheckedInToday = false
 			break
 		}
@@ -705,6 +834,79 @@ func qoderRotationOrder(items []qoderPoolItem, priority string) []string {
 	return out
 }
 
+// qoderSamePersonHolderOf 找出同人组里今天真正领到额度的那号。
+//
+// 场景：扫描时本号被判 claimed（上游把同一条已领活动展示给同组所有号），
+// 探测确认「本号不是主人」—— 但名字还不知道，得从同组里找那个真领的。
+func qoderSamePersonHolderOf(email string, out []QoderScanAccount) string {
+	key := normalizeQoderEmail(email)
+	for _, peer := range QoderSamePersonPeers(email) {
+		pk := normalizeQoderEmail(peer)
+		for i := range out {
+			o := &out[i]
+			if normalizeQoderEmail(o.Email) != pk {
+				continue
+			}
+			if o.Phase == QoderPhaseClaimed && o.CheckedInToday {
+				return o.Email
+			}
+		}
+	}
+	// 同人组里没有 claimed 的（上游把已领活动展示给所有人，但没有一个号
+	// 是"主人"）—— 那就退回同组里任意一个号，至少把"同一人组"讲清楚。
+	for _, peer := range QoderSamePersonPeers(email) {
+		if normalizeQoderEmail(peer) != key {
+			return peer
+		}
+	}
+	return ""
+}
+
+// qoderFillAlreadyQuotaOwner 回填「already」号今天的额度到底是谁领走的。
+//
+// ⚠️ 重要更正（实测 2026-11-04 11:28，GET .../campaigns/{cid}/reward 原始响应）：
+//
+//	2108643821@qq.com       grantId=01a1a477-96d3-…  claimedAt=2026-11-04T02:51:03Z
+//	xu20060420fan@gmail.com grantId=01a1a463-e178-…  claimedAt=2026-11-04T02:29:31Z
+//
+// 两个号看到的是**同一条 campaign**（同一个活动"每天领 100 Credits"，服务端
+// 对所有人下发同一个活动实例），但**grantId 不同、claimedAt 不同** ——
+// **每个账号各自领到了一份额度**，不是共享一份。
+//
+// 额度侧同样印证：
+//
+//	qq     附加包 total=1700 used=0     remaining=1700   （17 份 × 100）
+//	gmail  附加包 total=900  used=558   remaining=342    （9 份 × 100）
+//
+// 所以「服务端按人发、同一人一天只有一份」这个前提是**错的**（它把
+// "同一条活动" 误当成 "同一份额度"），按它把后打的号的 100 归零是**错杀**。
+//
+// 真正的归属判据只有一条：服务端明确回
+// failureCode=SAME_PERSON_ALREADY_CLAIMED（本号被拒，没拿到额度）。
+// 那时才能说「额度是同人的另一个号领的」，credits 归零 + 点名。
+//
+// 本函数只处理**已经有明确归属结论**（QuotaTakenBy 非空）的 already 号：
+// 把它的 credits 归零（不是它入账的）、面值单列、文案点名。
+// 没有归属结论的 already = 本号自己今天早先领过 ⇒ credits 照实显示。
+func qoderFillAlreadyQuotaOwner(results []QoderCheckinItem) {
+	for i := range results {
+		r := &results[i]
+		if r.Phase != QoderPhaseAlready || r.QuotaTakenBy == "" {
+			continue
+		}
+		owner := r.QuotaTakenBy
+		if normalizeQoderEmail(owner) == normalizeQoderEmail(r.Email) {
+			continue // 自己领的，就是本号签到
+		}
+		r.Credits = 0
+		if r.BenefitAmount == 0 {
+			r.BenefitAmount = 100
+		}
+		r.Msg = "今日额度已被同一个人的另一个账号 " + owner +
+			" 领走（服务端判定同一人，一天只发一份；本号账上未新增积分）"
+	}
+}
+
 // qoderItemFromResult 把一次签到结果归一化为契约结果项。
 //
 // verdict 是本次只读探测对「本号与该活动实例主人是否同一个人」的结论
@@ -733,7 +935,20 @@ func qoderItemFromResult(it qoderPoolItem, res *QoderCheckinResult, rank, group 
 		LastClaimedAt: prevClaimed,
 	}
 	switch phase {
-	case QoderPhaseClaimed, QoderPhaseAlready:
+	case QoderPhaseClaimed:
+		// 只有 claimed 才是**本号这次真的入账**的积分。
+		item.Credits = res.Credits
+		item.CheckedInToday = true
+		item.ClaimedAt = res.ClaimedAt
+	case QoderPhaseAlready:
+		// ⚠️ already 的积分**不一定**是本号入账：上游对同一人组的所有号返回
+		// **同一条**已领活动，后打的号拿到的是同一个 campaign 实例 ——
+		// 那 100 积分可能进了**另一个号**的账。
+		//
+		// 归属由只读探测（GET .../campaigns/{cid}/reward，比 grantId）确认：
+		// 拿到自己的 grantId ⇒ 本号自己领的，credits 照实显示；
+		// 服务端回 BLOCKED+SAME_PERSON ⇒ 本号没领到，credits 归零 + 点名归属
+		// （见 qoderFillAlreadyQuotaOwner）。
 		item.Credits = res.Credits
 		item.CheckedInToday = true
 		item.ClaimedAt = res.ClaimedAt
@@ -762,17 +977,25 @@ func qoderItemFromResult(it qoderPoolItem, res *QoderCheckinResult, rank, group 
 // （QoderPoolScan）必须调用同一个函数，否则同一时刻同一状态会出现两套结论
 // （D-Q1：签到侧 unassigned、状态侧 shared_person）。
 //
-// 判定规则（与 plan 2.2.11 / T19 一致）：
+// 判定规则（2026-11-04 按实测修订）：
 //
-//	blocked                                     → shared_person（服务端判定同人）
+//	blocked                                     → shared_person（服务端明确判定同人）
 //	pending + 同组已有持有者（quotaTakenBy≠空）   → shared_person
 //	pending + 明确非同人（verdict=other）         → unassigned（今天没给本号下发）
 //	pending + 证据不足（unknown/未探测）           → unknown
 //	claimed/already/claimable：
-//	    组内只有自己 且 无独立设备/出口             → shared_person（默认策略）
-//	    组内只有自己 且 有独立设备/出口 且 probe=isolated_viable → isolated
+//	    quotaTakenBy≠空（额度归属另有其人）          → shared_person
 //	    组内 >1（已被服务端判为同人）               → shared_person
+//	    verdict=owner（本号自己的 grantId）         → isolated（本号独占一份）
+//	    独立设备/出口 且 probe=isolated_viable      → isolated
+//	    其余（证据不足）                            → unknown（归属未核实）
 //	login_required/error                        → unknown
+//
+// ⚠️ 2026-11-04 实测更正：旧实现对 claimed/already/claimable **一律**回
+// shared_person，面板上于是每个号都挂着「策略：服务端判定同人」。但服务端
+// 从没判过这两个号同人（person.json 为空、也没回过 SAME_PERSON_ALREADY_CLAIMED），
+// 两号各自拿到**不同的 grantId**、各自 +100 —— 拿没有证据的结论当事实说，
+// 会把用户引到完全错误的方向上。现在只在真有证据时才说「服务端判定同人」。
 //
 // 独立设备/出口由邮箱查 qoder_egress.json 得出（不依赖调用方手里的 dev 对象），
 // 保证两个端点在相同配置下得到相同答案。
@@ -789,17 +1012,25 @@ func qoderStrategySnapshot(email, phase, quotaTakenBy string, groupSize int, ver
 		}
 		return QoderStrategyUnknown
 	case QoderPhaseClaimed, QoderPhaseAlready, "claimable":
-		// claimable 是「今天还能领」：同属按人共享的额度池，只是本号是候选。
+		if strings.TrimSpace(quotaTakenBy) != "" {
+			// 额度明确归属同组的另一个号 → 服务端视角下是同一个人。
+			return QoderStrategySharedPerson
+		}
 		if groupSize > 1 {
 			// 服务端已把本号判进某个同人组 → 绝不是独立额度。
 			return QoderStrategySharedPerson
+		}
+		if strings.EqualFold(strings.TrimSpace(verdict), QoderVerdictOwner) {
+			// 本号自己的 grantId ⇒ 这份额度确实在**本号**账上（实测 2026-11-04：
+			// 两个号看到同一条 campaign，但 grantId/claimedAt 各不相同，各领各的）。
+			return QoderStrategyIsolated
 		}
 		if qoderEgressIndependentForEmail(email) &&
 			strings.EqualFold(strings.TrimSpace(probeConclusion), "isolated_viable") {
 			return QoderStrategyIsolated
 		}
-		// 探测未证明隔离可用时一律 shared_person，避免把未验证的隔离说成可用。
-		return QoderStrategySharedPerson
+		// 证据不足：如实说「归属未核实」，不许默认扣上「服务端判定同人」的帽子。
+		return QoderStrategyUnknown
 	default:
 		return QoderStrategyUnknown
 	}
@@ -1395,7 +1626,7 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 					row.DeviceQuotaUsed = true
 					row.QuotaTakenBy = holder
 					row.Msg = "今日每日额度已被同一个人的另一个账号 " + holder +
-						" 领取（服务端按人发，同一人一天只有一份、先打先得）"
+						" 领取（服务端判定同一人，一天只发一份、先打先得）"
 				}
 			}
 			// 注意：这里**不**计算 strategy —— 统一放到函数末尾重算，保证
@@ -1422,10 +1653,70 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 	verdictByEmail := make(map[string]string, len(out))
 	for i := range out {
 		r := &out[i]
-		if r.Phase != QoderPhasePending || r.RecordTrusted {
+		// ⚠️ **claimed 也要探测**（2026-11-04 实测踩坑）：
+		// 上游活动列表对**同一人组的所有号**都返回今天这条已领活动（服务端按人发，
+		// 同一活动实例对同组账号都可见）。所以扫描看到"今天的活动已 CLAIMED"
+		// 就判 claimed 是不够的 —— 后打的号也会被判成"真领到"。
+		//
+		// 实测现场：qq 与 gmail 看到**同一个** campaign 实例
+		// 01a199dd-c0ea-721e-8751-ea0379af700e（qq 领的），但扫描把两个号
+		// 都报成 claimed → 面板两个号都显示"+100"，凭空多出 100。
+		//
+		// 判据：只读地问一次 GET .../campaigns/{cid}/reward，比对 grantId ——
+		// grantId 相同 = 同一个人的同一份额度；不同 = 本号不是主人。
+		//
+		// 只有 pending 且无本地可信记录时才需要"问是不是同一人"；
+		// claimed 的问题是"是不是**我**领的"，同样要问。
+		if r.Phase != QoderPhasePending && r.Phase != QoderPhaseClaimed {
+			continue
+		}
+		if r.Phase == QoderPhasePending && r.RecordTrusted {
+			continue
+		}
+		// claimed 号必须自己有 cid 才能问。
+		if r.Phase == QoderPhaseClaimed && r.ClaimCID == "" {
 			continue
 		}
 		em := normalizeQoderEmail(r.Email)
+		myAuth := qoderPoolAuth(pool.Accounts, em)
+		if myAuth == nil {
+			continue
+		}
+		// 路径 A（claimed）：用**本号自己的** cid 问服务端"这条实例对我意味着什么"。
+		//   拿到 status=CLAIMED + 自己的 grantId ⇒ 本号真领到了（实测 2026-11-04：
+		//   两个号看到同一条 campaign，但 grantId 与 claimedAt 各不相同，
+		//   **各领各的一份**，不是共享一份）。
+		//   只有服务端明确回 BLOCKED/SAME_PERSON_ALREADY_CLAIMED（本号被拒），
+		//   才是「额度是同人的另一个号领的」，这时才降级。
+		if r.Phase == QoderPhaseClaimed {
+			probe := qoderProbeReward(myAuth, QoderDeviceInfo(), r.ClaimCID, r.Scope)
+			switch {
+			case strings.EqualFold(probe.Status, "BLOCKED") &&
+				strings.Contains(strings.ToUpper(probe.FailureCode), "SAME_PERSON"):
+				// 服务端明确：本号与主人是**同一个人**，额度已被对方领走。
+				r.Phase = QoderPhaseAlready
+				r.CheckedInToday = false
+				r.DeviceQuotaUsed = true
+				holder := r.QuotaTakenBy
+				if holder == "" {
+					holder = qoderSamePersonHolderOf(r.Email, out)
+				}
+				r.QuotaTakenBy = holder
+				r.Msg = "今日额度已被同一个人的另一个账号 " + holder +
+					" 领走（服务端判定同一人，一天只发一份；本号账上未新增积分）"
+				verdictByEmail[em] = QoderVerdictSamePerson
+			case probe.GrantID != "":
+				// 拿到自己的 grantId ⇒ 本号就是主人，真领到了。
+				verdictByEmail[em] = QoderVerdictOwner
+				// 上游给了本号这份额度的领取时刻：落进 Claims（账本要知道
+				// 「上次领到」是什么时候，否则这个号永远显示没有领到时间）。
+				if t, err := time.Parse(time.RFC3339, strings.TrimSpace(probe.ClaimedAt)); err == nil {
+					_ = MarkClaimedAt("qoder", em, t)
+				}
+			}
+			continue
+		}
+		// 路径 B（pending）：本号看不到今天的活动 ⇒ 问"我是不是同一个人"。
 		var peers []string
 		for other, cid := range cidOf {
 			if other == em || cid == "" {
@@ -1437,8 +1728,7 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 		for _, other := range peers {
 			cid := cidOf[other]
 			ownerAuth := qoderPoolAuth(pool.Accounts, other)
-			myAuth := qoderPoolAuth(pool.Accounts, em)
-			if ownerAuth == nil || myAuth == nil {
+			if ownerAuth == nil {
 				continue
 			}
 			ownerProbe := qoderProbeReward(myAuth, QoderDeviceInfo(), cid, r.Scope)
@@ -1448,7 +1738,7 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 				r.DeviceQuotaUsed = true
 				r.QuotaTakenBy = other
 				r.Msg = "今日每日额度已被同一个人的另一个账号 " + other +
-					" 领取（服务端按人发，同一人一天只有一份、先打先得）"
+					" 领取（服务端判定同一人，一天只发一份、先打先得）"
 				verdictByEmail[em] = QoderVerdictSamePerson
 				if err := saveQoderPersonLink(em, other); err != nil {
 					log.Printf("[qoder-person] 记录同人关系 %s ↔ %s 失败（不影响扫描结论）：%v", em, other, err)
@@ -1484,6 +1774,27 @@ func QoderPoolScan(emails []string) []QoderScanAccount {
 				break
 			}
 		}
+	}
+	// ⚠️ already + 额度归属是**同人的另一个号** ⇒ 本号今天**没有签到**、
+	// 账上也没新增积分（服务端按人发，一天一份）。
+	//
+	// 2026-11-04 实测现场：qq 号 claimed（真入账 +100），gmail 号回 already
+	// 但拿到的是**同一个 campaign 实例** —— 上游说"今日已领取"，可那 100 进了
+	// qq 的账。旧实现两号都显示"✓ 今日已签到 / +100 Credits"，凭空多出 100。
+	//
+	// 这里把 already 号改成：不是本号签到 + 如实说明归属。
+	for i := range out {
+		r := &out[i]
+		if r.Phase != QoderPhaseAlready || r.QuotaTakenBy == "" {
+			continue
+		}
+		if strings.EqualFold(r.QuotaTakenBy, r.Email) {
+			continue // 自己领的，就是本号签到
+		}
+		r.DeviceQuotaUsed = true
+		r.CheckedInToday = false
+		r.Msg = "今日额度已由同一个人的另一个账号 " + r.QuotaTakenBy +
+			" 领取（服务端判定同一人，一天只发一份；本号账上未新增积分）"
 	}
 	// 判定出「同一人」关系（或被反证撤销）后重算组大小：组是**判定**出来的，
 	// 不是按 scope 猜的，所以必须等判定完成再统计。

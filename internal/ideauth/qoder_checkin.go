@@ -367,8 +367,9 @@ type QoderCheckinResult struct {
 	CheckedInToday bool `json:"checked_in_today,omitempty"`
 	// Scope 该账号的 agentAccountScope（agent 租户位标识）。
 	//
-	// ⚠️ 它不是每日额度的分组键：2026-11-02 实测两个号的 scope 其实**不同**，
-	// 却照样共享同一份每日额度（服务端按人发）。
+	// ⚠️ 它不是每日额度的分组键：2026-11-02 实测两个号的 scope 其实**不同**；
+	// 2026-11-04 实测两号各自拿到不同的 grantId、各自 +100 —— 额度不是无条件
+	// 按人共享的，服务端判同人才只发一份。
 	Scope string `json:"scope,omitempty"`
 	// QuotaGroup 本账号所在**同一人组**里的账号数（含自己）。>1 = 与别的号同一人。
 	QuotaGroup int `json:"quota_group,omitempty"`

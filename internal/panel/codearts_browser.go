@@ -22,6 +22,7 @@
 package panel
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -220,6 +221,72 @@ func codeartsStopBrowserLocked(keepProfile bool) {
 	codeartsBrowserSession.port = 0
 }
 
+// codeartsBrowserWaitLogin 处理"还没登录"这一步：读 authui 的扫码状态机，
+// 把「没扫 / 扫了没授权 / 授权了但回跳失败」三种情况区分开，并给出能照做的提示。
+//
+// 这是 2026-11-04 用户报「我登陆了但仍提示登录、提取不到」的正面修法。
+// 根因（实测）：扫码成功后 authui 靠 302 → redirect_url（带 CAS ticket）
+// 回跳控制台换会话；这一步失败时页面停在登录页，旧的文案判定永远说"未登录"，
+// 面板既不报错也不提示，用户完全看不到卡在哪。
+//
+// 三种状态的处理：
+//   - authorized + redirect_url：面板**代为跳转**并复验会话；通了就继续走保存流程。
+//   - authorizing：正在授权，等下一轮。
+//   - new / 427：二维码没被扫成功（最常见是扫了张过期码），明确让用户刷新重扫。
+func (p *Panel) codeartsBrowserWaitLogin(w http.ResponseWriter, r *http.Request, port int, text string, cookies []codearts.Cookie) {
+	msg := "还没检测到华为云登录态，请在浏览器窗口里完成登录"
+	qr := codeartsQRProbe(port)
+	if qr.Known && qr.Status == "authorized" && qr.RedirectURL != "" {
+		// 扫码授权成功，但页面没自己跳回去（CAS ticket 回跳失败）。
+		log.Printf("[codearts] 扫码已授权但页面未回跳（port %d），面板代为跳转", port)
+		if err := codeartsNavigateTo(port, qr.RedirectURL); err == nil {
+			time.Sleep(3 * time.Second)
+			if codeartsConsoleSessionAlive(mustCDPCookies(port)) {
+				log.Printf("[codearts] 代跳后控制台会话已通（port %d）", port)
+				// 回跳成功 → 重跑一次完整判定（Cookie 已更新），这次会走保存流程。
+				p.codeartsBrowserPoll(w, r)
+				return
+			}
+		}
+		msg = "扫码已成功，但华为云回跳控制台失败（票据交换被拒）。请在窗口里刷新二维码后重扫一次"
+	} else if m := codeartsLoginMessage(qr, text); m != "" {
+		msg = m
+	}
+	if msg == "还没检测到华为云登录态，请在浏览器窗口里完成登录" && strings.Contains(text, "登录华为云") {
+		msg = "浏览器还停在登录页，请完成登录后自动保存"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "running": true, "cookies": len(cookies),
+		"sample": trimText(text, 200), "message": msg,
+	})
+}
+
+// codeartsLoginMessage 按 authui 的扫码状态给出能照做的提示（纯函数，便于测试）。
+//
+// authui 的 /authui/qrcode/status 实测会回这些状态：
+//
+//	new        二维码刚出，没被扫过
+//	authorizing 扫到了，正在授权
+//	authorized  授权完成（带 redirect_url = CAS 回跳地址）
+//	expired    二维码已过期（2026-11-04 实测现场就是这个）
+//
+// 另外 error_code=427 也是「二维码失效，需要刷新」，页面文案里同时会出现
+// 「二维码已失效 刷新」。三条判据（状态 / 错误码 / 文案）取并集，避免任何
+// 一条变化就漏判 —— 漏判的表现是笼统地说"还没登录"，用户完全看不到卡在哪。
+//
+// 返回空串 = 没有可给的具体状态（调用方用默认文案）。
+func codeartsLoginMessage(qr codeartsQRState, text string) string {
+	switch {
+	case qr.Known && qr.Status == "authorizing":
+		return "已扫到二维码，正在授权，请稍等（授权完成后会自动保存）"
+	case qr.Known && (qr.Status == "expired" || qr.ErrorCode == "427" || codeartsQRExpired(text)):
+		return "二维码已失效，请点一下二维码旁的「刷新」重新出码后扫码（旧的扫了也不会成功）"
+	case qr.Known && qr.Status == "new":
+		return "请用华为云 App 扫描窗口里的二维码（面板会自动保存，不需要手动确认）"
+	}
+	return ""
+}
+
 // codeartsBrowserPoll 检测登录并把账号写入号池。
 func (p *Panel) codeartsBrowserPoll(w http.ResponseWriter, r *http.Request) {
 	codeartsBrowserSession.mu.Lock()
@@ -271,14 +338,24 @@ func (p *Panel) codeartsBrowserPoll(w http.ResponseWriter, r *http.Request) {
 	// 消失、换成「活动福利 / 新建任务 / 工作台」等模块（实测页面文案）。
 	text, nick, logged := codeartsLoginProbe(port)
 	if !logged {
-		msg := "还没检测到华为云登录态，请在浏览器窗口里完成登录"
-		if strings.Contains(text, "登录华为云") {
-			msg = "浏览器还停在登录页，请完成登录后自动保存"
+		// ⚠️ 只看页面文案会漏掉**登录成功但页面没跳回来**的情况（实测 2026-11-04）：
+		// 扫码后 authui 会 302 到 redirect_url（带 CAS ticket）换控制台会话，
+		// 这一步失败时页面停在 authui 登录页 —— 文案判定永远说"未登录"。
+		// 但此时浏览器里**已经有**控制台会话 Cookie（devclouddevuibjJ_SESSION_ID）
+		// 和**认证侧**身份 Cookie（domain_tag/user_tag）。
+		//
+		// 所以这里补一路**实测**：拿浏览器当下的活 Cookie 直接打控制台只读接口，
+		// 通 → 就是真登录了（保存）；不通 → 确实还没登录。
+		if codeartsConsoleSessionAlive(cookies) {
+			logged = true
+			if nick == "" {
+				nick = codeartsNicknameOf(cookies)
+			}
+			log.Printf("[codearts] 页面文案未判登录，但控制台接口实测已登录（port %d），按已登录处理", port)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": true, "running": true, "cookies": len(cookies),
-			"sample": trimText(text, 200), "message": msg,
-		})
+	}
+	if !logged {
+		p.codeartsBrowserWaitLogin(w, r, port, text, cookies)
 		return
 	}
 	// **关掉窗口**：登录已经完成，会话凭据存在号池里（Cookie 快照），
@@ -504,6 +581,236 @@ func codeartsCookiesOf(all []cdpCookie) []codearts.Cookie {
 	}
 	return out
 }
+
+// mustCDPCookies 读浏览器当前 Cookie；读失败返回空切片（调用方自己判空）。
+func mustCDPCookies(port int) []codearts.Cookie {
+	all, err := cdpAllCookies(port)
+	if err != nil {
+		return nil
+	}
+	return codeartsCookiesOf(all)
+}
+
+// codeartsNavigateTo 把登录窗口里**当前正在登录的那个页面**导航到目标 URL。
+//
+// 为什么只导航当前页而不是新开标签：新开标签会打断 authui 的页面上下文
+//（client_key、service 参数都在原页面的 URL 上），而且用户会看到多一个标签页。
+func codeartsNavigateTo(port int, target string) error {
+	pages, err := caListPages(port)
+	if err != nil {
+		return err
+	}
+	for _, p := range pages {
+		if !strings.Contains(p.URL, "auth.huaweicloud.com") {
+			continue
+		}
+		ws, derr := wsDial(p.WS, 6*time.Second)
+		if derr != nil {
+			continue
+		}
+		nerr := caNavigate(ws, target)
+		_ = ws.Close()
+		if nerr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("没有可导航的登录页面")
+}
+
+// codeartsConsoleSessionAlive 用**浏览器当下的活 Cookie** 打控制台只读接口，
+// 判断控制台侧会话是不是真的活着。
+//
+// 为什么需要它（实测 2026-11-04 11:0x）：
+//   - 页面文案判定只在"登录成功**且**页面跳回控制台"时才成立；
+//   - 但 authui 扫码成功后的 CAS ticket 回跳（302 → redirect_url）可能失败，
+//     此时页面停在 authui 登录页、文案永远说"未登录"，而浏览器里其实已经有
+//     可用的控制台会话（devclouddevuibjJ_SESSION_ID + cftk 齐全）。
+//   - 反过来，光看 Cookie 名字也会误判：未登录时同样有 SessionID / HWWAFSESID。
+//
+// 判据用**接口实测**：真打一次 /chat/snap-manager/v1/package/overview，
+// 拿到非空 JSON 才算活。这是唯一不会骗人的判据。
+//
+// ⚠️ 只读接口：不 claim、不改号池、不刷新任何凭据。
+func codeartsConsoleSessionAlive(cookies []codearts.Cookie) bool {
+	if len(cookies) == 0 {
+		return false
+	}
+	// 缺控制台侧会话 Cookie 就不用发请求了（省一次网络往返）。
+	names := map[string]string{}
+	for _, c := range cookies {
+		names[c.Name] = c.Value
+	}
+	if names["devclouddevuibjJ_SESSION_ID"] == "" && names["devclouddevuibjtcftk"] == "" {
+		return false
+	}
+	// 自己拼请求而不是复用 codearts.Credits：那个走 8 秒超时的共享 client，
+	// 放在登录轮询里会让界面卡住。这里给 4 秒。
+	parts := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		if c.Name == "" || c.Value == "" {
+			continue
+		}
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	req, err := http.NewRequest(http.MethodGet,
+		codearts.APIBase+"/chat/snap-manager/v1/package/overview", nil)
+	if err != nil {
+		return false
+	}
+	h := req.Header
+	h.Set("Cookie", strings.Join(parts, "; "))
+	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+	h.Set("Accept", "application/json, text/plain, */*")
+	h.Set("Referer", codearts.APIBase+"/chat/home")
+	h.Set("language", "zh-cn")
+	h.Set("x-language", "zh-cn")
+	h.Set("x-codearts-doer-scenario-type", "web")
+	h.Set("x-requested-with", "XMLHttpRequest")
+	h.Set("Agent-Type", "PromptCenter")
+	if cftk := names["devclouddevuibjtcftk"]; cftk != "" {
+		h.Set("cftk", cftk)
+	}
+	cl := &http.Client{Timeout: 4 * time.Second}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 实测：会话失效的特征是 HTTP 200 + **空 body**（见 codearts.ErrSessionExpired）。
+	// 有内容 = 接口真的返回了数据 = 会话活着。
+	return resp.StatusCode == http.StatusOK && len(bytes.TrimSpace(raw)) > 0
+}
+
+// codeartsQRExpired 判断登录页上的二维码是否已失效。
+//
+// 实测文案：华为云 authui 二维码过期时页面出现「二维码已失效 刷新」。
+// 这是最高频的卡点 —— 用户扫的是一张过期码，服务端 /authui/qrcode/status
+// 一直是 {"status":"new"}（从未扫成功），用户却以为"我登录了"。
+func codeartsQRExpired(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, kw := range []string{"二维码已失效", "二维码已过期", "扫码已失效"} {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// codeartsNicknameOf 从 Cookie 里取账号昵称（masked_user 形如 h*********uvj421wxe）。
+func codeartsNicknameOf(cookies []codearts.Cookie) string {
+	for _, c := range cookies {
+		if c.Name == "masked_user" && c.Value != "" {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// ── 扫码登录状态（authui）────────────────────────────────────────────────
+
+// codeartsQRState authui 扫码状态机（实测 2026-11-04 反查 app.bundle.js + 真实响应）。
+//
+//	{"status":"new"}        二维码刚出，还没扫
+//	{"status":"authorizing"} 扫到了，正在授权
+//	{"status":"authorized"}  授权成功 —— **redirect_url 里带 CAS ticket**，
+//	                        前端就是 window.location.href = redirect_url 回跳控制台
+//
+// 为什么面板要自己读它（而不是只看页面文案）：
+// 用户扫码成功后，authui 会 302 到 redirect_url 换控制台会话。这一步失败时
+// 页面停在登录页、文案判定永远说"未登录"，用户看到的就是"我登录了但还是提示
+// 登录、也提取不到"—— 面板既不报错也不提示，用户完全不知道卡在哪。
+// 读 qrcode/status 能把「扫码没成功」「扫了没授权」「授权了但回跳失败」
+// 三种状态区分开，给出准确提示。
+type codeartsQRState struct {
+	// Status new / authorizing / authorized / 其它
+	Status string `json:"status"`
+	// RedirectURL 授权成功后的回跳地址（带 ticket）
+	RedirectURL string `json:"redirect_url"`
+	// ErrorCode authui 的错误码（427 = 二维码失效需要刷新）
+	ErrorCode string `json:"error_code"`
+	// Known 页面里没有 authui 登录页（false = 不在扫码流程里）
+	Known bool `json:"known"`
+}
+
+// codeartsQRProbe 在**登录窗口的 authui 页面里**读扫码状态。
+//
+// ⚠️ 必须用页面上下文发（fetch with credentials），因为 client_key 是页面
+// 轮询时自己生成并带在 URL 上的；纯 HTTP 拿不到当前页面的 client_key。
+//
+// 只读：只 GET /authui/qrcode/status，不点任何按钮、不领任何东西。
+func codeartsQRProbe(port int) codeartsQRState {
+	pages, err := caListPages(port)
+	if err != nil {
+		return codeartsQRState{}
+	}
+	for _, p := range pages {
+		if !strings.Contains(p.URL, "auth.huaweicloud.com") {
+			continue
+		}
+		ws, derr := wsDial(p.WS, 6*time.Second)
+		if derr != nil {
+			continue
+		}
+		raw, eerr := caEval(ws, codeartsQRStatusJS)
+		_ = ws.Close()
+		if eerr != nil {
+			continue // 页面正在跳转，下一轮再读
+		}
+		var st codeartsQRState
+		if json.Unmarshal(raw, &st) != nil {
+			continue
+		}
+		st.Known = true
+		return st
+	}
+	return codeartsQRState{}
+}
+
+// codeartsQRStatusJS 在 authui 页面里取 client_key 并读扫码状态。
+const codeartsQRStatusJS = `(async () => {
+  const q = new URLSearchParams(location.search);
+  const service = q.get('service') || '';
+  // client_key 在页面自己的轮询 URL 上：从 performance 资源里反查。
+  let ck = '';
+  try {
+    const r = performance.getEntriesByType('resource').map(e => e.name)
+      .filter(n => n.indexOf('/authui/qrcode/status') >= 0);
+    for (const n of r) {
+      const m = n.match(/[?&]client_key=([^&]+)/);
+      if (m) { ck = decodeURIComponent(m[1]); break; }
+    }
+  } catch (e) {}
+  if (!ck) {
+    // 轮询还没发出去过：从 qrcode 请求里找
+    try {
+      const r2 = performance.getEntriesByType('resource').map(e => e.name)
+        .filter(n => n.indexOf('/authui/qrcode') >= 0);
+      for (const n of r2) {
+        const m = n.match(/[?&]client_key=([^&]+)/);
+        if (m) { ck = decodeURIComponent(m[1]); break; }
+      }
+    } catch (e) {}
+  }
+  if (!ck) return JSON.stringify({ status: '', known: true });
+  try {
+    const u = '/authui/qrcode/status?client_key=' + encodeURIComponent(ck) +
+      (service ? '&service=' + encodeURIComponent(service) : '');
+    const r = await fetch(u, { credentials: 'same-origin' });
+    const t = await r.text();
+    let p = null;
+    try { p = JSON.parse(t); } catch (e) {}
+    if (!p) return JSON.stringify({ status: '', known: true, error_code: 'not-json' });
+    return JSON.stringify({
+      status: p.status || '', redirect_url: p.redirect_url || '',
+      error_code: p.error_code || '', known: true
+    });
+  } catch (e) {
+    return JSON.stringify({ status: '', known: true, error_code: String(e) });
+  }
+})()`
 
 // codeartsLoginProbe 读**已打开**的页面，判定是否已登录。
 //

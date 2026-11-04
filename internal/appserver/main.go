@@ -36,6 +36,40 @@ import (
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 //
+// 1.15.8-panel：把 Qoder「额度归属」的结论改成**只说有证据的话** ——
+//  1) 面板上「策略：服务端判定同人」是**默认值**，不是实测结论：旧实现对
+//     claimed/already/claimable 一律回 shared_person，于是每个号都挂着这句。
+//     但 2026-11-04 实测：服务端**从没判过**这两个号同人 —— 两号看到同一条
+//     campaign，grantId / claimedAt 各不相同，各自 +100（额度余额也各自独立：
+//     1700 / 900）。现在只有拿到**本号自己的 grantId** 才叫 isolated，只有服务端
+//     明确回 SAME_PERSON_ALREADY_CLAIMED（或额度归属另有其人）才叫 shared_person，
+//     其余一律 unknown（归属未核实）—— 不再拿没证据的结论当事实说。
+//  2) POST 侧补上「already」的**只读归属探测**（GET .../campaigns/{cid}/reward）：
+//     上游对同一人组的所有号返回同一条已领活动，「already」不等于「本号领过」。
+//     不问就会出现「同一个号两个说法」（POST 说未核实、扫描说独立）和「+100 虚记」。
+//  3) 面板文案同步：不再笼统说「服务端按人发，同一人一天只有一份」—— 那只在
+//     服务端判同人时成立。
+//
+// 1.15.7-panel：修用户实测报出的两个真问题 ——
+//  1) 华为云登录窗口「我登录了但还提示未登录、提取不到」：根因是登录判定
+//     **只看页面文案**。实测现场：浏览器里已有完整登录凭据（domain_tag /
+//     user_tag / hwid_cas_sid / SSOTGC），authui 的 /authui/isLogin 也回
+//     success，但扫码后的 CAS ticket 回跳（302 → redirect_url）失败，页面
+//     停在 authui 登录页 —— 文案判定永远说"未登录"，面板既不报错也不提示。
+//     现在：① 判定加一路**接口实测**（拿活 Cookie 真打控制台只读接口）；
+//     ② 直接读 authui 的**扫码状态机**（/authui/qrcode/status），把
+//     「没扫 / 扫了没授权 / 授权了但回跳失败」区分开；
+//     ③ 授权成功但没回跳时，面板**代为跳转** redirect_url 并复验会话；
+//     ④ 二维码失效时明确提示「点刷新重新出码」（实测扫的是过期码，
+//     服务端 status 一直是 new，从未扫成功）。
+//  2) Qoder 面板「两个号都显示 +100 / 上下重复」：
+//     ① 虚记 —— 服务端按**人**发额度，后打的号回 already 但拿到的是**同一个
+//     campaign 实例**，那 100 积分只进了先打那个号的账。旧实现 already 也记
+//     credits=100，两个号相加凭空多出 100。现在按 campaign 实例回填归属，
+//     额度是同人另号领的 ⇒ credits 归零 + 点名是谁领的 + 文案说清未入账。
+//     ② 重复 —— 上方表格已逐号显示状态与积分，下方「本次尝试」块再逐号重列
+//     一遍。现在该块只画汇总（分桶计数 / 实际入账 / 额度组 / 本轮顺序）。
+//
 // 1.15.6-panel：修三个实测出来的真问题 ——
 //  1) 华为云 CodeArts 续期被**陈旧结论永久锁死**：renew_result=needs_login 是
 //     「上一次尝试的结论」却被当成账号的固有属性，于是用户明明重新登录成功了，
@@ -53,7 +87,7 @@ import (
 // 实测）—— 不再拿 agentAccountScope 猜分组（实测两个号 scope 不同却共享一份额度）；
 // 跨号判定改成**只读**（GET .../campaigns/{cid}/reward），不会动到别人的额度；
 // 号池里的 scope 改为按账号自身解析（原来读的是主文件的 scope，会记错号）。
-const appVersion = "1.15.6-panel"
+const appVersion = "1.15.8-panel"
 
 // traeRateRange 汇总 Trae 目录的消耗倍率区间（启动日志用）。
 func traeRateRange(ms []traechat.ModelInfo) string {

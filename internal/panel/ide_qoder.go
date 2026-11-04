@@ -276,6 +276,18 @@ func qoderLegacyCheckinItem(res *ideauth.QoderCheckinResult) ideauth.QoderChecki
 	default:
 		phase = ideauth.QoderPhaseFailed
 	}
+	// strategy 由 ideauth 的统一函数推导（面板不自己判断）：
+	// 真领到 / 本地账本可信 ⇒ 本号独占一份（owner）；否则证据不足，如实留 unknown，
+	// 绝不默认扣上「服务端判定同人」的帽子（2026-11-04 实测：服务端并未判同人）。
+	verdict := ideauth.QoderVerdictUnknown
+	switch phase {
+	case ideauth.QoderPhaseClaimed:
+		verdict = ideauth.QoderVerdictOwner
+	case ideauth.QoderPhaseAlready:
+		if ideauth.CheckinRecordTrusted("qoder", res.Email) {
+			verdict = ideauth.QoderVerdictOwner
+		}
+	}
 	item := ideauth.QoderCheckinItem{
 		Email:      res.Email,
 		Name:       res.Name,
@@ -289,9 +301,7 @@ func qoderLegacyCheckinItem(res *ideauth.QoderCheckinResult) ideauth.QoderChecki
 		Scope:      res.Scope,
 		ClaimCID:   res.ClaimCID,
 		QuotaGroup: 1,
-		// 单号路径没有同人探测证据（verdict=unknown），由 ideauth 的统一函数推导
-		// strategy：默认 shared_person，探测证明隔离可用且该号有独立出口时才 isolated。
-		Strategy:     ideauth.QoderStrategyFor(res.Email, phase, "", 1, ideauth.QoderVerdictUnknown),
+		Strategy:     ideauth.QoderStrategyFor(res.Email, phase, "", 1, verdict),
 		RotationRank: 1,
 	}
 	if phase == ideauth.QoderPhaseClaimed || phase == ideauth.QoderPhaseAlready {

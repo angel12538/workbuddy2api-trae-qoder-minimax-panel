@@ -319,8 +319,11 @@ func TestQoderCheckinStatusContract(t *testing.T) {
 	if a.LastClaimedAt == "" {
 		t.Error("A 号应能从账本回落到 last_claimed_at")
 	}
-	if a.Strategy != ideauth.QoderStrategySharedPerson {
-		t.Errorf("探测未证明隔离时策略应为 shared_person，实际 %q", a.Strategy)
+	// claimable = 今天还没领、可以领。归属**未核实** → unknown：
+	// 不得默认扣上「服务端判定同人」的帽子（2026-11-04 实测：服务端并没判同人，
+	// 两个号各自都领到了各自的 100）。
+	if a.Strategy != ideauth.QoderStrategyUnknown {
+		t.Errorf("未核实的归属策略应为 unknown，实际 %q", a.Strategy)
 	}
 	b := byEmail["b@test.com"]
 	if b.Phase != "pending" || b.CheckedInToday {
@@ -633,12 +636,20 @@ func TestQoderCheckinAndStatusAgreeOnStrategy(t *testing.T) {
 	if !statusResp.AllSettled {
 		t.Error("没有 claimable 账号时 all_settled 应为 true（旧语义，与 checked_in_today 区分）")
 	}
-	// A 号两端点也自洽。
-	if checkinByEmail["a@test.com"].Strategy != ideauth.QoderStrategySharedPerson {
-		t.Errorf("A 号默认策略应为 shared_person，实际 %q", checkinByEmail["a@test.com"].Strategy)
+	// A 号两端点也自洽：上游说今天这条已领，且只读探测拿回**本号自己的**
+	// grantId ⇒ 本号独占一份额度（isolated）。两个端点必须给同一个答案 ——
+	// 「同一个号两个说法」是 D-Q1 类 bug（POST 侧不问就只能说未核实，扫描侧却
+	// 问得出，于是两边打架）。
+	ckA := checkinByEmail["a@test.com"]
+	stA := statusByEmail["a@test.com"]
+	if ckA.Strategy != ideauth.QoderStrategyIsolated {
+		t.Errorf("A 号 POST 侧策略应为 isolated（本号自己的 grantId），实际 %q", ckA.Strategy)
 	}
-	if statusByEmail["a@test.com"].Strategy != ideauth.QoderStrategySharedPerson {
-		t.Errorf("A 号状态扫描策略应为 shared_person，实际 %q", statusByEmail["a@test.com"].Strategy)
+	if stA.Strategy != ideauth.QoderStrategyIsolated {
+		t.Errorf("A 号状态扫描策略应为 isolated（本号自己的 grantId），实际 %q", stA.Strategy)
+	}
+	if ckA.Strategy != stA.Strategy {
+		t.Errorf("同一状态两端点 strategy 必须一致：checkin=%q status=%q", ckA.Strategy, stA.Strategy)
 	}
 }
 

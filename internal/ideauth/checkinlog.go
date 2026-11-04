@@ -444,6 +444,13 @@ func normalizeQoderClaimRecord(rec QoderClaimRecord) (QoderClaimRecord, error) {
 	if rec.Phase != "claimed" && rec.Phase != "already" {
 		rec.Credits = 0
 	}
+	// ⚠️ already 也可能是**虚记**（实测 2026-11-04）：服务端按人发额度，
+	// 后打的号回 already，但拿到的是同一个 campaign 实例 —— 那 100 积分
+	// 进了同一人另一个号的账。quota_taken_by 点名了归属 ⇒ credits 必须归零，
+	// 否则两号相加凭空多出 100。
+	if rec.Phase == "already" && strings.TrimSpace(rec.QuotaTakenBy) != "" {
+		rec.Credits = 0
+	}
 	if rec.Credits < 0 {
 		rec.Credits = 0
 	}
@@ -564,13 +571,23 @@ func QoderClaimHistory(email string, days int) []QoderClaimRecord {
 	return out
 }
 
-// QoderClaimedDates 返回某账号 phase=claimed 的去重日期（升序）。
+// QoderClaimedDates 返回某账号「领到过每日额度」的去重日期（升序）。
+//
+// 口径：phase=claimed（本轮真领到）**或** phase=already 且 credits>0
+// （上游说今天这条已领、且这笔积分确实是本号入账的 —— 实测 2026-11-04：
+// 两个号各领各的一份，后打的号本轮显示 already，但那份额度在**它自己**账上）。
+//
+// 排除 phase=already 且 credits=0：那种是「额度被同人的另一个号领走」，
+// 本号一分钱没多，不能算进「历史已领」。
 func QoderClaimedDates(email string, days int) []string {
 	records := QoderClaimHistory(email, days)
 	seen := map[string]bool{}
 	out := make([]string, 0, len(records))
 	for _, r := range records {
-		if r.Phase != "claimed" || r.Date == "" || seen[r.Date] {
+		if r.Date == "" || seen[r.Date] {
+			continue
+		}
+		if r.Phase != "claimed" && !(r.Phase == "already" && r.Credits > 0) {
 			continue
 		}
 		seen[r.Date] = true
@@ -679,7 +696,16 @@ func QoderBackfillClaimHistoryForToday(email string) (bool, error) {
 	}
 	today := qoderClaimDay(time.Now())
 	for _, rec := range QoderClaimHistory(ex, 1) {
-		if rec.Date == today && rec.Phase == "claimed" {
+		if rec.Date != today {
+			continue
+		}
+		if rec.Phase == "claimed" {
+			return false, nil
+		}
+		// 当天已有「already + credits>0」的记录：说明这份额度**已经是本号自己**
+		// 入账的（实测 2026-11-04：上游说已领、只读探测拿回本号自己的 grantId）。
+		// 再补一条 claimed 只会让审计日志把同一天算成两笔 100 —— 不补。
+		if rec.Phase == "already" && rec.Credits > 0 {
 			return false, nil
 		}
 	}

@@ -5160,9 +5160,11 @@ const QD_PHASE_TEXT = {
   claimed: '已领取', already: '今日已领', blocked: '同一人已领（未签到）',
   pending: '今日未下发', failed: '失败', login_required: '需重新登录', error: '错误',
 };
+// strategy 文案：只在上游真有证据时才说「服务端判定同人」（2026-11-04 实测：
+// 服务端并未判这两个号同人 —— 两号 grantId 不同、各自 +100）。
 const QD_STRATEGY_TEXT = {
-  isolated: '独立设备/出口', shared_person: '服务端判定同人',
-  rotated: '按人轮换', unassigned: '今日未下发', unknown: '未知策略',
+  isolated: '额度独立（各号各一份）', shared_person: '服务端判定同人',
+  rotated: '按人轮换', unassigned: '今日未下发', unknown: '归属未核实',
 };
 
 function qdPhaseText(p) { return QD_PHASE_TEXT[p] || p || '未知'; }
@@ -5178,8 +5180,14 @@ function qdCounts(results) {
 }
 
 // qdBucketHTML 纯函数：把一次批量签到结果按 phase 分桶成 HTML。
+//
 // credits 严格按后端数值展示（blocked/pending/failed 恒为 0），活动面值
 // 只在 benefit_amount 存在时提示「未入账」，绝不把面值当成已领积分。
+//
+// ⚠️ 只画**汇总**，不重复逐号行（2026-11-04 用户反馈）：
+// 上方「账号 / 积分 / 状态 / 操作」表格已经逐号显示了状态与积分，
+// 下方再把每个号重列一遍（"今日已领 +100 Credits"）是同一件事说两遍。
+// 这里只保留：分桶计数、本轮顺序、总额度组数 —— 表格没有的**汇总信息**。
 function qdBucketHTML(d) {
   const results = Array.isArray(d && d.results) ? d.results : [];
   if (!results.length) return '';
@@ -5196,41 +5204,28 @@ function qdBucketHTML(d) {
   const rot = Array.isArray(d && d.rotation_order) ? d.rotation_order : [];
   const orderLine = rot.length
     ? '<div class="note" data-qd-rotation="1">本轮顺序：' +
-      rot.map((e, i) => (i + 1) + '. ' + e).join(' · ') + '</div>'
+      rot.map((e, i) => (e ? (i + 1) + '. ' + e : '')).filter(Boolean).join(' · ') + '</div>'
     : '';
-  const blocks = order.map(p => {
-    const rows = by.get(p).map(r => {
-      const email = String(r.email || '');
-      const why = r.msg || '';
-      const credits = Number(r.credits || 0);
-      const benefit = Number(r.benefit_amount || 0);
-      const zeroPhase = p !== 'claimed' && p !== 'already';
-      let extra = '';
-      if (p === 'blocked') {
-        // 契约：blocked 必须显示 quota_taken_by，不得计入已签到。
-        extra = '同一人已领（' + (r.quota_taken_by || '同组其他账号') + '）';
-      } else if (p === 'claimed') {
-        extra = r.quota_taken_by ? '额度归属 ' + r.quota_taken_by : '';
-      }
-      const cText = '+' + credits + ' Credits' +
-        (zeroPhase && benefit ? '（活动面值 ' + benefit + '，未入账）' : '');
-      return '<div class="qrow" data-qd-result="' + esc(email) + '" data-qd-phase="' + esc(p) + '">' +
-        '<span class="code">' + esc(email) + '</span>' +
-        '<span class="name"><span class="t">' + esc(why || qdPhaseText(p)) + '</span>' +
-        (extra ? '<span class="tag mute">' + esc(extra) + '</span>' : '') + '</span>' +
-        '<span class="prog">' + esc(cText) + '</span>' +
-        '<span class="st">' + esc(qdPhaseText(p)) + '</span>' +
-        '</div>';
-    }).join('');
-    return '<div class="qgroup" data-qd-bucket="' + esc(p) + '">' +
-      '<header><span class="nm">' + esc(qdPhaseText(p)) + '</span>' +
-      '<span class="cnt">' + by.get(p).length + ' 个</span></header>' + rows + '</div>';
-  }).join('');
+  // 新增积分：只有 claimed 才算（后端 credits 语义），already 的额度可能是同人另号领的。
+  const gained = Number(d && d.credits_total) || 0;
+  const gainLine = gained > 0
+    ? '<div class="note" data-qd-gain="1">本轮实际入账：+' + gained + ' Credits</div>'
+    : '';
+  // 额度组：组 = 服务端判定为**同一个人的号**的集合（组内只有 1 个 = 该号独享一份）。
+  // ⚠️ 2026-11-04 实测更正：额度**不是**无条件按人共享 —— 两个号各自拿到不同的
+  // grantId、各自 +100；只有服务端明确判同人（SAME_PERSON_ALREADY_CLAIMED）时
+  // 才只发一份。所以这里不能说「同一人一天只有一份」。
+  const groups = Array.isArray(d && d.quota_groups) ? d.quota_groups : [];
+  const takenOver = results.filter(r => r && (r.quota_taken_by || r.same_person_taken)).length;
+  const groupLine = groups.length
+    ? '<div class="note" data-qd-groups="1">额度组 ' + groups.length + ' 个（组 = 服务端判定同人的号，组内只有 1 个即独享一份' +
+      (takenOver > 0 ? '；今天有 ' + takenOver + ' 个号的额度被同组另一个号领走' : '') + '）</div>'
+    : '';
   // 七相之和必须等于实际尝试数；缺相不显示，但总和行给出真实分桶。
   mayCheckQoderBucketsSum(results, by);
   return '<div class="qd-buckets" data-qd-buckets="1">' +
     '<div class="note" style="padding:6px 0">本次尝试 ' + results.length + ' 个 · ' + esc(sum) + '</div>' +
-    orderLine + blocks + '</div>';
+    gainLine + groupLine + orderLine + '</div>';
 }
 
 // mayCheckQoderBucketsSum 只在开发期把不变量写进控制台；不改变 UI 行为。
@@ -5334,11 +5329,17 @@ async function loadCkQoder(quiet) {
         : '';
       const quotaTip = quota
         ? (holder
-          ? '今日每日额度已被同一个人的另一个账号 ' + holder + ' 领取（服务端按人给，同一人一天只有一份）'
-          : '今日每日额度已被同一个人的另一个账号领取（服务端按人给，同一人一天只有一份、先打先得）')
+          ? '今日每日额度已被服务端判定为同一个人的另一个账号 ' + holder + ' 领走（同人一天只发一份）'
+          : '今日每日额度已被服务端判定为同一个人的另一个账号领走（同人一天只发一份、先打先得）')
         : '';
       const status = isDone
-        ? UI.badge('ok', '✓', '今日已签到', why || '上游活动列表确认今天已领取')
+        // ⚠️ already 但额度是**同人的另一个号**领的（服务端按人发，一天一份）：
+        // 本号账上没新增积分，不能说"今日已签到"。2026-11-04 用户反馈的
+        // 「两个号都显示 +100」就是这里来的。
+        ? (phaseMap[k] === 'already' && holder
+          ? UI.badge('mute2', '○', '同一人已领（未入账）',
+              why || ('今日额度已由同一人另一个账号 ' + holder + ' 领取，本号账上未新增积分'))
+          : UI.badge('ok', '✓', '今日已签到', why || '上游活动列表确认今天已领取'))
         : (phaseMap[k] === 'pending'
           ? (quota
             ? UI.badge('mute2', '○', '同一人已领（未签到）', why || quotaTip)

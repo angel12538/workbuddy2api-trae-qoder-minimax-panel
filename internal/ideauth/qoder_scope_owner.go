@@ -27,7 +27,7 @@ import (
 //	gmail 的 runtimeId 全部落在 ext 的 accounts["qoder:prod:global:9ecb3ca9…"] 里。
 //
 //	⚠️ 但 scope **不能**用来判断「两个号是不是同一个人」：这两个号 scope 不同，
-//	却照样共享同一份每日额度（服务端按人发，见 qoder_person.go）。
+//	服务端却没判它们同人（各自都领到了各自的 100，grantId 不同）。
 
 // qoderScopeBucket 一个 scope 桶：scope → 该账号在服务端注册出来的 id 集合。
 type qoderScopeBucket struct {

@@ -1165,8 +1165,13 @@ process.stdout.write(JSON.stringify({ empty: empty, session: session, cookie: co
 	}
 }
 
-// TestFrontendQoderBuckets 七相分桶：blocked 必须单列且显示 quota_taken_by，
-// credits 不得把被阻塞的号显示成已入账。
+// TestFrontendQoderBuckets Qoder 签到结果块的契约（2026-11-04 改版）：
+//
+//  1. **只画汇总**，不重复逐号行 —— 上方「账号/积分/状态/操作」表格已经逐号
+//     展示了状态与积分，下面再逐号重列一遍是同一件事说两遍（用户明确要求去掉）。
+//  2. 七相计数必须齐全且与实际尝试数一致。
+//  3. blocked/pending 等"没领到"的相位**不得**显示成已入账的 +100。
+//  4. 「本轮实际入账」只算 credits_total（后端只把 claimed 计入）。
 func TestFrontendQoderBuckets(t *testing.T) {
 	script := `const fs = require('fs');
 const vm = require('vm');
@@ -1180,46 +1185,47 @@ const ctx = {
 };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.qdBucketHTML = qdBucketHTML; this.qdCounts = qdCounts; this.qdPhaseText = qdPhaseText;', ctx);
-const d = { results: [
+const d = { credits_total: 100, quota_groups: [{ quota_group: 1 }], results: [
   { email: 'a@x', phase: 'claimed', credits: 100, quota_taken_by: 'a@x', strategy: 'shared_person', msg: '领取成功' },
   { email: 'b@y', phase: 'blocked', credits: 0, benefit_amount: 100, quota_taken_by: 'a@x', strategy: 'shared_person', msg: '服务端判定同人' },
   { email: 'c@z', phase: 'pending', credits: 0 },
   { email: 'd@z', phase: 'failed', credits: 0, msg: 'HTTP 500' },
   { email: 'e@z', phase: 'login_required', credits: 0 },
   { email: 'f@z', phase: 'error', credits: 0 },
-  { email: 'g@z', phase: 'already', credits: 100 },
+  { email: 'g@z', phase: 'already', credits: 0, benefit_amount: 100, quota_taken_by: 'a@x' },
 ] };
 const html = ctx.qdBucketHTML(d);
 const c = ctx.qdCounts(d.results);
 process.stdout.write(JSON.stringify({
   html: html,
   counts: c,
-  hasSeven: ['claimed','already','blocked','pending','failed','login_required','error']
-    .every(p => html.indexOf('data-qd-bucket="' + p + '"') >= 0),
-  blockedText: html.indexOf('同一人已领（a@x）') >= 0,
-  blockedZero: html.indexOf('data-qd-result="b@y"') >= 0 && html.indexOf('+0 Credits（活动面值 100，未入账）') >= 0,
+  hasAllPhasesInSum: ['已领取 1','今日已领 1','同一人已领（未签到） 1','今日未下发 1','失败 1','需重新登录 1','错误 1']
+    .every(s => html.indexOf(s) >= 0),
+  noPerRow: html.indexOf('data-qd-result=') < 0 && html.indexOf('data-qd-bucket=') < 0,
+  noFakeGain: html.indexOf('本轮实际入账：+100 Credits') >= 0 &&
+              html.indexOf('+100 Credits（活动面值') < 0,
   sumOk: c.claimed === 1 && c.already === 1 && c.blocked === 1 && c.pending === 1 &&
          c.failed === 1 && c.login_required === 1 && c.error === 1,
 }));`
 	out := runNodeScript(t, "qoder-buckets", script)
 	var got struct {
-		HasSeven    bool           `json:"hasSeven"`
-		BlockedText bool           `json:"blockedText"`
-		BlockedZero bool           `json:"blockedZero"`
-		SumOk       bool           `json:"sumOk"`
-		Counts      map[string]int `json:"counts"`
+		HasAllPhasesInSum bool           `json:"hasAllPhasesInSum"`
+		NoPerRow          bool           `json:"noPerRow"`
+		NoFakeGain        bool           `json:"noFakeGain"`
+		SumOk             bool           `json:"sumOk"`
+		Counts            map[string]int `json:"counts"`
 	}
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out)
 	}
-	if !got.HasSeven {
-		t.Errorf("七相分桶未全部渲染：%s", out)
+	if !got.HasAllPhasesInSum {
+		t.Errorf("七相计数未全部出现在汇总里：%s", out)
 	}
-	if !got.BlockedText {
-		t.Errorf("blocked 未显示「同一人已领（quota_taken_by）」：%s", out)
+	if !got.NoPerRow {
+		t.Errorf("结果块不得重复渲染逐号行（上方表格已逐号展示）：%s", out)
 	}
-	if !got.BlockedZero {
-		t.Errorf("blocked 的 credits 必须为 0 且面值标注未入账：%s", out)
+	if !got.NoFakeGain {
+		t.Errorf("「本轮实际入账」必须等于 credits_total 且不能出现裸 +100：%s", out)
 	}
 	if !got.SumOk {
 		t.Errorf("七相计数不等于实际尝试数：%v", got.Counts)

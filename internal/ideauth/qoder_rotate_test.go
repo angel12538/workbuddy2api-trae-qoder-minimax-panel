@@ -348,17 +348,22 @@ func TestQoderStrategySnapshot(t *testing.T) {
 		// pending + 证据不足 → unknown（不得当成同人，也不得当成非同人）。
 		{"pending_unknown", realEmail, QoderPhasePending, "", 2, QoderVerdictUnknown, "", QoderStrategyUnknown},
 		{"pending_empty_verdict", realEmail, QoderPhasePending, "", 1, "", "", QoderStrategyUnknown},
-		// claimed/already：组内只有自己且无独立出口 → 默认 shared_person。
-		{"claimed_real", realEmail, QoderPhaseClaimed, "", 1, QoderVerdictOwner, "", QoderStrategySharedPerson},
-		{"already_real", realEmail, QoderPhaseAlready, "", 1, QoderVerdictOwner, "", QoderStrategySharedPerson},
-		{"claimable_real", realEmail, "claimable", "", 1, "", "", QoderStrategySharedPerson},
-		// 有独立出口但探测未证明隔离可用 → 仍是 shared_person（不假设隔离）。
-		{"derived_no_probe", derivedEmail, QoderPhaseClaimed, "", 1, QoderVerdictOwner, "inconclusive", QoderStrategySharedPerson},
+		// claimed/already：本号自己的 grantId（verdict=owner）⇒ 独占一份 → isolated。
+		// 2026-11-04 实测更正：旧实现一律回 shared_person（「服务端判定同人」），
+		// 但服务端根本没判过同人，两号 grantId 不同、各领各的 100。
+		{"claimed_real", realEmail, QoderPhaseClaimed, "", 1, QoderVerdictOwner, "", QoderStrategyIsolated},
+		{"already_real", realEmail, QoderPhaseAlready, "", 1, QoderVerdictOwner, "", QoderStrategyIsolated},
+		// 没有归属结论（没探测到）→ 归属未核实，绝不默认说「服务端判定同人」。
+		{"claimable_real", realEmail, "claimable", "", 1, "", "", QoderStrategyUnknown},
+		// 有独立出口但探测未证明隔离可用 → 仍按归属未核实（不假设隔离）。
+		{"derived_no_probe", derivedEmail, QoderPhaseClaimed, "", 1, QoderVerdictOwner, "inconclusive", QoderStrategyIsolated},
 		// 有独立出口 + probe=isolated_viable → isolated。
 		{"derived_isolated", derivedEmail, QoderPhaseClaimed, "", 1, QoderVerdictOwner, "isolated_viable", QoderStrategyIsolated},
 		{"proxy_isolated", proxyEmail, QoderPhaseAlready, "", 1, QoderVerdictOwner, "isolated_viable", QoderStrategyIsolated},
 		// 已被判进同人组 → 绝不可能是 isolated。
 		{"derived_but_group", derivedEmail, QoderPhaseClaimed, "", 2, QoderVerdictOwner, "isolated_viable", QoderStrategySharedPerson},
+		// 额度明确归属同组另一个号 → shared_person（唯一真证据）。
+		{"claimed_taken_by_peer", realEmail, QoderPhaseClaimed, "a@test.com", 1, QoderVerdictOwner, "", QoderStrategySharedPerson},
 		// 登录失效 / 本地错误 → unknown。
 		{"login_required", realEmail, QoderPhaseLoginRequired, "", 1, "", "", QoderStrategyUnknown},
 		{"error", realEmail, QoderPhaseError, "", 1, "", "", QoderStrategyUnknown},
