@@ -56,7 +56,7 @@ var traeOAuthState struct {
 	state     string
 	createdAt time.Time
 	done      bool
-	ok        bool         // done 时：是否成功
+	ok        bool // done 时：是否成功
 	message   string
 	ln        net.Listener // 非 nil = 回调服务器已在监听
 	srv       *http.Server
@@ -293,35 +293,7 @@ func (p *Panel) traeFinishLogin(q url.Values) (string, error) {
 
 // traeExchangeToken POST oauth/ExchangeToken：用 refresh_token 换 access_token。
 func traeExchangeToken(refreshToken string) (accessToken, newRefreshToken string, err error) {
-	body, _ := json.Marshal(map[string]string{
-		"ClientID":     traeOAuthClientID,
-		"RefreshToken": refreshToken,
-		"ClientSecret": traeOAuthClientSecret,
-		"UserID":       "",
-	})
-	var out struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Data    struct {
-			AccessToken  string `json:"access_token"`
-			Token        string `json:"token"`
-			RefreshToken string `json:"refresh_token"`
-		} `json:"data"`
-	}
-	if err := traePostJSON(traeAPIBase+"/oauth/ExchangeToken", "", body, &out); err != nil {
-		return "", "", fmt.Errorf("ExchangeToken 请求失败: %w", err)
-	}
-	if out.Code != 0 {
-		return "", "", fmt.Errorf("ExchangeToken 失败 (code=%d): %s", out.Code, out.Message)
-	}
-	at := out.Data.AccessToken
-	if at == "" {
-		at = out.Data.Token
-	}
-	if at == "" {
-		return "", "", fmt.Errorf("ExchangeToken 响应缺少 access_token")
-	}
-	return at, out.Data.RefreshToken, nil
+	return upstream.TraeExchangeToken(refreshToken)
 }
 
 // traeGetUserInfo POST GetUserInfo：取 user_id / name（失败不致命，调用方回落）。

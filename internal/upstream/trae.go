@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -121,7 +122,11 @@ func LoadTraeAccounts(dataDir string) ([]TraeAccount, error) {
 // **读-改-写**：保留文件里其它账号与其它字段（device_id / added_at / 助手写的 refresh_token
 // 等），绝不整体重写覆盖——这个文件是面板与 Trae 助手**共用**的，覆盖会打掉助手的登录态。
 // 原子落盘（tmp + rename），避免半截文件让两侧都读崩。
+var traeAccountsWriteMu sync.Mutex
+
 func SaveTraeAccount(dataDir string, acct TraeAccount) (added bool, err error) {
+	traeAccountsWriteMu.Lock()
+	defer traeAccountsWriteMu.Unlock()
 	if strings.TrimSpace(acct.UserID) == "" {
 		return false, fmt.Errorf("缺少 UserID，拒绝写入")
 	}
@@ -133,44 +138,81 @@ func SaveTraeAccount(dataDir string, acct TraeAccount) (added bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 		return false, err
 	}
-	var f TraeAccountsFile
+	// Preserve fields owned by other tools and refuse to overwrite a corrupt file.
+	f := map[string]json.RawMessage{}
 	if raw, rerr := os.ReadFile(fp); rerr == nil {
-		_ = json.Unmarshal(raw, &f) // 解析失败按空文件处理：下面会整体重写为合法 JSON
+		if err := json.Unmarshal(raw, &f); err != nil || f == nil {
+			return false, fmt.Errorf("账号文件格式错误，拒绝覆盖")
+		}
+	} else if !os.IsNotExist(rerr) {
+		return false, rerr
 	}
+	var accounts []map[string]json.RawMessage
+	if raw, ok := f["accounts"]; ok {
+		if err := json.Unmarshal(raw, &accounts); err != nil {
+			return false, fmt.Errorf("账号列表格式错误，拒绝覆盖")
+		}
+	}
+	set := func(a map[string]json.RawMessage, key, value string) { a[key], _ = json.Marshal(value) }
 	now := time.Now().Format("2006-01-02T15:04:05")
-	for i := range f.Accounts {
-		if f.Accounts[i].UserID != acct.UserID {
+	for _, existing := range accounts {
+		if existing == nil {
+			return false, fmt.Errorf("账号条目格式错误，拒绝覆盖")
+		}
+	}
+	for _, existing := range accounts {
+		var userID string
+		_ = json.Unmarshal(existing["UserID"], &userID)
+		if userID != acct.UserID {
 			continue
 		}
 		// 已存在：只更新凭证，保留既有 name / added_at（避免每次登录都改展示名与加入时间）
-		f.Accounts[i].JWT = acct.JWT
+		set(existing, "jwt", acct.JWT)
 		if acct.RefreshToken != "" {
-			f.Accounts[i].RefreshToken = acct.RefreshToken
+			set(existing, "refresh_token", acct.RefreshToken)
 		}
 		if acct.Name != "" {
-			f.Accounts[i].Name = acct.Name
+			set(existing, "name", acct.Name)
 		}
-		f.Accounts[i].UpdatedAt = now
+		set(existing, "updated_at", now)
+		f["accounts"], _ = json.Marshal(accounts)
 		return false, writeTraeAccounts(fp, f)
 	}
 	if acct.AddedAt == "" {
 		acct.AddedAt = now
 	}
 	acct.UpdatedAt = now
-	f.Accounts = append(f.Accounts, acct)
+	rawAccount, err := json.Marshal(acct)
+	if err != nil {
+		return false, err
+	}
+	var newAccount map[string]json.RawMessage
+	if err := json.Unmarshal(rawAccount, &newAccount); err != nil {
+		return false, err
+	}
+	accounts = append(accounts, newAccount)
+	f["accounts"], _ = json.Marshal(accounts)
 	return true, writeTraeAccounts(fp, f)
 }
 
-func writeTraeAccounts(fp string, f TraeAccountsFile) error {
+func writeTraeAccounts(fp string, f map[string]json.RawMessage) error {
 	raw, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := fp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(fp), ".trae-accounts-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, fp)
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), fp)
 }
 
 // traeDataDir 解析 Trae 数据目录：显式配置优先，否则用 %APPDATA%\TraeWorkAssistant。
@@ -764,19 +806,23 @@ func traeTruncate(s string, n int) string {
 //
 //	POST https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken
 //	{"ClientID":"en1oxy7wnw8j9n","RefreshToken":"<rt>","ClientSecret":"-","UserID":""}
-//	→ {"code":0,"data":{"access_token":"...","refresh_token":"..."}}
+//	→ 当前官网使用 ResponseMetadata / Result；同时兼容旧版 code / data。
 //
 // refresh_token 可能轮换（响应里给新值就替换），所以调用方务必把返回值写回账号。
 
 const (
-	traeOAuthExchangeURL = "https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken"
-	traeOAuthClientID    = "en1oxy7wnw8j9n"
+	traeOAuthExchangeURL  = "https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken"
+	traeOAuthClientID     = "en1oxy7wnw8j9n"
 	traeOAuthClientSecret = "-"
 )
 
 // TraeExchangeToken 用 refresh_token 换新的 access token（JWT）。
 // 返回的 newRefresh 非空时表示服务端轮换了 refresh_token，调用方需落盘。
 func TraeExchangeToken(refreshToken string) (accessToken, newRefresh string, err error) {
+	return traeExchangeTokenWithClient(refreshToken, traeClient)
+}
+
+func traeExchangeTokenWithClient(refreshToken string, client *http.Client) (accessToken, newRefresh string, err error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
 		return "", "", fmt.Errorf("该账号没有 refresh_token，无法自动续期（需用浏览器重新登录一次以获取）")
@@ -793,39 +839,16 @@ func TraeExchangeToken(refreshToken string) (accessToken, newRefresh string, err
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("accept", "*/*")
-	resp, err := traeClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("ExchangeToken 请求失败: %w", err)
+		return "", "", traeExchangeNetworkError(err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-
-	var out struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Data    struct {
-			AccessToken  string `json:"access_token"`
-			Token        string `json:"token"`
-			RefreshToken string `json:"refresh_token"`
-		} `json:"data"`
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return "", "", &TraeExchangeError{Reason: "读取响应失败"}
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", "", fmt.Errorf("ExchangeToken 响应解析失败: %w（body=%s）", err, traeTruncate(string(raw), 200))
-	}
-	if out.Code != 0 {
-		return "", "", fmt.Errorf("ExchangeToken 失败 (code=%d): %s", out.Code, out.Message)
-	}
-	at := out.Data.AccessToken
-	if at == "" {
-		at = out.Data.Token
-	}
-	if at == "" {
-		return "", "", fmt.Errorf("ExchangeToken 响应缺少 access_token（body=%s）", traeTruncate(string(raw), 200))
-	}
-	if !strings.HasPrefix(at, "Cloud-IDE-JWT ") {
-		at = "Cloud-IDE-JWT " + at
-	}
-	return at, out.Data.RefreshToken, nil
+	return decodeTraeExchangeResponse(resp.StatusCode, raw)
 }
 
 // TraeNeedsRefresh 判断账号 JWT 是否「该续期了」：无法解析 exp、或剩余不足 margin。
