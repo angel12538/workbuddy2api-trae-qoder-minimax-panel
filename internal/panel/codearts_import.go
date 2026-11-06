@@ -12,7 +12,9 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 
@@ -34,7 +36,11 @@ func (p *Panel) codeartsImportCookie(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
 		return
 	}
-	cookies := parseCookieHeader(req.Cookie)
+	cookies, parseErr := parseCodeartsCookieInput(req.Cookie)
+	if parseErr != nil {
+		writeErr(w, http.StatusBadRequest, parseErr.Error())
+		return
+	}
 	if len(cookies) == 0 {
 		writeErr(w, http.StatusBadRequest, "没解析出 Cookie：请粘贴**整行** Cookie 请求头"+
 			"（形如 name=value; name2=value2）。注意要用 F12 → Network → 任一 /chat/ 请求的"+
@@ -62,11 +68,7 @@ func (p *Panel) codeartsImportCookie(w http.ResponseWriter, r *http.Request) {
 
 	ok, kerr := codearts.Keepalive(up)
 	if !ok {
-		msg := "这份 Cookie 打不通华为云接口"
-		if kerr != nil {
-			msg += "：" + kerr.Error()
-		}
-		msg += "。多半是页面登录后又过期了，或复制的不是 /chat/ 请求那一行（缺关键票据）。没有写入号池。"
+		msg := codeartsImportFailure(kerr)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": msg})
 		return
 	}
@@ -110,39 +112,95 @@ func (p *Panel) codeartsImportCookie(w http.ResponseWriter, r *http.Request) {
 // 统一挂在 .huaweicloud.com 域上即可：HTTP 直连路径本来就是一整行 Cookie 发出去，
 // 不看 per-domain 归属（api.go 的 doAPI 就是这么拼的）。
 func parseCookieHeader(raw string) []codearts.Cookie {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
+	cookies, _ := parseCodeartsCookieInput(raw)
+	return cookies
+}
+
+var errCodeartsCookieFormat = errors.New("Cookie 格式不正确：请在网络面板中复制 Cookie 请求头的完整值。可按行粘贴完整的 name=value 项；不要在票据中间插入换行、制表符或其他控制字符。未发起验证请求，也未写入号池。")
+
+// Normalize boundaries between complete cookie pairs, never bytes inside a token.
+// A copied request-header block is restricted to its Cookie field.
+func parseCodeartsCookieInput(raw string) ([]codearts.Cookie, error) {
+	for _, ch := range raw {
+		if ch == 0x7f || (ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t') {
+			return nil, errCodeartsCookieFormat
+		}
 	}
-	// 容错：用户可能连 "Cookie: " 前缀一起复制了。
-	if i := strings.Index(strings.ToLower(raw), "cookie:"); i >= 0 && i <= 12 {
-		raw = raw[i+len("cookie:"):]
+	raw = strings.TrimSpace(strings.TrimPrefix(raw, "\ufeff"))
+	if raw == "" {
+		return nil, nil
+	}
+	lines := strings.Split(strings.ReplaceAll(strings.ReplaceAll(raw, "\r\n", "\n"), "\r", "\n"), "\n")
+	start := 0
+	explicit := false
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.EqualFold(line, "cookie") || strings.HasPrefix(strings.ToLower(line), "cookie:") {
+			start, explicit = i, true
+			break
+		}
 	}
 	var out []codearts.Cookie
-	for _, piece := range strings.Split(raw, ";") {
-		piece = strings.TrimSpace(piece)
-		if piece == "" {
+	for _, line := range lines[start:] {
+		line = strings.TrimSpace(line)
+		if strings.EqualFold(line, "cookie") {
 			continue
 		}
-		k, v, found := strings.Cut(piece, "=")
-		if !found {
-			continue
+		if strings.HasPrefix(strings.ToLower(line), "cookie:") {
+			line = strings.TrimSpace(line[len("cookie:"):])
+		} else if colon := strings.IndexByte(line, ':'); explicit && colon >= 0 {
+			equal := strings.IndexByte(line, '=')
+			if equal < 0 || colon < equal {
+				break // next request header, not part of the Cookie value
+			}
 		}
-		k = strings.TrimSpace(k)
-		v = strings.TrimSpace(v)
-		if k == "" || v == "" {
-			continue
+		for _, piece := range strings.Split(line, ";") {
+			piece = strings.TrimSpace(piece)
+			if piece == "" {
+				continue
+			}
+			k, v, found := strings.Cut(piece, "=")
+			if !found {
+				return nil, errCodeartsCookieFormat
+			}
+			k = strings.TrimSpace(k)
+			v = strings.TrimSpace(v)
+			if k == "" || v == "" {
+				continue
+			}
+			checkValue := v
+			if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+				checkValue = v[1 : len(v)-1]
+			}
+			if err := (&http.Cookie{Name: k, Value: checkValue}).Valid(); err != nil {
+				return nil, errCodeartsCookieFormat
+			}
+			out = append(out, codearts.Cookie{
+				Name: k, Value: v,
+				// 统一挂 .huaweicloud.com：HTTP 直连路径本来就是一整行 Cookie 发出，
+				// 不看 per-domain 归属（api.go 的 doAPI 就是这么拼的）。
+				Domain: ".huaweicloud.com", Path: "/",
+				// 显式标记「这份数据没有过期信息」：Cookie 请求头只有 name=value，
+				// 拿不到 Expires/Max-Age。默认值恰好就是 false，但写出来是为了让后来者
+				// 一眼看到这是**已知事实**（未观测），不是"0 秒过期"，也不是"会话级"。
+				Expires: 0, ExpiresKnown: false, Session: false,
+			})
 		}
-		out = append(out, codearts.Cookie{
-			Name: k, Value: v,
-			// 统一挂 .huaweicloud.com：HTTP 直连路径本来就是一整行 Cookie 发出，
-			// 不看 per-domain 归属（api.go 的 doAPI 就是这么拼的）。
-			Domain: ".huaweicloud.com", Path: "/",
-			// 显式标记「这份数据没有过期信息」：Cookie 请求头只有 name=value，
-			// 拿不到 Expires/Max-Age。默认值恰好就是 false，但写出来是为了让后来者
-			// 一眼看到这是**已知事实**（未观测），不是"0 秒过期"，也不是"会话级"。
-			Expires: 0, ExpiresKnown: false, Session: false,
-		})
 	}
-	return out
+	return out, nil
+}
+
+func codeartsImportFailure(err error) string {
+	switch {
+	case errors.Is(err, codearts.ErrSessionExpired):
+		return "华为云会话已失效，或 Cookie 缺少关键登录票据。请重新登录后复制完整 Cookie。没有写入号池。"
+	case err != nil:
+		var networkErr net.Error
+		if errors.As(err, &networkErr) && networkErr.Timeout() {
+			return "连接华为云超时，请检查 NAS 网络后重试。不能据此判断 Cookie 已过期。没有写入号池。"
+		}
+		return "连接或验证华为云接口失败，请检查 NAS 网络或稍后重试。不能据此判断 Cookie 已过期。没有写入号池。"
+	default:
+		return "华为云接口暂未通过会话验证，请稍后重试。没有写入号池。"
+	}
 }
