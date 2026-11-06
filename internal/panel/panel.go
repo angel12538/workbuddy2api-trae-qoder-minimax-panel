@@ -24,8 +24,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/ideauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -94,6 +94,9 @@ type Panel struct {
 	// 错误语义，混在一起迟早串味。
 	mmLoginMu sync.Mutex
 	mmLogins  map[string]*minimax.DeviceSession
+
+	traeManualMu     sync.Mutex
+	traeManualLogins map[string]*traeManualSession
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -174,11 +177,11 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:      cfg,
+		mux:      http.NewServeMux(),
+		started:  time.Now(),
+		logs:     NewRing(500),
+		logins:   map[string]loginSession{},
 		mmLogins: map[string]*minimax.DeviceSession{},
 	}
 	p.routes()
@@ -229,6 +232,8 @@ func (p *Panel) routes() {
 	// Trae 账号添加：OAuth 授权码 + 本地回调（与上面 WorkBuddy 的 login/* 是两套体系）。
 	p.mux.HandleFunc("POST /panel/api/trae/login/start", p.withAuth(p.traeLoginStart))
 	p.mux.HandleFunc("GET /panel/api/trae/login/poll", p.withAuth(p.traeLoginPoll))
+	p.mux.HandleFunc("POST /panel/api/trae/login/manual/start", p.withAuth(p.traeManualStart))
+	p.mux.HandleFunc("POST /panel/api/trae/login/manual/import", p.withAuth(p.traeManualImport))
 	// Trae 账号添加（推荐路线）：面板自拉浏览器 + CDP 取凭证。
 	// 授权页路线在「认证中」会卡住、且复用浏览器登录态导致多账号不可用，故另开这条。
 	p.mux.HandleFunc("POST /panel/api/trae/browser/start", p.withAuth(p.traeBrowserStart))

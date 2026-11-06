@@ -1410,6 +1410,7 @@ async function pollLogin() {
 function closeAdd() {
   stopPoll(); stopTraePoll(); stopMmLoginPoll(); stopDbBrowserPoll(); stopQoderLoginPoll();
   loginState = null; traeLoginState = null; $('addVeil').classList.remove('on');
+  resetTraeManualPanel();
 }
 $('btnCloseAdd').onclick = closeAdd;
 
@@ -1419,6 +1420,7 @@ $('btnCloseAdd').onclick = closeAdd;
    走「自拉浏览器」而不是授权页 OAuth：授权页会在「认证中」卡住，且复用浏览器
    登录态 → 多账号没法加。自拉浏览器每次全新会话，可反复加号。 */
 function resetTraePanel() {
+  resetTraeManualPanel();
   $('addTraeLoad').hidden = true; $('addTraeReady').hidden = true;
   $('addTraeDone').hidden = true; $('addTraeErr').hidden = true;
   $('btnTraeStart').disabled = false; $('btnTraeStart').hidden = false;
@@ -1467,6 +1469,75 @@ async function pollTraeLogin() {
 }
 $('btnTraeStart').onclick = startTraeLogin;
 $('btnTraeStop').onclick = stopTraeBrowser;
+
+/* Container-friendly login: the user pastes the official loopback result. */
+function resetTraeManualPanel() {
+  traeLoginState = null;
+  $('traeManualReturn').value = '';
+  $('traeManualAuthLink').removeAttribute('href');
+  $('addTraeManualReady').hidden = true;
+  $('btnTraeManualStart').disabled = false;
+  $('btnTraeManualStart').textContent = '获取网页登录链接';
+  $('btnTraeManualImport').disabled = false;
+  $('btnTraeManualImport').textContent = '验证并导入账号';
+}
+async function startTraeManualLogin() {
+  resetTraeManualPanel();
+  $('btnTraeManualStart').disabled = true;
+  $('addTraeErr').hidden = true; $('addTraeDone').hidden = true;
+  // The marker prevents a response from reopening a dialog closed meanwhile.
+  const marker = {};
+  traeLoginState = marker;
+  try {
+    const r = await api('trae/login/manual/start', { method: 'POST' });
+    if (traeLoginState !== marker) return;
+    traeLoginState = r.state;
+    $('traeManualAuthLink').href = r.url;
+    $('addTraeManualReady').hidden = false;
+    $('btnTraeManualStart').textContent = '重新获取登录链接';
+    $('btnTraeManualStart').disabled = false;
+  } catch (e) {
+    if (traeLoginState !== marker) return;
+    traeLoginState = null;
+    $('btnTraeManualStart').disabled = false;
+    $('addTraeErr').hidden = false;
+    $('addTraeErr').textContent = e.message;
+  }
+}
+async function importTraeManualLogin() {
+  const state = traeLoginState;
+  const callback = $('traeManualReturn').value.trim();
+  $('addTraeErr').hidden = true; $('addTraeDone').hidden = true;
+  if (typeof state !== 'string' || !callback) {
+    $('addTraeErr').hidden = false;
+    $('addTraeErr').textContent = '请先获取登录链接，完成登录后粘贴完整返回地址';
+    return;
+  }
+  $('btnTraeManualStart').disabled = true;
+  $('btnTraeManualImport').disabled = true;
+  $('btnTraeManualImport').textContent = '正在验证并保存…';
+  try {
+    const r = await api('trae/login/manual/import', { method: 'POST',
+      body: JSON.stringify({ state, callback_url: callback }) });
+    if (traeLoginState !== state) return;
+    resetTraeManualPanel();
+    $('addTraeDone').hidden = false;
+    $('addTraeDone').textContent = r.message || '账号已导入，支持自动续期';
+    loadTraeStatus(true);
+  } catch (e) {
+    if (traeLoginState !== state) return;
+    $('addTraeErr').hidden = false;
+    $('addTraeErr').textContent = e.message;
+  } finally {
+    if (traeLoginState === state) {
+      $('btnTraeManualStart').disabled = false;
+      $('btnTraeManualImport').disabled = false;
+      $('btnTraeManualImport').textContent = '验证并导入账号';
+    }
+  }
+}
+$('btnTraeManualStart').onclick = startTraeManualLogin;
+$('btnTraeManualImport').onclick = importTraeManualLogin;
 
 /* ── Qoder 添加（浏览器登录 / 捕获本机当前登录态）────────────────────
    Qoder 的可用登录态只在桌面客户端里（网页版拿不到 IDE 能用的令牌），所以
