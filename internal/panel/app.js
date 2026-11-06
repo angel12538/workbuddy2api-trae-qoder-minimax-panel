@@ -1408,6 +1408,7 @@ async function pollLogin() {
   }
 }
 function closeAdd() {
+  clearCaImportInputs();
   stopPoll(); stopTraePoll(); stopMmLoginPoll(); stopDbBrowserPoll(); stopQoderLoginPoll();
   loginState = null; traeLoginState = null; $('addVeil').classList.remove('on');
 }
@@ -5666,11 +5667,8 @@ async function doMainPoolCheckinAll() {
 
 
 /* ── CodeArts 签到（华为云码道）───────────────────────────────────────
-   凭据是**浏览器 profile**（持久会话）：华为云的网页登录态活不过一小时
-   （SSOTGC / SessionID 是短时票据），把 Cookie 快照存下来第二天注入一律
-   判定未登录（2026-10-27 实测）。所以「添加账号」= 面板用一个全新 profile
-   拉起浏览器，你登录一次；面板把这份 profile 归档到该账号名下，之后每天
-   用它拉一次无头浏览器自动点「活动福利 → 每日领取」。 */
+   群晖 / Docker 用网页登录后粘贴 Cookie；桌面部署保留服务器浏览器入口。
+   会话失效后需要重新登录，不能把浏览器 profile 或 Cookie 当成永久续期凭据。 */
 let caPollTimer = null;
 
 /* ── CodeArts 票据寿命展示（C-UI-REPAIR@1 / C-CA-API@1）────────────────
@@ -5904,7 +5902,7 @@ async function loadCkCodeArts(quiet) {
     }
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = '还没有账号。点右上角「添加账号」，在「华为 CodeArts」页签里登录华为云即可。';
+      st.textContent = '还没有账号。点右上角「添加账号」→「华为 CodeArts」，按页面步骤复制 Cookie 值并导入。';
       list.innerHTML = ''; return;
     }
     list.innerHTML = arr.map(a => caRowHtml(a, slotById[String(a.id || '')])).join('');
@@ -5926,6 +5924,75 @@ async function loadCkCodeArts(quiet) {
     list.querySelectorAll('button[data-ca-relogin]').forEach(b => { b.onclick = () => doCaRelogin(b.dataset.caRelogin); });
     list.querySelectorAll('[data-ca-forget]').forEach(el => { el.onclick = () => doCaSlotForget(el.dataset.caForget); });
   } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+}
+
+// Cookie 只留在输入框及当前请求内；不写入 localStorage 或控制台。
+function clearCaImportInputs() {
+  if ($('caCookieInput')) $('caCookieInput').value = '';
+  if ($('caCookieLabel')) $('caCookieLabel').value = '';
+}
+
+async function doCaCopyFilter() {
+  try {
+    await copyText('package/overview');
+    toast('已复制筛选词，请粘贴到浏览器网络面板的筛选框，再刷新网页。', 'ok');
+  } catch (_) {
+    toast('复制未成功，请手动输入筛选词：package/overview', 'err');
+  }
+}
+
+function caCookieInputProblem(text) {
+  if (!text) return '请先粘贴 Cookie 这一项的完整值，例如 name=value; name2=value2。';
+  if (/^\s*(?:Host|:authority):\s*furiondata\.myhuaweicloud\.com\b/im.test(text) ||
+      /^\s*(?:GET|POST)\s+\/furiondataserver\/fr(?:[?\s])/im.test(text)) {
+    return '你选中的是 furiondata 请求。请筛选 package/overview，选择 devcloud.cn-north-4.huaweicloud.com 的请求，再只复制 Cookie 的值。';
+  }
+  const fullHeaders = /^\s*(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\s+HTTP\/[\d.]+/im.test(text) ||
+    /^\s*(?:Host|Accept|User-Agent|Origin|Referer|Content-Type|:method|:authority|:path)\s*:/im.test(text);
+  if (fullHeaders) {
+    return /^\s*Cookie\s*:/im.test(text)
+      ? '当前粘贴的是整段请求标头。请找到 Cookie 这一行，右键「复制值 / Copy value」，只粘贴它的值。'
+      : '这段请求标头里没有 Cookie。请按上方第 2 步选择码道请求，再找到 Cookie 这一行并复制值。';
+  }
+  if (!text.includes('=')) return '没有找到 name=value 形式的 Cookie 值。请在 Cookie 这一行右键「复制值 / Copy value」。';
+  return '';
+}
+
+async function doCaImportCookie() {
+  const btn = $('btnCaImportCookie'), input = $('caCookieInput');
+  if (!btn || !input || btn.disabled) return;
+  const done = $('addCaDone'), err = $('addCaErr');
+  done.hidden = true; err.hidden = true;
+  const original = input.value, cookie = original.trim();
+  const inputProblem = caCookieInputProblem(cookie);
+  if (inputProblem) {
+    err.hidden = false; err.textContent = inputProblem;
+    input.focus(); return;
+  }
+  const labelInput = $('caCookieLabel'), originalLabel = labelInput.value;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '正在验证并导入…';
+  try {
+    const r = await api('ide/codearts/import_cookie', {
+      method: 'POST', body: JSON.stringify({ cookie, label: originalLabel.trim() }),
+    });
+    if (!r || r.ok !== true) throw new Error((r && r.message) || '会话验证未通过，未导入账号。');
+    if (input.value === original) input.value = '';
+    if (labelInput.value === originalLabel) labelInput.value = '';
+    done.hidden = false;
+    done.textContent = r.message || '账号已验证并导入。会话失效后请重新登录导入。';
+    toast('CodeArts 账号已导入', 'ok');
+    // 刷新失败不应把已成功的写入显示成“导入失败”。
+    try { await loadCkCodeArts(true); }
+    catch (_) { done.textContent += ' 账号列表刷新失败，请手动刷新面板。'; }
+  } catch (e) {
+    err.hidden = false;
+    err.textContent = e.message === 'HTTP 404'
+      ? '当前服务尚未包含 Cookie 导入接口，请更新服务后重试。'
+      : e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
 }
 
 // doCaAdd 拉浏览器 → 轮询登录态（用户登录成功后自动入库）。
@@ -5976,22 +6043,15 @@ async function doCaAdd() {
   }
 }
 
-// doCaRelogin 单账号重新登录：带 id 打开登录窗口，复用该号**自己的身份槽**
-// （同一台设备重登，不凭空多出一台"新设备"）。只在「需重新登录」时出现。
-async function doCaRelogin(id) {
+// 重新登录也走粘贴入口；后端按验证后的华为云身份更新原账号。
+function doCaRelogin(id) {
   if (!id) return;
-  try {
-    const d = await api('ide/codearts/browser/start', { method: 'POST', body: JSON.stringify({ id }) });
-    toast(d.message || '已打开登录窗口，请登录华为云');
-    const box = $('addCaState'), err = $('addCaErr');
-    if (err) err.hidden = true;
-    if (box) {
-      box.hidden = false; box.className = 'state';
-      box.innerHTML = '<span class="dots">请在弹出的窗口里重新登录该账号，登录成功后会自动保存…</span>';
-    }
-    if ($('btnCaStop')) $('btnCaStop').hidden = false;
-    watchCaLogin();
-  } catch (e) { toast('打开登录窗口失败：' + e.message, 'err'); }
+  openAdd();
+  switchAddTab('codearts');
+  const box = $('addCaState');
+  box.hidden = false;
+  box.textContent = '请在华为码道网页中登录要更新的同一个账号，再粘贴新的完整 Cookie。';
+  $('caCookieInput').focus();
 }
 
 // doCaSlotForget 重置身份（换设备）：改 SlotID/DeviceGUID，旧槽目录自动备份。
@@ -6018,6 +6078,7 @@ async function doCaStop() {
 
 // resetCodeArtsAddPanel 重置弹窗里的 CodeArts 页签。
 function resetCodeArtsAddPanel() {
+  clearCaImportInputs();
   if (caPollTimer) { clearInterval(caPollTimer); caPollTimer = null; }
   const s = $('addCaState'), d = $('addCaDone'), e = $('addCaErr'), b = $('btnCaStop');
   if (s) s.hidden = true;
@@ -6058,6 +6119,8 @@ async function doCaRemove(id) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+if ($('btnCaCopyFilter')) $('btnCaCopyFilter').onclick = doCaCopyFilter;
+if ($('btnCaImportCookie')) $('btnCaImportCookie').onclick = doCaImportCookie;
 if ($('btnCaAdd')) $('btnCaAdd').onclick = doCaAdd;
 if ($('btnCaStop')) $('btnCaStop').onclick = doCaStop;
 if ($('btnCaCheckinAll')) $('btnCaCheckinAll').onclick = () => doCaCheckin($('btnCaCheckinAll'));

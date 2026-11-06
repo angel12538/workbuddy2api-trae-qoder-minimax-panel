@@ -391,7 +391,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 打开 `http://127.0.0.1:7863/panel/`，点右上角「**添加账号**」：面板展示授权链接 → 浏览器完成登录 → 自动检测并落盘凭证 → **热加载进池（无需重启）**，顺带完成首次签到。
 
-弹窗按平台分了六个页签，**所有平台的加号入口都收在这里**（各视图分段里不再有零散的"添加"按钮）：
+弹窗按平台分了七个页签，**所有平台的加号入口都收在这里**（各视图分段里不再有零散的"添加"按钮）：
 
 | 页签 | 加号方式 | 说明 |
 |---|---|---|
@@ -400,6 +400,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 | Qoder | **网页登录**（每号独立浏览器会话）/ 客户端浏览器登录 / 捕获本机客户端登录态 | 见下方说明 |
 | MiniMax | **浏览器登录**（设备码）/ 捕获客户端 / 粘贴 Token | 三条通道并列，互不冲突 |
 | 豆包 | **浏览器登录** / **客户端登录并添加** / 粘贴 Cookie | 拿到的都是同一批网页 Cookie |
+| 华为 CodeArts | 网页登录后粘贴 Cookie / 服务器本机浏览器登录 | 群晖 / Docker 无需安装浏览器；先验证再保存 |
 | 导入 JSON | 上传 `auths/` 里的凭证文件 | 批量迁移用 |
 
 > **Qoder 网页登录**：网页控制台（`qoder.com/account/usage`）**同样能领每日 100 Credits** ——
@@ -412,6 +413,10 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 > 完成鉴权，面板自动收录这个号。勾选「先退出当前账号再登录」可以换一个号登录 ——
 > 服务端在**登录时**给账号发"这个人"的身份（scope）。⚠️ 2026-11-04 更正：scope
 > **不是**额度分组键 —— 两个号 scope 不同，却照样各领各的 100 积分（见下方 FAQ）。
+>
+> CodeArts（群晖 / Docker）：进入「添加账号 → 华为 CodeArts」，打开码道网页并登录 → F12「网络」筛选 `package/overview` 后刷新 → 选择 `devcloud.cn-north-4.huaweicloud.com/chat/snap-manager/v1/package/overview` 请求 → 在「请求标头」中右键 **Cookie → 复制值**，粘贴回面板验证并导入。可直接运行 `node scripts/test_codearts_import.cjs` 检查前端导入流程。
+>
+> 复制的是 Cookie 这一项的完整值（`name=value; name2=value2`），不是以 GET / POST 开头的整段请求头。`furiondata.myhuaweicloud.com` 的上报请求不适用于登录导入。支持按行粘贴完整 Cookie 项；单个票据内部断行、控制字符等格式问题会在联网前拒绝。会话失效后需重新登录导入，不能保证永久自动续期，也不能从请求头推断票据过期时间。服务器有桌面和 Chrome / Edge 时仍可使用备用浏览器入口。
 >
 > **豆包浏览器登录**：面板自拉一个干净浏览器窗口打开豆包网页版，你登录一次，
 > 面板用**浏览器级** CDP（`Storage.getAllCookies`，能覆盖登录弹窗所在的其它域）抓取
