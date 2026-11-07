@@ -1298,10 +1298,7 @@ func qoderSHA256(s string) []byte {
 // 显式配置 derived 时才使用派生设备。读取配置失败一律回落到真实设备 ——
 // 签到是无人值守路径，不能因为一个坏掉的配置文件全部失败。
 func qoderDeviceForAccount(auth *QoderAuth) *QoderDevice {
-	email := ""
-	if auth != nil {
-		email = auth.User.Email
-	}
+	email := QoderIdentityKey(auth)
 	if dev, err := QoderDeviceForEmail(email); err == nil && dev != nil {
 		return dev
 	}

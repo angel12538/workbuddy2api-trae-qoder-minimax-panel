@@ -431,12 +431,34 @@ let expFetching = false;                       // 到期卡片在途标记（防
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
 const TITLES = { checkin: '签到池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', ideaccounts: 'IDE 账号池', models: '模型与档位', config: '配置', logs: '运行日志' };
+const PAGE_DETAILS = {
+  checkin: ['DAILY WORKSPACE', '查看各平台账号状态，集中完成每日签到与凭证维护。', '跨平台账号管理', 'YOUR DAILY ROUTINE'],
+  usage: ['USAGE & INSIGHTS', '查看请求、Token 与积分消耗，了解账号和模型的使用情况。', '用量与调用趋势', 'UNDERSTAND YOUR USAGE'],
+  packages: ['CREDITS & BALANCE', '查看各平台积分余额、来源与到期分布，安排后续使用。', '积分与到期管理', 'MAKE EVERY CREDIT COUNT'],
+  taskscenter: ['TASK CENTER', '扫描账号待办，集中执行成长任务并查看完成进度。', '任务集中处理', 'PLAN · RUN · TRACK'],
+  ideaccounts: ['ACCOUNT WORKSPACE', '管理已添加的 IDE 账号，查看登录状态并切换当前账号。', '多平台账号维护', 'CONNECTED ACCOUNTS'],
+  models: ['MODEL DIRECTORY', '浏览可用模型与档位，检查账号额度和请求队列。', '模型与可用额度', 'FIND THE RIGHT MODEL'],
+  config: ['WORKSPACE SETTINGS', '按需调整服务、调度和平台设置，修改后保存配置。', '服务配置管理', 'YOUR WORKSPACE SETTINGS'],
+  logs: ['ACTIVITY & LOGS', '查看请求记录和运行日志，追踪调用情况与任务结果。', '请求与运行记录', 'KEEP THINGS IN VIEW'],
+};
+function updatePageIntro(v) {
+  const info = PAGE_DETAILS[v] || PAGE_DETAILS.checkin;
+  for (const [id, text] of [['pageTitle', TITLES[v]], ['pageEyebrow', info[0]],
+    ['pageDescription', info[1]], ['pageContextLabel', info[2]], ['pageContextDetail', info[3]]]) {
+    if ($(id)) $(id).textContent = text;
+  }
+  document.querySelectorAll('.nav a').forEach(a => {
+    if (a.dataset.view === v) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  });
+}
 function go(v) {
   if (!(v in TITLES)) v = 'checkin';
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
+  updatePageIntro(v);
   if (v === 'models') { if (!$('mdBody').children.length) loadModels(); loadModelQueue(); }
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
@@ -1360,7 +1382,29 @@ $('cfgForm').onsubmit = async ev => {
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
+let addPreviousFocus = null;
+let addPreviousOverflow = null;
+function updateAddIntro(tab) {
+  const copy = {
+    wb: ['WB', 'WorkBuddy', '在官方网页完成授权，账号会自动添加。', '网页授权', '获取链接后，在官方网页完成授权。'],
+    trae: ['TR', 'Trae', '网页登录后粘贴授权返回地址，完成验证后导入。', '返回地址导入', '完成官方登录后，复制完整返回地址到此面板。'],
+    qoder: ['Q', 'Qoder', '选择账号地区，在官方网页确认授权即可。', '网页授权', '授权后返回此面板，等待账号添加结果。'],
+    minimax: ['M', 'MiniMax', '获取验证码，在官方授权页登录并确认。', '验证码授权', '验证码有效期为 5 分钟，过期后可重新获取。'],
+    doubao: ['豆', '豆包', '登录网页后，复制 Cookie 或请求标头即可导入。', 'Cookie 导入', '支持整段请求标头，无需手动删除其他字段。'],
+    codearts: ['CA', '华为 CodeArts', '选择码道账号请求，复制 Cookie 的值并验证。', 'Cookie 验证', '此平台请复制 Cookie 的值，按下方步骤验证导入。'],
+    import: ['{ }', 'JSON 文件', '批量导入 cockpit tools 导出的账号文件。', '文件导入', '选择文件后开始导入，结果会显示在当前页面。'],
+  };
+  const c = copy[tab] || copy.wb;
+  if ($('addPlatformMark')) { $('addPlatformMark').textContent = c[0]; $('addPlatformMark').dataset.platform = tab; }
+  if ($('addPlatformTitle')) $('addPlatformTitle').textContent = c[1];
+  if ($('addPlatformSubtitle')) $('addPlatformSubtitle').textContent = c[2];
+  if ($('addMethodBadge')) $('addMethodBadge').textContent = c[3];
+  if ($('addFooterNote')) $('addFooterNote').textContent = c[4];
+}
 function openAdd() {
+  addPreviousFocus = document.activeElement;
+  if (addPreviousOverflow === null) addPreviousOverflow = document.body.style.overflow;
+  document.body.style.overflow = 'hidden';
   $('addVeil').classList.add('on');
   // 重置到 WorkBuddy 标签
   switchAddTab('wb');
@@ -1376,9 +1420,18 @@ function openAdd() {
   resetDoubaoAddPanel();
   resetCodeArtsAddPanel();
   stopPoll(); stopTraePoll();
+  document.querySelector('#addTabs .tab.on')?.focus();
 }
 function switchAddTab(tab) {
-  document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  const previousTab = document.querySelector('#addTabs .tab.on')?.dataset.tab;
+  document.querySelectorAll('#addTabs .tab').forEach(b => {
+    const selected = b.dataset.tab === tab;
+    b.classList.toggle('on', selected);
+    b.setAttribute('aria-selected', String(selected));
+    b.tabIndex = selected ? 0 : -1;
+  });
+  updateAddIntro(tab);
+  if (previousTab !== tab) document.querySelector('#addVeil .import-content')?.scrollTo(0, 0);
   $('addTabWb').hidden = tab !== 'wb';
   $('addTabTrae').hidden = tab !== 'trae';
   $('addTabQoder').hidden = tab !== 'qoder';
@@ -1393,6 +1446,7 @@ function switchAddTab(tab) {
   $('btnOpenUrl').hidden = !wb || $('addReady').hidden;
   if (tab === 'trae') stopPoll(); else stopTraePoll();
   if (tab !== 'minimax') stopMmLoginPoll();
+  if (tab !== 'qoder') { stopQoderDevicePoll(); stopQoderWebPoll(); stopQoderLoginPoll(); }
   if (tab === 'qoder') loadQoderAddTab();
   if (tab === 'minimax') loadMinimaxAddTab();
   if (tab === 'doubao') resetDoubaoAddPanel();
@@ -1440,11 +1494,50 @@ async function pollLogin() {
 }
 function closeAdd() {
   clearCaImportInputs();
-  stopPoll(); stopTraePoll(); stopMmLoginPoll(); stopDbBrowserPoll(); stopQoderLoginPoll();
+  stopPoll(); stopTraePoll(); stopMmLoginPoll(); stopDbBrowserPoll(); stopQoderLoginPoll(); stopQoderWebPoll(); stopQoderDevicePoll();
   loginState = null; traeLoginState = null; $('addVeil').classList.remove('on');
   resetTraeManualPanel();
+  if (addPreviousOverflow !== null) document.body.style.overflow = addPreviousOverflow;
+  addPreviousOverflow = null;
+  if (addPreviousFocus?.isConnected && typeof addPreviousFocus.focus === 'function') addPreviousFocus.focus();
+  addPreviousFocus = null;
 }
 $('btnCloseAdd').onclick = closeAdd;
+if ($('btnCloseAddFooter')) $('btnCloseAddFooter').onclick = closeAdd;
+const addTabLayout = window.matchMedia('(max-width: 740px)');
+function updateAddTabOrientation() {
+  $('addTabs').setAttribute('aria-orientation', addTabLayout.matches ? 'horizontal' : 'vertical');
+  if ($('addVeil').classList.contains('on')) {
+    document.querySelector('#addTabs .tab.on')?.scrollIntoView({block: 'nearest', inline: 'nearest'});
+  }
+}
+addTabLayout.addEventListener('change', updateAddTabOrientation);
+updateAddTabOrientation();
+if ($('btnDbCopyFilter')) $('btnDbCopyFilter').onclick = async () => {
+  try { await copyText('domain:www.doubao.com'); toast('筛选词已复制', 'ok'); }
+  catch (e) { toast('复制失败，请手动复制筛选词', 'err'); }
+};
+$('addTabs').addEventListener('keydown', e => {
+  if (!['ArrowDown', 'ArrowUp', 'ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(e.key)) return;
+  const tabs = Array.from(document.querySelectorAll('#addTabs .tab'));
+  const current = tabs.indexOf(e.target.closest('button[data-tab]'));
+  if (current < 0) return;
+  e.preventDefault();
+  const direction = ['ArrowDown', 'ArrowRight'].includes(e.key) ? 1 : -1;
+  const next = e.key === 'Home' ? 0 : (e.key === 'End' ? tabs.length - 1 : (current + direction + tabs.length) % tabs.length);
+  switchAddTab(tabs[next].dataset.tab);
+  tabs[next].focus();
+  tabs[next].scrollIntoView({block: 'nearest', inline: 'nearest'});
+});
+$('addVeil').addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.preventDefault(); closeAdd(); return; }
+  if (e.key !== 'Tab') return;
+  const items = Array.from($('addVeil').querySelectorAll('button, a[href], input, select, textarea, summary, [tabindex]'))
+    .filter(el => !el.disabled && el.tabIndex >= 0 && el.getClientRects().length > 0);
+  const first = items[0], last = items[items.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+});
 
 /* ── Trae 账号添加（面板自拉浏览器 + CDP 取凭证）────────────────────────
    与上面 WorkBuddy 的设备码流程是两套独立体系：账号落在 Trae 助手的
@@ -1588,6 +1681,8 @@ function resetQoderPanel() {
   const le = $('addQoderLoginErr');
   if (le) { le.hidden = true; le.textContent = ''; }
   stopQoderLoginPoll();
+  stopQoderDevicePoll();
+  applyLoginCapabilities();
 }
 let qoderLoginTimer = null;
 function stopQoderLoginPoll() { if (qoderLoginTimer) { clearTimeout(qoderLoginTimer); qoderLoginTimer = null; } }
@@ -1632,7 +1727,7 @@ async function doQoderWebLogin(email) {
     qoderWebTimer = setTimeout(tick, 2500);
   } catch (e) {
     $('addQoderWebErr').hidden = false; $('addQoderWebErr').textContent = e.message;
-    $('addQoderWebBox').hidden = true;
+    $('addQoderWebBox').hidden = false;
   } finally { b.disabled = false; b.textContent = '网页登录并添加'; }
 }
 if ($('btnQoderWeb')) $('btnQoderWeb').onclick = () => {
@@ -1682,22 +1777,13 @@ async function doQoderLogin() {
     qoderLoginTimer = setTimeout(tick, 2500);
   } catch (e) {
     $('addQoderLoginErr').hidden = false; $('addQoderLoginErr').textContent = e.message;
-    $('addQoderLoginBox').hidden = true;
+    $('addQoderLoginBox').hidden = false;
   } finally { b.disabled = false; b.textContent = '浏览器登录并添加'; }
 }
 async function loadQoderAddTab() {
   resetQoderPanel();
   const cur = $('addQoderCur');
-  if (!cur) return;
-  cur.className = 'state';
-  cur.innerHTML = '<span class="dots">读取中</span>';
-  try {
-    const d = await api('ide/qoder/accounts');
-    cur.className = 'state';
-    cur.textContent = d.current_email
-      ? '本机当前登录：' + (d.current_name || '') + ' <' + d.current_email + '>'
-      : '本机 Qoder 未登录 —— 请先登录 Qoder，再回来点「添加当前 Qoder 账号」。';
-  } catch (e) { cur.className = 'state err'; cur.textContent = e.message; }
+  if (cur) { cur.className = 'import-description'; cur.textContent = '选择国内版或国际版，获取链接后在官方网页完成授权。'; }
 }
 async function doQoderCapture() {
   const b = $('btnQoderCapture');
@@ -1889,7 +1975,7 @@ function resetDoubaoAddPanel() {
   if (dn) dn.hidden = true;
   if (er) er.hidden = true;
   const man = $('addDbManual');
-  if (man) man.hidden = true;
+  if (man) man.hidden = false;
   const tg = $('btnDbToggleManual');
   if (tg) tg.textContent = '改用粘贴 Cookie';
   const b = $('btnDbClient');
@@ -1901,6 +1987,7 @@ function resetDoubaoAddPanel() {
   const be = $('addDbBrowserErr');
   if (be) { be.hidden = true; be.textContent = ''; }
   stopDbBrowserPoll();
+  applyLoginCapabilities();
 }
 /* 豆包「客户端登录并添加」：拉起客户端 → 用户登录 → 提取 Cookie 入池。 */
 async function doDbClientAdd() {
@@ -1963,7 +2050,8 @@ async function doDbBrowserAdd() {
     dbBrowserTimer = setTimeout(tick, 2000);
   } catch (e) {
     $('addDbBrowserErr').hidden = false; $('addDbBrowserErr').textContent = e.message;
-    $('addDbBrowserBox').hidden = true;
+    $('addDbBrowserBox').hidden = false;
+    $('addDbManual').hidden = false;
   } finally { b.disabled = false; b.textContent = '浏览器登录并添加'; }
 }
 if ($('btnDbClient')) $('btnDbClient').onclick = doDbClientAdd;
@@ -1975,8 +2063,11 @@ if ($('btnDbBrowserStop')) $('btnDbBrowserStop').onclick = async () => {
 };
 async function doDbAddCookie() {
   const b = $('btnDbAddCookie');
+  const label = b.textContent;
   b.disabled = true;
+  b.textContent = '正在导入…';
   $('addDbDone').hidden = true; $('addDbErr').hidden = true;
+  if (!$('dbCookieInput').value.trim()) { $('addDbErr').hidden = false; $('addDbErr').textContent = '请先粘贴从豆包网页复制的 Cookie 值或完整请求标头。'; b.disabled = false; b.textContent = label; $('dbCookieInput').focus(); return; }
   try {
     const d = await api('ide/doubao/add_cookie', {
       method: 'POST',
@@ -1988,7 +2079,7 @@ async function doDbAddCookie() {
     loadCkDoubao(true);
   } catch (e) {
     $('addDbErr').hidden = false; $('addDbErr').textContent = e.message;
-  } finally { b.disabled = false; }
+  } finally { b.disabled = false; b.textContent = label; }
 }
 if ($('btnDbToggleManual')) $('btnDbToggleManual').onclick = () => {
   const man = $('addDbManual');
@@ -2549,7 +2640,7 @@ async function loadTraeStatus(quiet) {
     if ($('btnTraeCheckinAll')) $('btnTraeCheckinAll').disabled = false;
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = '未找到 Trae 账号。请先在「Trae Work 助手」里添加账号，然后回来点刷新。';
+      st.textContent = '还没有 Trae 账号。点击「添加账号 → Trae」，完成网页登录后粘贴授权返回地址。';
       list.innerHTML = ''; $('traeSummary').textContent = '';
       return;
     }
@@ -4661,7 +4752,7 @@ async function loadQoderAccounts(quiet) {
       const rm = UI.sub('data-qoder-remove', a.email, '移除');
       return '<div class="arow" data-acc="' + esc(a.email) + '">' +
         '<div class="who"><div class="nm">' + esc(identName(a.name, a.email, '未命名')) + '</div>' +
-        '<div class="id">' + esc(identLabel(a.email, '未设置')) + '</div></div>' +
+        '<div class="id">' + esc(identLabel(a.identity_label || a.email, '未设置')) + '</div></div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' + renew + sw + rm + '</div>' +
         '</div>';
@@ -5268,7 +5359,7 @@ async function loadCkWorkBuddy(quiet) {
     if ($('ckWbSummary')) $('ckWbSummary').textContent = all.length ? ('共 ' + all.length + ' 个 · 已签 ' + done) : '号池为空';
     if (!all.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = 'WorkBuddy 号池为空。';
+      st.textContent = '还没有 WorkBuddy 账号。点击右上角「添加账号」，在官方网页完成授权即可添加。';
       list.innerHTML = ''; return;
     }
     // 表头与其他平台统一为：账号 | 积分 | 状态 | 操作。
@@ -5480,7 +5571,7 @@ async function loadCkQoder(quiet) {
     const rows = arr.length ? arr : (cur ? [{ email: cur, name: d.current_name || '当前登录', current: true }] : []);
     if (!rows.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = '本机 Qoder 未登录，号池也为空。请先在 Qoder 登录，再到「IDE 账号池」点「添加账号」。';
+      st.textContent = '还没有 Qoder 账号。点击「添加账号 → Qoder」，选择地区后完成官方网页授权。';
       list.innerHTML = '';
       renderQoderBuckets();
       return;
@@ -5599,7 +5690,7 @@ function renderQoderRows(rows, arr, cur, st2) {
     return '<div class="trow" data-qd-row="' + esc(email) + '">' +
       '<div class="who"><div class="nm">' + esc(identName(a.name, email, '未命名')) +
       (a.current ? '<span class="tag mute" style="margin-left:6px">当前登录</span>' : '') + groupTag + '</div>' +
-      '<div class="id">' + esc(identLabel(email, '未设置')) + '</div>' + metaHTML + '</div>' +
+      '<div class="id">' + esc(identLabel(a.identity_label || email, '未设置')) + '</div>' + metaHTML + '</div>' +
       '<div class="credits" data-qk-cred="' + esc(email) + '"><span class="note">查询中…</span></div>' +
       '<div>' + status + '</div>' +
       '<div class="acts">' +
@@ -5655,13 +5746,11 @@ async function loadCkMiniMax(quiet) {
     if ($('ckMmSummary')) {
       $('ckMmSummary').textContent = arr.length
         ? ('共 ' + arr.length + ' 个 · 已签 ' + done)
-        : (d.has_client ? '号池为空（可点「添加当前账号」）' : 'MiniMax Code 未登录');
+        : '尚未添加账号';
     }
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = d.has_client
-        ? '号池为空。点右上角「添加当前账号」，把客户端当前登录的账号存进来。'
-        : '本机 MiniMax Code 未登录。请先登录，再点「添加当前账号」。';
+      st.textContent = '还没有 MiniMax 账号。点击「添加账号 → MiniMax」，获取验证码并在官方网页完成授权。';
       list.innerHTML = ''; return;
     }
     const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
@@ -5792,13 +5881,11 @@ async function loadCkDoubao(quiet) {
     if ($('ckDbSummary')) {
       $('ckDbSummary').textContent = arr.length
         ? ('共 ' + arr.length + ' 个 · 已签 ' + done)
-        : (d.has_client ? '号池为空（本机已装豆包客户端，可一键提取）' : '本机未安装豆包客户端');
+        : '尚未添加账号';
     }
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = d.has_client
-        ? '号池为空。点「从客户端提取」把当前登录的豆包账号存进来（客户端会短暂重启）。'
-        : '本机未安装豆包客户端。可先安装并登录，再提取；或通过「添加账号 → 豆包」粘贴 Cookie。';
+      st.textContent = '还没有豆包账号。点击「添加账号 → 豆包」，粘贴 Cookie 或整段请求标头即可导入。';
       list.innerHTML = ''; return;
     }
     // 表头与其他平台统一为：账号 | 积分 | 状态 | 操作（豆包没有积分概念，列保留占位）。
@@ -6747,3 +6834,65 @@ async function loadCaCredits(quiet) {
     }).join('');
   } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
 }
+// Qoder device authorization works from a NAS without a desktop browser.
+let qoderDeviceTimer = null, qoderDeviceState = '', qoderDeviceGeneration = 0;
+function stopQoderDevicePoll() {
+  qoderDeviceGeneration++;
+  if (qoderDeviceTimer) clearTimeout(qoderDeviceTimer);
+  qoderDeviceTimer = null;
+}
+async function applyLoginCapabilities() {
+  try {
+    const d = await api('ide/login/capabilities');
+    for (const id of ['qoderDesktopOptions', 'doubaoDesktopOptions', 'wbDesktopOptions', 'traeDesktopOptions', 'minimaxDesktopOptions', 'codeartsDesktopOptions']) if ($(id)) $(id).hidden = !d.desktop_login;
+  } catch (e) { /* Desktop choices remain hidden if capability detection fails. */ }
+}
+async function startQoderDeviceLogin() {
+  stopQoderDevicePoll();
+  const generation = qoderDeviceGeneration;
+  const b = $('btnQoderDevice'); b.disabled = true;
+  $('qdDeviceBox').hidden = false; $('qdDeviceErr').hidden = true;
+  $('qdDeviceUrl').hidden = true; $('btnQoderDeviceRetry').hidden = true;
+  $('addQoderDone').hidden = true;
+  $('qdDeviceState').textContent = '正在生成登录链接…';
+  try {
+    const d = await api('ide/qoder/device/start', {method: 'POST', body: JSON.stringify({region: $('qdDeviceRegion').value})});
+    if (generation !== qoderDeviceGeneration) return;
+    const link = new URL(d.auth_url);
+    if (!['https://qoder.com', 'https://qoder.com.cn'].includes(link.origin) || link.pathname !== '/device/selectAccounts') throw new Error('授权链接异常，请重新获取');
+    qoderDeviceState = d.state;
+    $('qdDeviceUrl').href = link.href; $('qdDeviceUrl').hidden = false;
+    $('qdDeviceState').textContent = '请打开官方授权网页，登录并确认授权。链接有效期为 10 分钟。';
+    qoderDeviceTimer = setTimeout(() => pollQoderDevice(generation), 2500);
+  } catch (e) {
+    if (generation !== qoderDeviceGeneration) return;
+    $('qdDeviceState').textContent = '登录链接生成失败';
+    $('qdDeviceErr').textContent = e.message; $('qdDeviceErr').hidden = false;
+  } finally { b.disabled = false; }
+}
+async function pollQoderDevice(generation = qoderDeviceGeneration) {
+  if (generation !== qoderDeviceGeneration) return;
+  $('btnQoderDeviceRetry').hidden = true;
+  try {
+    const d = await api('ide/qoder/device/poll?state=' + encodeURIComponent(qoderDeviceState));
+    if (generation !== qoderDeviceGeneration) return;
+    $('qdDeviceErr').hidden = true;
+    $('qdDeviceState').textContent = d.message || '等待完成网页授权…';
+    if (d.done) {
+      stopQoderDevicePoll();
+      $('qdDeviceUrl').hidden = true;
+      if (d.ok) {
+        $('addQoderDone').textContent = d.message; $('addQoderDone').hidden = false;
+        loadQoderAccounts(true); loadCkQoder(true);
+      } else { $('qdDeviceErr').textContent = d.message; $('qdDeviceErr').hidden = false; }
+      return;
+    }
+    qoderDeviceTimer = setTimeout(() => pollQoderDevice(generation), 2500);
+  } catch (e) {
+    if (generation !== qoderDeviceGeneration) return;
+    $('qdDeviceErr').textContent = e.message; $('qdDeviceErr').hidden = false;
+    $('btnQoderDeviceRetry').hidden = false;
+  }
+}
+if ($('btnQoderDevice')) $('btnQoderDevice').onclick = startQoderDeviceLogin;
+if ($('btnQoderDeviceRetry')) $('btnQoderDeviceRetry').onclick = () => pollQoderDevice();

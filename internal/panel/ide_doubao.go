@@ -18,12 +18,12 @@ package panel
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -112,8 +112,8 @@ func (p *Panel) doubaoAddExtract(w http.ResponseWriter, r *http.Request) {
 	log.Printf("panel: 豆包客户端提取: %s（%s，%d 个 Cookie）", acc.Label, verb, len(cookies))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "added": added, "id": acc.ID, "label": acc.Label,
-		"msg":     verb + "：" + acc.Label + "（" + fmt.Sprintf("%d 个 Cookie", len(cookies)) + "）",
-		"note":    strings.TrimSpace(killNote + "；" + launchNote),
+		"msg":  verb + "：" + acc.Label + "（" + fmt.Sprintf("%d 个 Cookie", len(cookies)) + "）",
+		"note": strings.TrimSpace(killNote + "；" + launchNote),
 	})
 }
 
@@ -170,13 +170,17 @@ func (p *Panel) doubaoAddCookie(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Cookie string `json:"cookie"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Cookie) == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&req); err != nil || strings.TrimSpace(req.Cookie) == "" {
 		writeErr(w, http.StatusBadRequest, "cookie 不能为空（粘贴 sessionid=...; ttwid=... 整串）")
 		return
 	}
-	cookies := doubao.ParseCookieString(req.Cookie)
+	cookies, parseErr := parseDoubaoCookieInput(req.Cookie)
+	if parseErr != nil {
+		writeErr(w, http.StatusBadRequest, parseErr.Error())
+		return
+	}
 	if cookies["sessionid"] == "" && cookies["sessionid_ss"] == "" {
-		writeErr(w, http.StatusBadRequest, "Cookie 里没有 sessionid —— 请复制包含登录态的完整 Cookie 串")
+		writeErr(w, http.StatusBadRequest, "Cookie 缺少豆包登录字段 sessionid / sessionid_ss，请先登录豆包，再复制包含登录态的 Cookie 或请求标头。未保存账号。")
 		return
 	}
 	acc, added, err := doubao.Upsert(cookies, "manual")
@@ -596,8 +600,9 @@ func doubaoNetResults(ws *wsConn, id int) []doubaoNetRow {
 }
 
 // doubaoCheckinRe 从 v3/detail 响应里提取 daily_checkin 状态
-//（{"campaign_code":"daily_signin",...,"daily_checkin":{"checked_in_today":true,
-//   "continuous_days":1,"last_checkin_date":"2026-10-24",...}}）。
+// （{"campaign_code":"daily_signin",...,"daily_checkin":{"checked_in_today":true,
+//
+//	"continuous_days":1,"last_checkin_date":"2026-10-24",...}}）。
 var doubaoCheckinRe = regexp.MustCompile(
 	`"daily_checkin":\{"checked_in_today":(true|false),"continuous_days":(\d+),"last_checkin_date":"([^"]+)"`)
 
@@ -671,13 +676,13 @@ func doubaoPageStatusFetch(ws *wsConn, id int) (phase, detail string, ok bool) {
 
 // doubaoScanState 页面扫描快照。
 type doubaoScanState struct {
-	Ready   bool   `json:"ready"`
-	Btn     string `json:"btn"`
-	Already bool   `json:"already"`
-	Success bool   `json:"success"`
-	Card    string `json:"card"`
-	Login   bool   `json:"login"`
-	Sample  string `json:"sample"`
+	Ready   bool     `json:"ready"`
+	Btn     string   `json:"btn"`
+	Already bool     `json:"already"`
+	Success bool     `json:"success"`
+	Card    string   `json:"card"`
+	Login   bool     `json:"login"`
+	Sample  string   `json:"sample"`
 	Cands   []string `json:"cands,omitempty"`
 }
 

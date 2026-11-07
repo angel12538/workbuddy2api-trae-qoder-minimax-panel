@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,10 @@ var qoderLoginSession struct {
 //
 // body: {"logout":true} —— 先退出当前账号（备份登录态），让客户端回到登录页。
 func (p *Panel) qoderLoginStart(w http.ResponseWriter, r *http.Request) {
+	if runtime.GOOS != "windows" {
+		writeErr(w, http.StatusBadRequest, "此登录方式需要服务器上的 Windows 桌面；请使用设备授权登录")
+		return
+	}
 	var req struct {
 		Logout bool `json:"logout"`
 	}
