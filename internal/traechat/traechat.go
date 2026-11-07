@@ -96,6 +96,227 @@ func (m ModelInfo) CreditsLabel() string {
 	return fmt.Sprintf("x%.2f", m.ConsumptionRate)
 }
 
+// ── 思考档位（reasoning effort） ─────────────────────────────────────────
+
+// traeLevelOrder Trae 原生档位，由低到高。
+var traeLevelOrder = []string{"light", "high", "extra_high"}
+
+// EffortConfig 模型目录声明的思考档位能力（档位为 Trae 原生值）。
+type EffortConfig struct {
+	Support bool
+	Levels  []string
+	Default string
+}
+
+// ModelEffort 解析模型目录里的 reasoning_effort_config。
+// 兼容 object / JSON 字符串两种形态与 snake/camel 两套字段名。
+func ModelEffort(m ModelInfo) EffortConfig {
+	raw := m.Raw()
+	v := raw["reasoning_effort_config"]
+	if v == nil {
+		v = raw["reasoningEffortConfig"]
+	}
+	var cfg map[string]any
+	switch t := v.(type) {
+	case map[string]any:
+		cfg = t
+	case string:
+		_ = json.Unmarshal([]byte(t), &cfg)
+	}
+	if cfg == nil {
+		return EffortConfig{}
+	}
+	support := false
+	for _, k := range []string{"support_thinking", "supportThinking"} {
+		if val, ok := cfg[k]; ok {
+			switch s := val.(type) {
+			case bool:
+				support = s
+			case string:
+				support = strings.EqualFold(strings.TrimSpace(s), "true")
+			}
+			break
+		}
+	}
+	if !support {
+		return EffortConfig{}
+	}
+	var opts []string
+	for _, k := range []string{"options", "reasoning_effort_options", "reasoningEffortOptions"} {
+		if val, ok := cfg[k]; ok {
+			opts = effortStringList(val)
+			break
+		}
+	}
+	levels := make([]string, 0, len(traeLevelOrder))
+	for _, lv := range traeLevelOrder {
+		for _, o := range opts {
+			if normalizeEffortLevel(o) == lv {
+				levels = append(levels, lv)
+				break
+			}
+		}
+	}
+	def := ""
+	for _, k := range []string{"default_level", "defaultLevel", "default"} {
+		if s, ok := cfg[k].(string); ok && s != "" {
+			def = normalizeEffortLevel(s)
+			break
+		}
+	}
+	return EffortConfig{Support: true, Levels: levels, Default: def}
+}
+
+// EffortAlias 原生档位 → 网关/面板通用档位（low/high/xhigh）。
+func EffortAlias(level string) string {
+	switch level {
+	case "light":
+		return "low"
+	case "high":
+		return "high"
+	case "extra_high":
+		return "xhigh"
+	}
+	return ""
+}
+
+// Listing 返回（通用档位, 默认档位），供面板与 /v1/models 透出。
+func (c EffortConfig) Listing() ([]string, string) {
+	if !c.Support {
+		return nil, ""
+	}
+	out := make([]string, 0, len(c.Levels))
+	for _, lv := range c.Levels {
+		if e := EffortAlias(lv); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out, EffortAlias(c.Default)
+}
+
+// effortStringList 兼容 []any / []string / JSON 字符串数组。
+func effortStringList(v any) []string {
+	switch t := v.(type) {
+	case []string:
+		return t
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, x := range t {
+			if s, ok := x.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		var arr []string
+		if json.Unmarshal([]byte(t), &arr) == nil {
+			return arr
+		}
+	}
+	return nil
+}
+
+// normalizeEffortLevel 把常见档位写法归一为 Trae 原生值。
+func normalizeEffortLevel(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "none", "minimal", "min", "low", "light":
+		return "light"
+	case "medium", "mid", "normal", "default", "high":
+		return "high"
+	case "xhigh", "x-high", "extra_high", "extra-high", "very_high", "very-high",
+		"max", "maximum", "ultra":
+		return "extra_high"
+	}
+	return ""
+}
+
+func effortRank(lv string) int {
+	for i, v := range traeLevelOrder {
+		if v == lv {
+			return i
+		}
+	}
+	return -1
+}
+
+// clampEffort 取不高于请求档位的最高支持档位；低于全部支持档位时取最低档。
+func clampEffort(requested string, levels []string) string {
+	if requested == "" || len(levels) == 0 {
+		return ""
+	}
+	r := effortRank(requested)
+	if r < 0 {
+		return ""
+	}
+	best := ""
+	for _, lv := range levels {
+		if effortRank(lv) <= r && (best == "" || effortRank(lv) > effortRank(best)) {
+			best = lv
+		}
+	}
+	if best == "" {
+		best = levels[0]
+	}
+	return best
+}
+
+// effortFromBudget 按 thinking.budget_tokens 推档位（对齐 Trae 客户端口径）。
+func effortFromBudget(n int64) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n < 4096:
+		return "light"
+	case n < 16384:
+		return "high"
+	default:
+		return "extra_high"
+	}
+}
+
+// TraeRequestedLevel 从入站请求解析思考档位（原始别名，未钳制）。
+func TraeRequestedLevel(req ChatRequest) string {
+	if lv := normalizeEffortLevel(req.ReasoningEffort); lv != "" {
+		return lv
+	}
+	if req.Reasoning != nil {
+		if lv := normalizeEffortLevel(req.Reasoning.Effort); lv != "" {
+			return lv
+		}
+	}
+	if req.Thinking != nil {
+		if lv := normalizeEffortLevel(req.Thinking.Effort); lv != "" {
+			return lv
+		}
+		if lv := normalizeEffortLevel(req.Thinking.Level); lv != "" {
+			return lv
+		}
+		return effortFromBudget(req.Thinking.BudgetTokens)
+	}
+	return ""
+}
+
+// applyEffortToCustomModel 按模型声明的档位钳制后写回 custom_model。
+// 上游若已带 reasoning_effort_level 键就沿用该键，否则用 reasoning_effort。
+func applyEffortToCustomModel(cm map[string]any, m ModelInfo, requested string) string {
+	cfg := ModelEffort(m)
+	if !cfg.Support {
+		return ""
+	}
+	lv := clampEffort(normalizeEffortLevel(requested), cfg.Levels)
+	if lv == "" {
+		return ""
+	}
+	if _, ok := cm["reasoning_effort_level"]; ok {
+		cm["reasoning_effort_level"] = lv
+		delete(cm, "reasoning_effort")
+	} else {
+		cm["reasoning_effort"] = lv
+		delete(cm, "reasoning_effort_level")
+	}
+	return lv
+}
+
 // Client Trae Remote 通道 HTTP 客户端。
 type Client struct {
 	HTTP        *http.Client
@@ -391,6 +612,9 @@ type CreateRequest struct {
 	ChatMode    string // "code" / "work"
 	SessionKey  string // 稳定会话键（biz_session_id）
 	MaxTokens   int64  // >0 写入 max_tokens
+	// Effort 调用方请求的思考档位（原生 light/high/extra_high 或常见别名）；
+	// 会按模型 reasoning_effort_config 钳制后写入 custom_model。
+	Effort string
 }
 
 type createResponse struct {
@@ -438,6 +662,8 @@ func (c *Client) CreateSession(req CreateRequest) (sessionID, messageID string, 
 	if _, ok := cm["use_remote_service"]; !ok {
 		cm["use_remote_service"] = true
 	}
+	// 思考档位：按模型 reasoning_effort_config 钳制后写入 custom_model。
+	applyEffortToCustomModel(cm, req.Model, req.Effort)
 
 	initial := map[string]any{
 		"chat_session_id":         "",

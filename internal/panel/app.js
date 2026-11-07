@@ -4988,17 +4988,26 @@ async function loadTraeIdeAccounts(quiet) {
     const arr = d.accounts || [];
     const cur = d.current_email || d.current_user_id || '';
     $('traeIdeSummary').textContent = cur ? '当前：' + cur : '当前未登录';
+    // 服务器/容器部署没有本机 Trae 客户端：不再整块拦截，账号照常展示；
+    // 只把「切号」标为不可用，避免「面板已登录却提示未检测到」的误导。
+    const addBtn = $('btnTraeIdeAdd');
     if (!d.available) {
       st.hidden = false; st.className = 'state';
-      st.innerHTML = '未检测到 Trae IDE 登录态。<br>数据目录：<code>' + esc(d.data_dir || '') + '</code><br>请先启动 Trae 并登录一个账号，再点「添加当前账号」。';
-      list.innerHTML = '';
-      return;
+      st.innerHTML = '未检测到本机 Trae IDE 登录态（服务器/容器部署属正常现象）。<br>数据目录：<code>' + esc(d.data_dir || '') + '</code><br>面板里已登录的 Trae 账号仍会显示在下方；「切号」需本机客户端，服务器上不可用。';
+      if (addBtn) { addBtn.disabled = true; addBtn.title = '未检测到本机 Trae 登录态，无法添加当前账号'; }
+    } else {
+      st.hidden = true;
+      if (addBtn) { addBtn.disabled = false; addBtn.title = ''; }
     }
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = cur
-        ? '号池为空。Trae 当前已登录 ' + cur + '，点右上角「添加当前账号」存入号池。'
-        : '号池为空。请先在 Trae 里登录，再点「添加当前账号」。';
+      st.textContent = d.available
+        ? (cur
+          ? '号池为空。Trae 当前已登录 ' + cur + '，点右上角「添加当前账号」存入号池。'
+          : '号池为空。请先在 Trae 里登录，再点「添加当前账号」。')
+        : (cur
+          ? '号池为空。当前账号 ' + cur + ' 来自签到池，可直接用于网关调用。'
+          : '号池为空。服务器未挂载 Trae 客户端数据；可先在「签到池」添加 Trae 账号。');
       list.innerHTML = '';
       return;
     }
@@ -5017,7 +5026,9 @@ async function loadTraeIdeAccounts(quiet) {
         ops = UI.off('切号', '该账号只有签到凭据、没有 IDE 登录态，无法切号');
       } else {
         status = UI.badge('warn', '○', '可切换');
-        ops = UI.act('data-traeide-switch', id, '切号', '切到这个账号（关闭 Trae → 写入登录态 → 重启）');
+        ops = d.available
+          ? UI.act('data-traeide-switch', id, '切号', '切到这个账号（关闭 Trae → 写入登录态 → 重启）')
+          : UI.off('切号', '服务器部署没有本机 Trae 客户端，无法切号');
       }
       const rm = UI.sub('data-traeide-remove', id, '移除');
       return '<div class="arow" data-acc="' + esc(id) + '">' +
@@ -5027,7 +5038,7 @@ async function loadTraeIdeAccounts(quiet) {
         '<div class="acts">' + ops + rm + '</div>' +
         '</div>';
     }).join('');
-    st.hidden = true;
+    st.hidden = !!d.available; // 服务器模式下保留顶部说明，不隐藏
     list.querySelectorAll('button[data-traeide-switch]').forEach(b => {
       b.onclick = () => doTraeIdeSwitch(b.dataset.traeideSwitch, b);
     });

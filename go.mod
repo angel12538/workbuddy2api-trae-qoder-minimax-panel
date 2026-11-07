@@ -7,7 +7,11 @@ require (
 	github.com/redis/go-redis/v9 v9.18.0
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.0
+	qoder2api v0.0.0
 )
+
+// Qoder 通道：复用 qoder2api（Qoder → OpenAI 兼容桥）的协议实现。
+replace qoder2api => ./qoder2api
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

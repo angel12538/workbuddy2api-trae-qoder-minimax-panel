@@ -486,6 +486,8 @@ func (h *Handler) modelList() []map[string]any {
 	out = append(out, h.minimaxModels()...)
 	// MiniMax 开放平台模型名单（前缀 "mm:"）。
 	out = append(out, h.mmModels()...)
+	// Qoder 模型名单（前缀 "qoder:"，账号来自面板已登录的 Qoder 号池）。
+	out = append(out, h.qoderModels()...)
 	return out
 }
 
@@ -618,6 +620,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Qoder 通道分流：模型名带 "qoder:" 前缀时交给 qoder2api Bridge（复用面板已登录账号）。
+	if realm == "qoder" {
+		h.qoderChat(w, r, body, bareModel, st)
+		return
+	}
 	if realm == "trae" {
 		h.traeChat(w, r, body, bareModel, st)
 		return
