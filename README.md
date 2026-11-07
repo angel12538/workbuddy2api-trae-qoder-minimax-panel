@@ -369,6 +369,14 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 官方撤销授权或续期凭证失效后，需要重新完成一次人工授权。
 原有桌面浏览器登录和客户端提取入口保留在「桌面版其他添加方式」中。
 
+#### Docker / NAS 切换 Qoder 面板当前账号
+
+在「IDE 账号池 → Qoder」点击「切号」，可将已有账号设为服务端面板当前使用的账号。「当前使用」标记会立即更新，刷新页面或重启容器后保留选择；请保留原有 `/app/data` 挂载。
+
+此选择供面板的当前账号查询、用量与续期使用；逐账号和全部账号签到仍按原账号池处理。容器不会操作访问者电脑上的 Qoder 客户端，也不会改变聊天网关的平台路由。Windows 本机运行默认保留客户端切号；Windows 无桌面服务可设置 `QODER_SERVER_MODE=1` 使用同一服务端行为。
+
+选择文件 `data/ide_accounts/qoder_current.json` 只保存账号键，令牌继续从原账号池读取。没有邮箱的账号也可以通过已验证的 UID 账号键切换。可运行 `node scripts/test_qoder_server.cjs` 检查前端切换行为。
+
 ### 方式二：Windows 单文件运行（无需 Docker）
 
 ```powershell

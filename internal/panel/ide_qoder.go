@@ -42,7 +42,7 @@ func (p *Panel) qoderAccounts(w http.ResponseWriter, r *http.Request) {
 	curName := ""
 	curExpires := ""
 	if a, err := ideauth.ReadQoderAuth(); err == nil {
-		cur = a.User.Email
+		cur = ideauth.QoderIdentityKey(a)
 		curName = a.User.Name
 		curExpires = a.ExpiresAt
 	}
@@ -51,6 +51,7 @@ func (p *Panel) qoderAccounts(w http.ResponseWriter, r *http.Request) {
 		"current_email":   cur,
 		"current_name":    curName,
 		"current_expires": curExpires,
+		"switch_mode":     qoderSwitchMode(),
 	})
 }
 
@@ -88,6 +89,19 @@ func (p *Panel) qoderSwitch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "email_required")
 		return
 	}
+	if ideauth.QoderServerMode() {
+		snap, err := ideauth.SwitchQoderTo(req.Email, false)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "qoder_switch_failed: " + err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "email": snap.Email, "name": snap.Name,
+			"switch_mode": "server", "restarted": false,
+			"message": "已切换服务端面板当前 Qoder 账号",
+		})
+		return
+	}
 	killNote := ""
 	if req.Restart {
 		killNote = ideauth.KillClient("qoder")
@@ -108,6 +122,13 @@ func (p *Panel) qoderSwitch(w http.ResponseWriter, r *http.Request) {
 		"restarted":    req.Restart,
 		"restart_note": killNote + "；" + launchNote,
 	})
+}
+
+func qoderSwitchMode() string {
+	if ideauth.QoderServerMode() {
+		return "server"
+	}
+	return "desktop"
 }
 
 type qoderRemoveReq struct {
@@ -289,18 +310,18 @@ func qoderLegacyCheckinItem(res *ideauth.QoderCheckinResult) ideauth.QoderChecki
 		}
 	}
 	item := ideauth.QoderCheckinItem{
-		Email:      res.Email,
-		Name:       res.Name,
-		UID:        res.UID,
-		Phase:      phase,
-		Msg:        res.Msg,
-		DeviceOK:   res.DeviceOK,
-		Refreshed:  res.Refreshed,
-		Exe:        res.Exe,
-		Base:       res.Base,
-		Scope:      res.Scope,
-		ClaimCID:   res.ClaimCID,
-		QuotaGroup: 1,
+		Email:        res.Email,
+		Name:         res.Name,
+		UID:          res.UID,
+		Phase:        phase,
+		Msg:          res.Msg,
+		DeviceOK:     res.DeviceOK,
+		Refreshed:    res.Refreshed,
+		Exe:          res.Exe,
+		Base:         res.Base,
+		Scope:        res.Scope,
+		ClaimCID:     res.ClaimCID,
+		QuotaGroup:   1,
 		Strategy:     ideauth.QoderStrategyFor(res.Email, phase, "", 1, verdict),
 		RotationRank: 1,
 	}
@@ -354,11 +375,11 @@ func (p *Panel) qoderCheckinStatus(w http.ResponseWriter, r *http.Request) {
 	// 100 Credits 的另一个号反而显示可签，两个号整个反了）。现在只信上游，
 	// 外加**可信**的本地记录（10:05 之后写入的完整时间戳）。
 	cur := map[string]any{}
-	if a, err := ideauth.ReadQoderAuth(); err == nil && a.User.Email != "" {
+	if a, err := ideauth.ReadQoderAuth(); err == nil && ideauth.QoderIdentityKey(a) != "" {
 		oc := ideauth.QoderScanCurrent()
 		ph, _ := oc["phase"].(string)
 		oc["checked_in_today"] = ph == "claimed" ||
-			(ph != "claimable" && ideauth.CheckinRecordTrusted("qoder", a.User.Email))
+			(ph != "claimable" && ideauth.CheckinRecordTrusted("qoder", ideauth.QoderIdentityKey(a)))
 		cur = oc
 	}
 	// 顶层 checked_in_today 与 POST checkin **同义**：只有**所有**账号今天都

@@ -115,6 +115,10 @@ func UpdateQoderPool(fn func(*QoderPoolFile) error) error {
 // UpsertQoderAccount 把当前登录态存入号池（按 Email 去重）。
 // 返回是否新增账号。
 func UpsertQoderAccount() (*QoderSnapshot, bool, error) {
+	if QoderServerMode() {
+		s, err := readQoderServerSnapshot()
+		return s, false, err
+	}
 	snap, err := CaptureQoderSnapshot()
 	if err != nil {
 		return nil, false, err
@@ -158,12 +162,18 @@ func RemoveQoderAccount(email string) error {
 // SwitchQoderTo 把号池中指定邮箱的登录态写入 Qoder（切号核心）。
 // 保存当前登录态到号池后再切换，避免丢失当前账号。
 func SwitchQoderTo(email string, restoreMachineID bool) (*QoderSnapshot, error) {
+	if QoderServerMode() {
+		return switchQoderServerTo(email)
+	}
 	f, err := LoadQoderPool()
 	if err != nil {
 		return nil, err
 	}
 	var target *QoderSnapshot
 	for _, a := range f.Accounts {
+		if a == nil {
+			continue
+		}
 		if strings.EqualFold(a.Email, email) {
 			target = a
 			break
@@ -215,12 +225,15 @@ func ListQoderAccounts() ([]QoderAccountView, error) {
 	}
 	curEmail := ""
 	if cur, err := ReadQoderAuth(); err == nil {
-		curEmail = cur.User.Email
+		curEmail = QoderIdentityKey(cur)
 	}
 	now := time.Now().UTC()
 	sizes := QoderQuotaGroupSizes(f.Accounts)
 	out := make([]QoderAccountView, 0, len(f.Accounts))
 	for _, a := range f.Accounts {
+		if a == nil {
+			continue
+		}
 		exp := false
 		if a.Auth != nil && a.Auth.ExpiresAt != "" {
 			if t, err := time.Parse(time.RFC3339, a.Auth.ExpiresAt); err == nil && t.Before(now) {

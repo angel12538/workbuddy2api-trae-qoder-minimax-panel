@@ -4716,29 +4716,31 @@ if ($('btnPkIdea')) $('btnPkIdea').onclick = () => loadPkIdea(false);
 /* ── IDE 账号（Qoder 切号） ──────────────────────────────────────────
    服务端直接读写本机 Qoder 的 auth.v1.dat（AES-256-GCM + DPAPI 密钥），
    面板只做展示与触发：添加当前账号 / 切换 / 移除。 */
+let qoderSwitchMode = 'desktop';
 async function loadQoderAccounts(quiet) {
   const st = $('qoderState'), list = $('qoderList');
   if (!st || !list) return;
   if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
   try {
     const d = await api('ide/qoder/accounts');
+    qoderSwitchMode = d.switch_mode || 'desktop';
     const arr = d.accounts || [];
     const cur = d.current_email || '';
     $('qoderSummary').textContent = cur
       ? '当前：' + cur + (d.current_expires ? '（到期 ' + String(d.current_expires).slice(0, 10) + '）' : '')
-      : '当前未登录';
+      : (qoderSwitchMode === 'server' ? '尚未选择当前账号' : '当前未登录');
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
       st.textContent = cur
         ? '号池为空。点右上角「添加账号 → Qoder」把当前登录账号存入号池。'
-        : '号池为空，且本机 Qoder 未登录。请先用某个账号登录 Qoder，再添加。';
+        : (qoderSwitchMode === 'server' ? '号池为空，请点右上角「添加账号 → Qoder」完成网页授权。' : '号池为空，且本机 Qoder 未登录。请先用某个账号登录 Qoder，再添加。');
       list.innerHTML = '';
       return;
     }
     const head = '<div class="ahead"><div>账号</div><div>状态</div><div>操作</div></div>';
     list.innerHTML = head + arr.map(a => {
       const status = a.current
-        ? UI.badge('ok', '✓', '当前登录')
+        ? UI.badge('ok', '✓', qoderSwitchMode === 'server' ? '当前使用' : '当前登录')
         : (a.expired
           ? UI.badge('todo', '!', '凭证过期')
           : UI.badge('warn', '○', '可切换'));
@@ -4747,7 +4749,7 @@ async function loadQoderAccounts(quiet) {
       // 那一行有"的情况。
       const sw = a.current
         ? UI.off('当前', '已经是当前登录的账号')
-        : UI.act('data-qoder-switch', a.email, '切号', '切到这个账号（关闭 Qoder → 写入登录态 → 重启）');
+        : UI.act('data-qoder-switch', a.email, '切号', qoderSwitchMode === 'server' ? '设为面板当前使用的 Qoder 账号' : '切到这个账号（关闭 Qoder → 写入登录态 → 重启）');
       const renew = UI.sub('data-qoder-renew', a.email, '续期', '用 refresh_token 换新 token');
       const rm = UI.sub('data-qoder-remove', a.email, '移除');
       return '<div class="arow" data-acc="' + esc(a.email) + '">' +
@@ -4797,14 +4799,20 @@ async function doQoderAdd() {
 }
 
 async function doQoderSwitch(email, btn) {
-  if (!confirm('切换到 ' + email + '？\n\n会自动关闭 Qoder、写入该账号登录态并重新启动 Qoder。')) return;
+  const server = qoderSwitchMode === 'server';
+  if (!confirm('切换到 ' + email + '？\n\n' + (server ? '将设为服务端面板当前使用的 Qoder 账号。' : '会自动关闭 Qoder、写入该账号登录态并重新启动 Qoder。'))) return;
   const old = btn.textContent;
   btn.disabled = true; btn.textContent = '切换中…';
   try {
     const d = await api('ide/qoder/switch', {
       method: 'POST',
-      body: JSON.stringify({ email, restore_machine_id: false, restart: true }),
+      body: JSON.stringify({ email, restore_machine_id: false, restart: !server }),
     });
+    if (d.switch_mode === 'server') {
+      toast('已切换当前账号：' + (d.name || d.email || email), 'ok');
+      await loadQoderAccounts(true);
+      return;
+    }
     // 完全冻结：不重载列表、不改「当前登录」标记，画面 100% 停在切换前。
     onSwitchDone('qoder', d.email || email, d.restart_note);
   } catch (e) { toast(e.message, 'err'); }
@@ -4862,7 +4870,7 @@ async function doQoderRelogin(btn, email) {
 }
 
 async function doQoderRemove(email) {
-  if (!confirm('从号池移除 ' + email + '？\n（不会影响 Qoder 当前登录态）')) return;
+  if (!confirm('从号池移除 ' + email + '？\n' + (qoderSwitchMode === 'server' ? '如果它是当前账号，移除后需要重新选择。' : '（不会影响 Qoder 当前登录态）'))) return;
   try {
     await api('ide/qoder/remove', { method: 'POST', body: JSON.stringify({ email }) });
     toast('已移除 ' + email, 'ok');
