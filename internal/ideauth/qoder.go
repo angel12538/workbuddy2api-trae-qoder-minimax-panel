@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,13 @@ const (
 
 // ReadQoderAuth 解密并返回当前 Qoder 登录账号。
 func ReadQoderAuth() (*QoderAuth, error) {
+	if QoderServerMode() {
+		s, err := readQoderServerSnapshot()
+		if err != nil {
+			return nil, err
+		}
+		return s.Auth, nil
+	}
 	key, err := QoderOSCryptKey()
 	if err != nil {
 		return nil, err
@@ -73,6 +81,9 @@ func ReadQoderAuth() (*QoderAuth, error) {
 // WriteQoderAuth 用 raw 的 JSON 内容重新加密写回 auth.v1.dat。
 // 会先备份原文件（.bak.<ts>）。
 func WriteQoderAuth(a *QoderAuth) error {
+	if QoderServerMode() {
+		return writeQoderServerAuth(a)
+	}
 	key, err := QoderOSCryptKey()
 	if err != nil {
 		return err
@@ -125,6 +136,16 @@ func QoderDeviceID() (string, error) {
 // 另外：scope **不是**每日额度的分组键（实测两个 scope 不同的号共享同一份额度，
 // 见 QoderQuotaGroupKey）。
 func QoderScope() (string, error) {
+	if QoderServerMode() {
+		s, err := readQoderServerSnapshot()
+		if err != nil {
+			return "", err
+		}
+		if s.Auth.Realm == "global" && !strings.Contains(s.Scope, ":global") {
+			return s.Scope + ":global", nil
+		}
+		return s.Scope, nil
+	}
 	b, err := os.ReadFile(filepath.Join(QoderDataDir(), "qoder-data.v1.json"))
 	if err != nil {
 		return "", err
@@ -159,6 +180,9 @@ type QoderSnapshot struct {
 
 // CaptureQoderSnapshot 抓取当前登录态，用于保存到号池。
 func CaptureQoderSnapshot() (*QoderSnapshot, error) {
+	if QoderServerMode() {
+		return readQoderServerSnapshot()
+	}
 	a, err := ReadQoderAuth()
 	if err != nil {
 		return nil, err

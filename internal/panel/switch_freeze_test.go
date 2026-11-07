@@ -11,7 +11,7 @@ import (
 
 // 切号「不掉上下文」回归测试。
 //
-// 背景：切号只应更换后端登录态，面板画面必须 100% 停在切换前
+// 背景：桌面客户端切号只应更换后端登录态，面板画面必须停在切换前
 // （列表顺序、滚动位置、额度数字、连「当前登录」徽章都不许变）。
 // 这里锁死两件事：
 //   1) 结构：切号函数里不得再出现 load*Accounts 之类的整表重载；
@@ -51,11 +51,12 @@ func grabJSFunc(t *testing.T, src, name string) string {
 	return ""
 }
 
-// TestAppJSSwitchDoesNotReload 切号后不得整表重载或改写列表。
+// TestAppJSSwitchDoesNotReload 桌面切号后不得整表重载或改写列表。
+// Qoder 的桌面冻结与服务端刷新分支由 TestQoderServerFrontendSwitchBranches 执行验证。
 func TestAppJSSwitchDoesNotReload(t *testing.T) {
 	src := readAppJS(t)
 
-	for _, fn := range []string{"doQoderSwitch", "doTraeIdeSwitch", "doWorkBuddySwitch"} {
+	for _, fn := range []string{"doTraeIdeSwitch", "doWorkBuddySwitch"} {
 		body := grabJSFunc(t, src, fn)
 		for _, bad := range []string{"loadQoderAccounts(", "loadTraeIdeAccounts(", "loadWorkBuddyAccounts("} {
 			if strings.Contains(body, bad) {
