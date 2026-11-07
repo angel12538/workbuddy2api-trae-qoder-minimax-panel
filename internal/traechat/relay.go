@@ -38,6 +38,17 @@ type ChatRequest struct {
 	MaxTokens int64     `json:"max_tokens,omitempty"`
 	// SessionKey 可选：调用方给定的会话键（缺省由账号+模型派生稳定值）。
 	SessionKey string `json:"session_key,omitempty"`
+	// 思考档位（OpenAI / Responses / Anthropic 三种形态都收）：
+	// reasoning_effort、reasoning.effort、thinking.{effort,level,budget_tokens}。
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	Reasoning       *struct {
+		Effort string `json:"effort"`
+	} `json:"reasoning,omitempty"`
+	Thinking *struct {
+		Effort       string `json:"effort"`
+		Level        string `json:"level"`
+		BudgetTokens int64  `json:"budget_tokens"`
+	} `json:"thinking,omitempty"`
 }
 
 // ── 请求扁平化 ───────────────────────────────────────────────────────────
@@ -594,6 +605,7 @@ func (r *Relay) attempt(ctx context.Context, acct *Account, mi ModelInfo, query 
 		ChatMode:   "code",
 		SessionKey: sessKey,
 		MaxTokens:  req.MaxTokens,
+		Effort:     TraeRequestedLevel(req),
 	})
 	if err != nil {
 		return nil, err

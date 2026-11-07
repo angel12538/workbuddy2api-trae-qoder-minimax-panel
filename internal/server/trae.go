@@ -277,6 +277,17 @@ func (h *Handler) traeModels() []map[string]any {
 			entry["description"] = fmt.Sprintf("[%s credit] Trae %s", lbl, m.Name)
 		}
 		entry["vendor"] = "trae"
+		// 思考档位透出：目录原生 light/high/extra_high → 通用 low/high/xhigh，
+		// 客户端可据此传 reasoning_effort（中继侧按模型声明钳制后写入 custom_model）。
+		if cfg := traechat.ModelEffort(m); cfg.Support {
+			entry["supports_reasoning"] = true
+			if levels, def := cfg.Listing(); len(levels) > 0 {
+				entry["reasoning_supported_efforts"] = levels
+				if def != "" {
+					entry["reasoning_default_effort"] = def
+				}
+			}
+		}
 		out = append(out, entry)
 	}
 	return out

@@ -1,8 +1,12 @@
 # syntax=docker/dockerfile:1
 # go.mod 要求 go 1.26.0，基础镜像必须跟上（用 1.23 会直接报 "go.mod requires go >= 1.26.0"）
 FROM golang:1.26-alpine AS build
+# 国内网络访问 proxy.golang.org 经常超时：优先国内镜像，失败再回退官方源。
+ENV GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
 WORKDIR /src
 COPY go.mod ./
+# 本地 replace 的子模块：go mod download 前必须先有它的 go.mod
+COPY qoder2api/go.mod ./qoder2api/go.mod
 RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。

@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoderchat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/traechat"
@@ -533,6 +535,40 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Trae 域：与网关 /v1/models 同源（复用 traechat 目录缓存，无账号/拉取失败则不列）。
+	if p.traeCatalog != nil {
+		if ms, err := p.traeCatalog.Models(r.Context()); err == nil {
+			for _, m := range ms {
+				e := map[string]any{
+					"id":              "trae:" + m.Name,
+					"name":            m.DisplayName,
+					"vendor":          "Trae",
+					"context_length":  m.ContextWindow,
+					"supports_images": m.Multimodal,
+					"is_default":      m.IsDefault,
+					"tags":            []string{"trae"},
+				}
+				if lbl := m.CreditsLabel(); lbl != "" {
+					e["credits"] = lbl
+					e["description"] = "[" + lbl + " credit] Trae " + m.Name
+				}
+				// 思考档位：目录里 reasoning_effort_config 的原生档位
+				// （light / high / extra_high）映射为面板/网关通用档位
+				// （low / high / xhigh），default_level 取默认档。
+				if support, efforts, def := traeEffortInfo(m); support {
+					e["supports_reasoning"] = true
+					if len(efforts) > 0 {
+						e["supported_efforts"] = efforts
+					}
+					if def != "" {
+						e["default_effort"] = def
+					}
+				}
+				out = append(out, e)
+			}
+		}
+	}
+
 	if len(out) == 0 {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
@@ -544,9 +580,73 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
-// qoderModelEntries 返回 Qoder 域的模型目录（静态口径，来源 docs.qoder.com/zh/cli/model）。
-// Qoder 客户端不暴露公开模型目录接口，故按官方文档内置；倍率即文档里的 price_factor。
+// traeEffortInfo 复用 traechat 的目录解析，返回（是否支持思考、通用档位、默认档位）。
+func traeEffortInfo(m traechat.ModelInfo) (bool, []string, string) {
+	cfg := traechat.ModelEffort(m)
+	if !cfg.Support {
+		return false, nil, ""
+	}
+	levels, def := cfg.Listing()
+	return true, levels, def
+}
+
+// qoderModelEntries 返回 Qoder 域的模型目录：优先用上游真实目录（ID/展示名/档位/倍率），
+// 未登录或拉取失败时回落到官方文档静态表，保证面板仍可见。
 func qoderModelEntries() []map[string]any {
+	ms, err := qoderchat.Models()
+	if err != nil || len(ms) == 0 {
+		return qoderStaticModelEntries()
+	}
+	out := make([]map[string]any, 0, len(ms))
+	for _, m := range ms {
+		if m.Key == "" || !m.Enable {
+			continue
+		}
+		ctx := m.ContextWindow
+		for _, t := range m.ContextTiers {
+			if t.Tokens > ctx {
+				ctx = t.Tokens
+			}
+		}
+		name := m.DisplayName
+		if name == "" {
+			name = m.Key
+		}
+		e := map[string]any{
+			"id":                 "qoder:" + m.Key,
+			"name":               name,
+			"credits":            qoderCredits(m.PriceFactor),
+			"vendor":             "Qoder",
+			"context_length":     ctx,
+			"supports_reasoning": m.IsReasoning || m.SupportsThinking,
+			"supports_images":    true,
+			"supports_tool_call": true,
+			"tags":               []string{"qoder"},
+		}
+		if len(m.ThinkingEfforts) > 0 {
+			e["supported_efforts"] = m.ThinkingEfforts
+		}
+		if m.DefaultEffort != "" {
+			e["default_effort"] = m.DefaultEffort
+		}
+		if m.IsDefault {
+			e["is_default"] = true
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func qoderCredits(pf float64) string {
+	if pf <= 0 {
+		return ""
+	}
+	// 与其它域保持一致：x 在前、数字在后（如 x0.50）。
+	return fmt.Sprintf("x%.2f", pf)
+}
+
+// qoderStaticModelEntries 是未登录/拉取失败时的静态兜底（来源 docs.qoder.com/zh/cli/model）。
+func qoderStaticModelEntries() []map[string]any {
 	type qm struct {
 		id, name, credits, def, vendor, desc string
 		efforts                              []string
@@ -554,20 +654,20 @@ func qoderModelEntries() []map[string]any {
 		canDisable, reasoning                bool
 	}
 	list := []qm{
-		{"Qwen3.8-Max", "Qwen3.8-Max", "0.5×", "medium", "阿里云", "千问最新旗舰，2.4T 参数，支持推理/多模态/思考开关，200K-1M 上下文", []string{"low", "medium", "xhigh"}, 1000000, true, true},
-		{"Qwen3.7-Max", "Qwen3.7-Max", "0.5×", "medium", "阿里云", "智能体能力大幅跃升，可自主处理长程复杂任务，支持多模态/思考开关", []string{"low", "medium", "high"}, 1000000, true, true},
-		{"Qwen3.7-Plus", "Qwen3.7-Plus", "0.1×", "medium", "阿里云", "推理能力、效率与多模态体验全面提升，高性价比", []string{"low", "medium", "high"}, 1000000, true, true},
-		{"Kimi-K3", "Kimi-K3", "0.8×", "high", "月之暗面", "2.8T 参数，面向软件工程/知识工作/深度推理，支持多模态", []string{"low", "high", "max"}, 1000000, false, true},
-		{"Kimi-K2.7-Code", "Kimi-K2.7-Code", "0.3×", "high", "月之暗面", "面向长上下文编码，256K 上下文，提供 Fast 模式", nil, 256000, false, false},
-		{"GLM-5.3", "GLM-5.3", "0.6×", "high", "智谱", "擅长复杂系统工程与长程任务，支持推理/多模态", []string{"low", "high", "max"}, 1000000, false, true},
-		{"GLM-5.2", "GLM-5.2", "0.6×", "high", "智谱", "擅长复杂系统工程与长程任务，支持思考开关", []string{"high", "max"}, 1000000, true, true},
-		{"DeepSeek-V4-Pro", "DeepSeek-V4-Pro", "0.8×", "high", "深度求索", "擅长复杂推理、代码生成与工程任务，支持思考开关", []string{"high", "max"}, 1000000, true, true},
-		{"DeepSeek-V4-Flash", "DeepSeek-V4-Flash", "0.3×", "high", "深度求索", "快速推理、低成本、能力均衡，支持思考开关", []string{"low", "high", "max"}, 1000000, true, true},
-		{"MiniMax-M3", "MiniMax-M3", "0.2×", "medium", "MiniMax", "原生多模态感知与前沿编码能力，1M 上下文", nil, 1000000, false, false},
-		{"Auto", "Auto（智能路由）", "1.0×", "", "Qoder", "自动选择最适合当前任务的模型，平衡性能与成本", nil, 1000000, false, false},
-		{"Ultimate", "Ultimate（专家级）", "1.6×", "", "Qoder", "专家级深度推理与思考能力，适合复杂系统设计", nil, 1000000, false, false},
-		{"Performance", "Performance（高性能）", "1.1×", "", "Qoder", "高级推理与高质量输出，适合核心功能实现/重构", nil, 1000000, false, false},
-		{"Efficient", "Efficient（高性价比）", "0.3×", "", "Qoder", "标准推理、低成本，适合基础代码生成与日常问答", nil, 1000000, false, false},
+		{"Qwen3.8-Max", "Qwen3.8-Max", "x0.50", "medium", "阿里云", "千问最新旗舰，2.4T 参数，支持推理/多模态/思考开关，200K-1M 上下文", []string{"low", "medium", "xhigh"}, 1000000, true, true},
+		{"Qwen3.7-Max", "Qwen3.7-Max", "x0.50", "medium", "阿里云", "智能体能力大幅跃升，可自主处理长程复杂任务，支持多模态/思考开关", []string{"low", "medium", "high"}, 1000000, true, true},
+		{"Qwen3.7-Plus", "Qwen3.7-Plus", "x0.10", "medium", "阿里云", "推理能力、效率与多模态体验全面提升，高性价比", []string{"low", "medium", "high"}, 1000000, true, true},
+		{"Kimi-K3", "Kimi-K3", "x1.40", "high", "月之暗面", "2.8T 参数，面向软件工程/知识工作/深度推理，支持多模态", []string{"low", "high", "max"}, 1000000, false, true},
+		{"Kimi-K2.8-Preview", "Kimi-K2.8-Preview", "x0.80", "high", "月之暗面", "面向长上下文编码，提供 Fast 模式", nil, 1000000, false, false},
+		{"GLM-5.3", "GLM-5.3", "x0.80", "high", "智谱", "擅长复杂系统工程与长程任务，支持推理/多模态", []string{"low", "high", "max"}, 1000000, false, true},
+		{"GLM-5.2", "GLM-5.2", "x0.60", "high", "智谱", "擅长复杂系统工程与长程任务，支持思考开关", []string{"high", "max"}, 1000000, true, true},
+		{"DeepSeek-V4-Pro", "DeepSeek-V4-Pro", "x0.50", "high", "深度求索", "擅长复杂推理、代码生成与工程任务，支持思考开关", []string{"high", "max"}, 1000000, true, true},
+		{"DeepSeek-V4-Flash", "DeepSeek-V4-Flash", "x0.10", "high", "深度求索", "快速推理、低成本、能力均衡，支持思考开关", []string{"low", "high", "max"}, 1000000, true, true},
+		{"MiniMax-M3", "MiniMax-M3", "x0.20", "medium", "MiniMax", "原生多模态感知与前沿编码能力，1M 上下文", nil, 1000000, false, false},
+		{"Auto", "Auto（智能路由）", "x0.50", "", "Qoder", "自动选择最适合当前任务的模型，平衡性能与成本", nil, 1000000, false, false},
+		{"Ultimate", "Ultimate（专家级）", "x2.00", "", "Qoder", "专家级深度推理与思考能力，适合复杂系统设计", nil, 1000000, false, false},
+		{"Performance", "Performance（高性能）", "x1.10", "", "Qoder", "高级推理与高质量输出，适合核心功能实现/重构", nil, 1000000, false, false},
+		{"Efficient", "Efficient（高性价比）", "x0.30", "", "Qoder", "标准推理、低成本，适合基础代码生成与日常问答", nil, 1000000, false, false},
 	}
 	out := make([]map[string]any, 0, len(list))
 	for _, m := range list {
@@ -585,6 +685,7 @@ func qoderModelEntries() []map[string]any {
 			"supports_tool_call":   true,
 			"tags":                 []string{"qoder"},
 		}
+		// 上游不提供最大输出，面板不展示猜测值（只保留官方文档的上下文长度）。
 		if m.def != "" {
 			e["default_effort"] = m.def
 		}
@@ -619,7 +720,7 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 	//（WorkBuddy 客户端显示的就是这个生效价）。前端据此显示「生效价+标签+划线牌价」。
 	if mi.PromoFactor != nil {
 		entry["promo_factor"] = *mi.PromoFactor
-		entry["promo_credits"] = mi.PromoCredits
+		entry["promo_credits"] = fmtRateXP(mi.PromoCredits)
 	}
 	if mi.PromoLabel != "" {
 		entry["promo_label"] = mi.PromoLabel
@@ -643,7 +744,28 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 	return entry
 }
 
-// modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
+// fmtRateXP 把上游折扣倍率原文统一为「x 在前」写法，与其它域模型倍率一致：
+// "0x" → "x0"、"0.50x" → "x0.50"、"x0.50" 原样保留。空串返回空串。
+func fmtRateXP(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(s), "x") {
+		return s
+	}
+	if strings.HasSuffix(strings.ToLower(s), "x") {
+		num := strings.TrimSpace(s[:len(s)-1])
+		if num == "" {
+			return ""
+		}
+		return "x" + num
+	}
+	return "x" + s
+}
+
+// modelProbes 返回模型输出上限的探测结果文件
+//（scripts/probe_max_tokens.py --panel-out
 // 写入的契约文件），供前端在「模型与档位」的实测列做风险标注。
 //
 // 设计边界：纯只读透传——文件缺失/未配置返回空集（面板退化为无标注，与历史行为
