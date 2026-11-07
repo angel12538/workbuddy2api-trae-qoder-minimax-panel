@@ -14,12 +14,14 @@ var base64Std = base64.StdEncoding
 
 // QoderAuth 对应 auth.v1.dat 解密后的结构。
 type QoderAuth struct {
-	SchemaVersion          int        `json:"schemaVersion"`
-	Token                  string     `json:"token"`
-	RefreshToken           string     `json:"refreshToken"`
-	ExpiresAt              string     `json:"expiresAt"`
-	RefreshTokenExpiresAt  string     `json:"refreshTokenExpiresAt"`
-	User                   QoderUser  `json:"user"`
+	AccountKey            string    `json:"accountKey,omitempty"` // pool routing key; not an email address
+	Realm                 string    `json:"realm,omitempty"`
+	SchemaVersion         int       `json:"schemaVersion"`
+	Token                 string    `json:"token"`
+	RefreshToken          string    `json:"refreshToken"`
+	ExpiresAt             string    `json:"expiresAt"`
+	RefreshTokenExpiresAt string    `json:"refreshTokenExpiresAt"`
+	User                  QoderUser `json:"user"`
 }
 
 // QoderUser 用户信息。
@@ -32,10 +34,10 @@ type QoderUser struct {
 }
 
 const (
-	qoderAuthFile     = "auth.v1.dat"
-	qoderOverlayFile  = "auth-profile-overlays.v1.dat"
-	qoderMachineID    = "auth.machine-id"
-	qoderMagic        = "v10"
+	qoderAuthFile    = "auth.v1.dat"
+	qoderOverlayFile = "auth-profile-overlays.v1.dat"
+	qoderMachineID   = "auth.machine-id"
+	qoderMagic       = "v10"
 )
 
 // ReadQoderAuth 解密并返回当前 Qoder 登录账号。
@@ -138,14 +140,14 @@ func currentQoderScope() string {
 
 // QoderSnapshot 是切号时保存的账号快照。
 type QoderSnapshot struct {
-	Email        string     `json:"email"`
-	UserID       string     `json:"user_id"`
-	Name         string     `json:"name"`
-	Auth         *QoderAuth `json:"auth"`
-	MachineID    string     `json:"machine_id"`
-	DeviceID     string     `json:"device_id"`
-	Scope        string     `json:"scope"`
-	SavedAt      string     `json:"saved_at"`
+	Email     string     `json:"email"`
+	UserID    string     `json:"user_id"`
+	Name      string     `json:"name"`
+	Auth      *QoderAuth `json:"auth"`
+	MachineID string     `json:"machine_id"`
+	DeviceID  string     `json:"device_id"`
+	Scope     string     `json:"scope"`
+	SavedAt   string     `json:"saved_at"`
 	// ClaimCID 该账号今天那条 CLAIM_BENEFIT 活动的实例 id。
 	//
 	// 服务端的每日额度按**人**给，同一个人的多个账号共用一条活动实例（实测

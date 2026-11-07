@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,10 @@ var doubaoBrowserSession struct {
 
 // doubaoBrowserStart 拉起浏览器（新 profile）并打开豆包网页版。
 func (p *Panel) doubaoBrowserStart(w http.ResponseWriter, r *http.Request) {
+	if runtime.GOOS != "windows" {
+		writeErr(w, http.StatusBadRequest, "此登录方式需要服务器上的 Windows 桌面；请打开豆包网页登录后粘贴 Cookie")
+		return
+	}
 	doubaoBrowserSession.mu.Lock()
 	defer doubaoBrowserSession.mu.Unlock()
 	if doubaoBrowserSession.proc != nil {

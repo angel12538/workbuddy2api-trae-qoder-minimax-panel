@@ -662,9 +662,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .freeze-bar .ic { color: var(--accent); font-weight: 600; }
   .freeze-bar .go { margin-left: auto; color: var(--accent); font-weight: 600; white-space: nowrap; }
 
+
 /* CodeArts 添加指引：关键步骤始终展开，域名和 Cookie 值分开说明。 */
-#addVeil .dlg:has(#addTabCodearts:not([hidden])) { width: 760px; }
-#addVeil .dlg:has(#addTabCodearts:not([hidden])) .tabs { display: flex; flex-wrap: wrap; margin: 9px 0 0; }
 #addTabCodearts .ca-steps { padding-left: 24px; margin: 12px 0; }
 #addTabCodearts .ca-steps > li { margin-bottom: 16px; padding-left: 3px; }
 #addTabCodearts .ca-step-title { display: block; font-weight: 600; margin-bottom: 5px; }
@@ -677,60 +676,431 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 #addTabCodearts .ca-field { display: block; margin: 8px 0 5px; }
 #addTabCodearts a { color: var(--accent); text-underline-offset: 3px; }
 #caCookieInput { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 7px; padding: 9px 11px; font: 12px/1.6 var(--mono); resize: vertical; min-height: 86px; }
+
+/* Account import workspace — scoped to the existing dialog. */
+#addVeil { --ink-3: #929bad; background: rgba(5, 8, 15, .7); backdrop-filter: blur(5px); color-scheme: dark; scrollbar-color: var(--ink-3) transparent; }
+[data-theme="light"] #addVeil { --ink-3: #717b8e; color-scheme: light; }
+#addVeil .import-dialog { width: 1040px; height: min(840px, calc(100dvh - 40px)); max-height: calc(100dvh - 40px); overflow: hidden; border-radius: 18px; box-shadow: 0 26px 90px -25px rgba(0,0,0,.65); }
+#addVeil .import-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 22px 26px 20px; }
+#addVeil .import-kicker { color: var(--accent); font-size: 11px; font-weight: 650; letter-spacing: 1px; margin-bottom: 4px; }
+#addVeil .import-header h3 { font-size: 21px; font-weight: 650; letter-spacing: -.4px; }
+#addVeil .import-header p { font-size: 12.5px; color: var(--ink-3); margin: 5px 0 0; }
+#addVeil .import-close { width: 34px; height: 34px; padding: 0; flex-shrink: 0; border-radius: 10px; font-size: 24px; line-height: 1; color: var(--ink-3); background: transparent; border-color: transparent; }
+#addVeil .import-close:hover { color: var(--ink); background: var(--surface-2); }
+#addVeil .import-workspace { display: grid; grid-template-columns: 188px minmax(0,1fr); flex: 1; min-height: 0; }
+#addVeil .import-nav { background: var(--surface-2); border-right: 1px solid var(--line-soft); padding: 20px 12px; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
+#addVeil .import-nav-label { display: flex; justify-content: space-between; align-items: center; padding: 0 9px 12px; color: var(--ink-3); font-size: 11.5px; font-weight: 550; }
+#addVeil .import-nav-label > span { border: 1px solid var(--line); border-radius: 5px; min-width: 20px; text-align: center; font-size: 10px; }
+#addVeil .tabs { display: flex; flex-direction: column; background: transparent; margin: 0; padding: 0; gap: 6px; border-radius: 0; }
+#addVeil .tabs .tab { display: flex; align-items: center; gap: 9px; text-align: left; padding: 10px 9px; min-height: 58px; border: 1px solid transparent; border-radius: 10px; color: var(--ink-2); font-size: 12px; box-shadow: none; }
+#addVeil .tabs .tab:hover { background: var(--surface); border-color: var(--line); }
+#addVeil .tabs .tab.on { background: var(--accent-soft); border-color: rgba(91,124,250,.26); color: var(--ink); }
+#addVeil .import-nav-icon, #addVeil .import-platform-mark { display: flex; align-items: center; justify-content: center; border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); font-weight: 700; font-family: var(--sans); flex-shrink: 0; }
+#addVeil .import-nav-icon { width: 31px; height: 31px; border-radius: 9px; font-size: 11px; }
+#addVeil .import-nav-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+#addVeil .import-nav-copy b { font-size: 12px; font-weight: 600; white-space: nowrap; }
+#addVeil .import-nav-copy small { font-size: 10px; color: var(--ink-3); white-space: nowrap; }
+#addVeil .import-nav-arrow { font-size: 18px; color: var(--accent); opacity: 0; }
+#addVeil .tab.on .import-nav-arrow { opacity: 1; }
+#addVeil [data-platform=doubao].import-nav-icon, #addVeil [data-platform=doubao].import-platform-mark { background: rgba(61,175,215,.10); border-color: rgba(61,175,215,.22); color: #63bfe0; }
+#addVeil [data-platform=qoder].import-nav-icon, #addVeil [data-platform=qoder].import-platform-mark { background: rgba(233,160,83,.10); border-color: rgba(233,160,83,.22); color: #dca569; }
+#addVeil [data-platform=trae].import-nav-icon, #addVeil [data-platform=trae].import-platform-mark { background: rgba(70,186,146,.10); border-color: rgba(70,186,146,.22); color: #58bd99; }
+#addVeil .import-nav-note { border-top: 1px solid var(--line); padding: 13px 8px 0; margin-top: 18px; font-size: 10.5px; line-height: 1.75; color: var(--ink-3); }
+#addVeil .import-content { padding: 24px 27px; min-width: 0; min-height: 0; overscroll-behavior: contain; scrollbar-width: thin; }
+#addVeil .import-platform-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+#addVeil .import-platform-mark { width: 45px; height: 45px; border-radius: 13px; color: var(--accent); background: var(--accent-soft); font-size: 17px; }
+#addVeil .import-platform-copy { flex: 1; min-width: 0; }
+#addVeil .import-platform-heading h4 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -.25px; }
+#addVeil .import-platform-heading p { margin: 5px 0 0; color: var(--ink-3); font-size: 12px; line-height: 1.6; }
+#addVeil .import-method-badge { color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 10.5px; white-space: nowrap; }
+#addVeil .tab-panel { margin: 0; padding: 0; border: 0; }
+#addVeil .import-flow { display: flex; align-items: center; gap: 0; padding: 10px 13px; border: 1px solid var(--line-soft); border-radius: 9px; background: var(--surface-2); margin-bottom: 18px; }
+#addVeil .import-flow > span { display: flex; align-items: center; flex: 1; gap: 7px; color: var(--ink-2); font-size: 11.5px; }
+#addVeil .import-flow > span + span::before { content: '›'; color: var(--ink-3); margin-right: 11px; }
+#addVeil .import-flow b { font: 11px var(--mono); color: var(--accent); }
+#addVeil .import-card { border: 1px solid var(--line); background: var(--surface); border-radius: 12px; padding: 18px; margin-bottom: 13px; min-width: 0; }
+#addVeil .import-card-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+#addVeil .import-card h5 { margin: 0; font-size: 13px; font-weight: 600; line-height: 1.55; }
+#addVeil .import-card p { color: var(--ink-3); font-size: 11.5px; line-height: 1.75; margin: 8px 0; }
+#addVeil .import-description { color: var(--ink-3); font-size: 12px; line-height: 1.75; margin: 0 0 15px; }
+#addVeil .import-note { color: var(--ink-3); font-size: 11.5px; line-height: 1.7; }
+#addVeil .import-guide-grid { display: grid; grid-template-columns: .9fr 1.2fr; gap: 12px; }
+#addVeil .import-guide-card { display: flex; flex-direction: column; padding: 15px; background: var(--surface-2); }
+#addVeil .import-card-eyebrow { font-size: 10.5px; color: var(--ink-3); margin-bottom: 7px; }
+#addVeil .import-open-link { display: inline-flex; align-items: center; justify-content: center; gap: 8px; align-self: flex-start; border: 1px solid rgba(91,124,250,.32); background: var(--accent-soft); color: var(--accent); padding: 7px 11px; border-radius: 7px; font-size: 11.5px; text-decoration: none; margin-top: 4px; }
+#addVeil .import-open-link:hover { border-color: var(--accent); filter: brightness(1.08); }
+#addVeil .import-copy-row { display: flex; align-items: center; gap: 5px; min-width: 0; margin-top: 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); padding: 4px 5px 4px 8px; }
+#addVeil .import-copy-row code { font: 10.5px/1.5 var(--mono); color: var(--ink-2); user-select: all; min-width: 0; flex: 1; overflow-wrap: anywhere; }
+#addVeil .import-copy-row button { padding: 4px 7px; font-size: 10px; background: transparent; flex-shrink: 0; }
+#addVeil .import-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+#addVeil .import-format-tag { color: var(--accent); border: 1px solid rgba(91,124,250,.25); background: var(--accent-soft); border-radius: 5px; padding: 3px 6px; font-size: 10px; white-space: nowrap; }
+#addVeil .import-field-label { display: block; color: var(--ink-2); font-size: 11.5px; font-weight: 550; margin: 10px 0 7px; }
+#addVeil textarea { display: block; box-sizing: border-box; width: 100%; min-height: 130px; max-height: 270px; padding: 12px; resize: vertical; font: 11.5px/1.8 var(--mono); color: var(--ink); background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; outline: none; }
+#addVeil textarea::placeholder { color: var(--ink-3); opacity: .8; }
+#addVeil textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+#addVeil #dbCookieInput { min-height: 110px; }
+#addVeil .import-form-footer { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-top: 12px; }
+#addVeil .import-form-footer .import-note { font-size: 10.5px; max-width: 330px; }
+#addVeil .import-form-footer button { flex-shrink: 0; padding: 8px 15px; border-radius: 8px; }
+#addVeil .import-region-select { max-width: 270px; margin: 8px 8px 12px 0; }
+#addVeil .state { line-height: 1.75; align-items: flex-start; margin: 10px 0; font-size: 12px; overflow-wrap: anywhere; }
+#addVeil .state.ok, #addVeil .state.err { padding: 10px 12px; border: 1px solid; border-radius: 8px; }
+#addVeil .state.ok { border-color: rgba(61,220,151,.22); background: var(--ok-soft); }
+#addVeil .state.err { border-color: rgba(240,101,95,.22); background: var(--bad-soft); }
+#addVeil .import-alternative { margin: 14px 0 0; border-top: 1px solid var(--line-soft); padding-top: 12px; color: var(--ink-3); font-size: 12px; }
+#addVeil .import-alternative > summary, #addVeil .import-help > summary { cursor: pointer; color: var(--ink-2); }
+#addVeil .import-alternative[open] > summary { margin-bottom: 12px; }
+#addVeil .import-help { margin-top: 10px; font-size: 11px; color: var(--ink-3); }
+#addVeil .import-help p { line-height: 1.8; margin: 9px 0; }
+#addVeil .import-help code { color: var(--ink-2); }
+#addVeil .ca-steps { padding: 0; margin: 14px 0; list-style: none; counter-reset: import-ca; }
+#addVeil .ca-steps > li { position: relative; padding: 16px 16px 16px 47px; border: 1px solid var(--line); border-radius: 11px; margin-bottom: 12px; font-size: 12px; line-height: 1.8; }
+#addVeil .ca-steps > li::before { counter-increment: import-ca; content: counter(import-ca, decimal-leading-zero); position: absolute; top: 18px; left: 15px; color: var(--accent); font: 11px var(--mono); }
+#addVeil .ca-step-title { font-size: 13px; }
+#addVeil .import-file-symbol { display: flex; width: 46px; height: 46px; border: 1px solid var(--line); border-radius: 12px; align-items: center; justify-content: center; margin-bottom: 16px; color: var(--accent); background: var(--accent-soft); font: 16px var(--mono); }
+#addVeil input[type=file] { padding: 13px; border-style: dashed; margin-bottom: 8px; cursor: pointer; }
+#addVeil input[type=file]::file-selector-button { font: inherit; font-size: 12px; padding: 7px 10px; margin-right: 12px; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; background: var(--surface); cursor: pointer; }
+#addVeil .import-footer { padding: 14px 24px; align-items: center; background: var(--surface); }
+#addVeil .import-footnote { color: var(--ink-3); font-size: 11px; line-height: 1.5; max-width: 490px; }
+#addVeil button:focus-visible, #addVeil a:focus-visible, #addVeil summary:focus-visible, #addVeil select:focus-visible, #addVeil input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 740px) {
+  #addVeil.on { padding: 12px; }
+  #addVeil .import-dialog { width: 100%; height: calc(100dvh - 24px); max-height: calc(100dvh - 24px); border-radius: 14px; }
+  #addVeil .import-header { padding: 16px 18px; }
+  #addVeil .import-header h3 { font-size: 18px; }
+  #addVeil .import-header p { font-size: 11px; }
+  #addVeil .import-workspace { display: flex; flex-direction: column; }
+  #addVeil .import-nav { padding: 9px 12px; flex-shrink: 0; border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }
+  #addVeil .import-nav-label, #addVeil .import-nav-note { display: none; }
+  #addVeil .tabs { flex-direction: row; overflow-x: auto; gap: 6px; padding: 2px; scrollbar-width: thin; }
+  #addVeil .tabs .tab { flex: 0 0 127px; padding: 7px 8px; min-height: 51px; }
+  #addVeil .import-nav-arrow { display: none; }
+  #addVeil .import-content { padding: 18px; flex: 1; }
+  #addVeil .import-platform-heading { gap: 9px; margin-bottom: 16px; }
+  #addVeil .import-platform-heading h4 { font-size: 17px; }
+  #addVeil .import-platform-heading p { font-size: 11px; }
+  #addVeil .import-platform-mark { width: 38px; height: 38px; border-radius: 11px; }
+  #addVeil .import-method-badge { display: none; }
+  #addVeil .import-flow { padding: 9px; }
+  #addVeil .import-flow > span { font-size: 10px; gap: 4px; }
+  #addVeil .import-flow > span + span::before { margin-right: 4px; }
+  #addVeil .import-guide-grid { grid-template-columns: 1fr; gap: 0; }
+  #addVeil .import-card { padding: 14px; }
+  #addVeil .import-form-footer { align-items: flex-start; flex-direction: column; gap: 10px; }
+  #addVeil .import-form-footer button { width: 100%; }
+  #addVeil .import-footer { padding: 12px 16px; gap: 7px; }
+  #addVeil .import-footnote { display: none; }
+}
+
+
+/* Console design system — shared by every view and the account importer. */
+:root {
+  --bg: #10131b; --surface: #191e29; --surface-2: #202633; --raise: #272e3d;
+  --line: #303849; --line-soft: #282f3e;
+  --ink: #edf0f8; --ink-2: #bec5d6; --ink-3: #949eb3;
+  --accent: #6574ed; --accent-soft: rgba(101,116,237,.14);
+  --ok: #5bceab; --ok-soft: rgba(91,206,171,.12);
+  --warn: #e7b768; --warn-soft: rgba(231,183,104,.12);
+  --bad: #f18b8e; --bad-soft: rgba(241,139,142,.11);
+  --shadow: 0 2px 8px -3px rgba(0,0,0,.18);
+  --radius: 14px; color-scheme: dark;
+}
+[data-theme="light"] {
+  --bg: #f5f6fa; --surface: #ffffff; --surface-2: #f7f8fc; --raise: #ffffff;
+  --line: #e1e5ef; --line-soft: #edf0f6;
+  --ink: #22283b; --ink-2: #505c73; --ink-3: #6e7a91;
+  --accent: #5365df; --accent-soft: rgba(83,101,223,.08);
+  --ok: #23876b; --ok-soft: rgba(35,135,107,.08);
+  --warn: #a56b1c; --warn-soft: rgba(179,122,39,.09);
+  --bad: #ce4f5b; --bad-soft: rgba(206,79,91,.08);
+  --shadow: 0 2px 8px -3px rgba(30,43,80,.055); color-scheme: light;
+}
+html { scrollbar-color: var(--ink-3) transparent; scrollbar-width: thin; }
+body { font-size: 13.5px; letter-spacing: .005em; }
+.skip-link { position: fixed; left: 18px; top: -60px; z-index: 100; padding: 10px 16px; background: var(--accent); color: #fff; border-radius: 9px; text-decoration: none; }
+.skip-link:focus { top: 12px; }
+.shell { grid-template-columns: 232px minmax(0,1fr); }
+.nav { padding: 0 13px; border-right-color: var(--line); z-index: 30; }
+.brand { padding: 30px 13px 26px; display: flex; align-items: center; gap: 10px; border-bottom: 0; }
+.brand-mark { display: flex; align-items: center; justify-content: center; width: 35px; height: 35px; border-radius: 11px; flex-shrink: 0; color: #fff; background: var(--accent); box-shadow: 0 4px 10px rgba(83,101,223,.18); }
+.brand-mark svg { width: 22px; height: 22px; }
+.brand .name { font-size: 14px; font-weight: 700; letter-spacing: -.35px; white-space: nowrap; }
+.brand .sub { font: 10px var(--sans); color: var(--ink-3); letter-spacing: .5px; margin-top: 2px; }
+.nav ul { padding: 0; }
+.nav-section-label { font-size: 10px; font-weight: 650; letter-spacing: .9px; color: var(--ink-3); padding: 12px 14px 10px; }
+.nav-section-label.system { margin-top: 20px; }
+.nav a { padding: 11px 14px; margin-bottom: 5px; gap: 11px; border: 1px solid transparent; border-radius: 9px; font-size: 12.5px; transition: background .16s, color .16s; white-space: nowrap; }
+.nav a svg { width: 17px; height: 17px; opacity: .85; }
+.nav a.on { border-color: color-mix(in srgb, var(--accent) 16%, transparent); font-weight: 650; }
+.nav a.on::after { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); margin-left: auto; }
+.nav .sig { margin: 20px 0 18px; padding: 14px; background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: 11px; font-size: 11px; }
+.nav .sig .row { gap: 7px; }
+.nav .sig .row:first-child { color: var(--ink-2); font-weight: 550; }
+.pulse { box-shadow: 0 0 0 3px var(--ok-soft); width: 6px; height: 6px; }
+.pulse.bad { box-shadow: 0 0 0 3px var(--bad-soft); }
+.pulse.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.topbar { padding: 16px 34px; min-height: 76px; gap: 11px; background: var(--surface); border-bottom: 1px solid var(--line); box-shadow: none; z-index: 25; }
+.topbar .breadcrumb-root { font-size: 12px; color: var(--ink-3); }
+.topbar h2 { font-size: 12px; font-weight: 600; }
+.topbar .sep { font-size: 17px; color: var(--ink-3); opacity: .65; }
+.topbar .meta { font: 11px var(--sans); padding-right: 13px; margin-right: 2px; border-right: 1px solid var(--line); white-space: nowrap; }
+.topbar button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; }
+.topbar button svg { width: 14px; height: 14px; }
+.topbar #btnTheme { width: 36px; padding: 8px; border-color: var(--line); }
+.topbar #btnAdd { padding-left: 13px; padding-right: 15px; }
+.page-intro { padding: 32px 34px 27px; width: 100%; max-width: 1560px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.page-eyebrow { display: flex; align-items: center; gap: 7px; font-size: 10px; font-weight: 650; letter-spacing: 1.5px; color: var(--accent); margin-bottom: 6px; }
+.page-eyebrow::before { content: ''; width: 15px; height: 2px; background: var(--accent); border-radius: 2px; }
+.page-intro h1 { font-size: 27px; line-height: 1.35; font-weight: 700; letter-spacing: -.7px; }
+.page-intro p { font-size: 12px; color: var(--ink-3); margin-top: 8px; line-height: 1.75; }
+.page-context { display: flex; align-items: center; gap: 11px; color: var(--ink-2); font-size: 11px; padding: 11px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 11px; flex-shrink: 0; }
+.page-context-icon { display: flex; align-items: center; justify-content: center; width: 31px; height: 31px; background: var(--accent-soft); color: var(--accent); border-radius: 8px; }
+.page-context-icon svg { width: 17px; height: 17px; }
+.page-context small { display: block; font-size: 9px; color: var(--ink-3); letter-spacing: .7px; margin-top: 2px; }
+.view { padding: 0 34px 52px; }
+.box { border-radius: var(--radius); margin-bottom: 21px; box-shadow: var(--shadow); min-width: 0; }
+.box > header { padding: 17px 20px; gap: 10px; min-height: 62px; flex-wrap: wrap; }
+.box > header h3 { font-size: 13px; font-weight: 650; color: var(--ink); }
+.box > header .note { font-size: 11px; white-space: normal; line-height: 1.6; }
+.box .pad { padding: 20px; }
+.box > .state { margin: 15px 18px 18px; padding: 13px 15px; background: var(--surface-2); border: 1px dashed var(--line); border-radius: 9px; font-size: 12px; line-height: 1.8; color: var(--ink-3); overflow-wrap: anywhere; align-items: flex-start; }
+.box > .state.err { border-style: solid; border-color: color-mix(in srgb, var(--bad) 24%, var(--line)); background: var(--bad-soft); color: var(--bad); }
+.box > .state.ok { border-style: solid; border-color: color-mix(in srgb, var(--ok) 24%, var(--line)); background: var(--ok-soft); color: var(--ok); }
+button { border-radius: 8px; font-size: 12px; padding: 7px 12px; font-weight: 550; transition: background .15s, border-color .15s, box-shadow .15s; }
+button:hover:not(:disabled) { box-shadow: 0 2px 6px rgba(20,30,60,.06); }
+button.primary { background: var(--accent); border-color: var(--accent); box-shadow: 0 2px 4px rgba(83,101,223,.12); }
+button.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 90%, var(--ink)); border-color: transparent; }
+button.xs, select.xs { padding: 5px 9px; font-size: 11px; border-radius: 7px; }
+button:disabled { opacity: .5; }
+input, select { border-radius: 8px; font-size: 12px; padding: 9px 11px; }
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 2px; border-color: var(--accent); }
+.acc { font-size: 12px; }
+.acc thead { background: var(--surface-2); }
+.acc th { font-size: 10.5px; font-weight: 600; color: var(--ink-3); padding: 11px 14px; }
+.acc td { padding: 13px 14px; }
+.acc tbody tr { transition: background .12s; }
+.acc td .who .nm { font-size: 12.5px; }
+.acc .who .id { font-size: 10px; }
+.tbl-wrap { scrollbar-width: thin; scrollbar-color: var(--ink-3) transparent; overscroll-behavior-x: contain; }
+.tag { padding: 3px 8px; font-size: 10px; line-height: 1.5; border-radius: 6px; }
+.tag.ok { border: 1px solid color-mix(in srgb, var(--ok) 13%, transparent); }
+.tag.warn { border: 1px solid color-mix(in srgb, var(--warn) 13%, transparent); }
+.tag.bad { border: 1px solid color-mix(in srgb, var(--bad) 13%, transparent); }
+.empty { padding: 38px 22px; font-size: 12px; }
+.empty .big { font-weight: 600; font-size: 14px; }
+.kpis { gap: 12px; padding: 19px 20px 4px; }
+.kpis.k4 { grid-template-columns: repeat(auto-fit,minmax(155px,1fr)); }
+.stats { grid-template-columns: repeat(auto-fit,minmax(145px,1fr)); box-shadow: none; border-radius: 10px; margin: 0 20px 18px; }
+.stat { padding: 17px 18px; }
+.stat .v { font-size: 25px; letter-spacing: -.7px; }
+.kpi { padding: 15px 16px 15px 18px; border-radius: 11px; border-color: var(--line); }
+.kpi::before { top: 17px; bottom: auto; height: 24px; width: 3px; border-radius: 0 3px 3px 0; }
+.kpi .v { font-size: 25px; letter-spacing: -.7px; }
+.kpi .k { font-size: 11px; }
+.kpi .sub { font-size: 10px; }
+.uschart, .pk-expiry-chart { border-radius: 10px; }
+.vtabs, .chips { max-width: 100%; flex-wrap: wrap; }
+.vtabs { padding: 4px; border: 1px solid var(--line-soft); border-radius: 9px; }
+.vtabs button { font-size: 11px; padding: 5px 11px; }
+.vtabs button.on { box-shadow: 0 1px 4px rgba(10,20,45,.1); color: var(--accent); }
+.switch { border-bottom: 1px solid var(--line-soft); padding: 12px 0; }
+.switch:last-child { border-bottom: none; }
+.switch input[type=checkbox] { appearance: none; width: 32px; height: 19px; padding: 0; border: none; border-radius: 20px; background: var(--line); position: relative; flex-shrink: 0; cursor: pointer; transition: background .16s; }
+.switch input[type=checkbox]::before { content: ''; display: block; position: absolute; top: 3px; left: 3px; width: 13px; height: 13px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.2); transition: transform .16s; }
+.switch input[type=checkbox]:checked { background: var(--accent); }
+.switch input[type=checkbox]:checked::before { transform: translateX(13px); }
+.savebar { border: 1px solid var(--line); border-radius: 11px; background: var(--surface); box-shadow: 0 -4px 18px rgba(20,30,60,.04); padding: 13px 17px; z-index: 5; bottom: 14px; }
+#logBox { background: color-mix(in srgb, var(--bg) 55%, var(--surface)); border-radius: 0 0 13px 13px; padding: 20px; line-height: 2; font-size: 11.5px; }
+.ln .lch { border-radius: 4px; padding: 3px 6px; margin-right: 11px; font-size: 9px; }
+.req-wrap thead th { background: var(--surface-2); }
+.credit-dim-hd { padding: 13px 20px 9px; font-size: 11.5px; font-weight: 600; color: var(--ink-2); border-top: 1px solid var(--line-soft); }
+.dlg { border-radius: 15px; box-shadow: 0 25px 90px -25px rgba(0,0,0,.5); }
+.dlg header { padding: 21px 23px 17px; }
+.dlg .body { padding: 21px 23px; }
+.dlg footer { padding: 15px 23px; }
+.tc-empty { padding: 45px 20px; }
+.tc-empty svg { width: 42px; height: 42px; color: var(--accent); opacity: .55; margin-bottom: 12px; }
+.tc-empty .d { font-size: 12px; line-height: 1.8; }
+.platform-mark { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); color: var(--ink-2); font-weight: 750; font-size: 11px; }
+.platform-copy { flex: 1; min-width: 0; }
+.platform-copy > .note { display: block; margin-top: 2px; font-size: 10.5px; }
+[data-platform="qoder"] > header .platform-mark { background: var(--warn-soft); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 16%, transparent); }
+[data-platform="trae"] > header .platform-mark, [data-platform="codearts"] > header .platform-mark { background: var(--ok-soft); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 16%, transparent); }
+[data-platform="doubao"] > header .platform-mark { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 16%, transparent); }
+#view-checkin { display: grid; grid-template-columns: minmax(0,1fr); gap: 19px; align-items: stretch; }
+#view-checkin > .box { margin-bottom: 0; }
+#view-checkin > .checkin-command { border-color: color-mix(in srgb, var(--accent) 23%, var(--line)); background: linear-gradient(110deg, var(--accent-soft), transparent 80%), var(--surface); }
+.checkin-command > header { padding: 22px 23px; border-bottom: 0; min-height: 100px; }
+.command-symbol { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 13px; background: var(--accent-soft); color: var(--accent); margin-right: 4px; flex-shrink: 0; }
+.command-symbol svg { width: 23px; height: 23px; }
+.command-copy { flex: 1; }
+.checkin-command > header h3 { font-size: 16px; letter-spacing: -.25px; }
+.command-copy p { margin-top: 5px; font-size: 11.5px; color: var(--ink-3); line-height: 1.7; }
+.checkin-command #btnCkMaster { padding: 9px 17px; font-size: 12px; }
+.checkin-platform > header { min-height: 79px; padding: 17px 18px; flex-wrap: wrap; }
+#view-checkin .trow, #view-checkin .thead { grid-template-columns: minmax(110px,1fr) auto auto auto; gap: 11px; padding-left: 18px; padding-right: 18px; }
+#view-checkin .arow, #view-checkin .ahead { grid-template-columns: minmax(100px,1fr) auto auto; gap: 11px; padding-left: 18px; padding-right: 18px; }
+#view-checkin .trow .who, #view-checkin .arow .who { min-width: 0; max-width: 190px; }
+#view-checkin .who .nm { font-size: 12px; }
+#view-checkin .who .id { font-size: 10px; }
+#view-checkin .thead, #view-checkin .ahead { font-size: 10px; background: var(--surface-2); border-top: 1px solid var(--line-soft); }
+#view-checkin .trow .credits, #view-checkin .arow .credits { font-size: 11px; }
+#view-checkin .trow .acts { gap: 5px; flex-wrap: wrap; }
+#view-checkin .acts button { padding: 3px 7px; font-size: 10.5px; }
+#view-checkin .ck-group { margin: 0; padding: 0; font-size: 12px; color: var(--ink); border: 0; }
+#view-checkin .checkin-credits .pad { padding: 18px 20px 9px; }
+#view-checkin .checkin-credits .acc { min-width: 420px; }
+#view-checkin .checkin-credits .acc th:first-child { width: 45%; }
+#view-checkin .checkin-credits .tbl-wrap:has(tbody:empty) { display: none; }
+#ckQoderBuckets { color: var(--ink-3); font-size: 10.5px; line-height: 1.7; padding: 0 18px 15px; }
+#ckQoderBuckets:empty { padding: 0; }
+@media (min-width: 1280px) {
+  #view-checkin { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  #view-checkin > .checkin-command, #view-checkin > .checkin-credits { grid-column: 1 / -1; }
+}
+@media (max-width: 1100px) and (min-width: 761px) {
+  .shell { grid-template-columns: 208px minmax(0,1fr); }
+  .nav { padding: 0 9px; }
+  .brand { padding-left: 10px; gap: 8px; }
+  .brand .name { font-size: 12.5px; }
+  .topbar { padding: 15px 24px; }
+  .topbar .meta { display: none; }
+  .view { padding-left: 24px; padding-right: 24px; }
+  .page-intro { padding-left: 24px; padding-right: 24px; }
+}
+@media (max-width: 760px) {
+  .shell { display: block; }
+  .nav { height: auto; position: relative; flex-direction: column; align-items: stretch; padding: 0; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand { padding: 17px 19px 13px; border: 0; }
+  .brand-mark { width: 30px; height: 30px; border-radius: 9px; }
+  .brand .name { font-size: 14px; }
+  .brand .sub { display: none; }
+  .nav ul { display: flex; gap: 5px; padding: 0 14px 12px; overflow-x: auto; scrollbar-width: none; flex: none; }
+  .nav ul::-webkit-scrollbar { display: none; }
+  .nav li { flex-shrink: 0; }
+  .nav .nav-section-label, .nav .sig { display: none; }
+  .nav a { padding: 7px 10px; margin: 0; gap: 7px; font-size: 11.5px; }
+  .nav a svg { width: 14px; height: 14px; }
+  .nav a.on::after { display: none; }
+  .topbar { position: relative; padding: 11px 18px; min-height: 59px; gap: 8px; }
+  .topbar .breadcrumb-root, .topbar .sep, .topbar .meta { display: none; }
+  .topbar h2 { font-size: 11px; color: var(--ink-3); }
+  .topbar button { min-height: 32px; padding: 6px 9px; font-size: 10.5px; gap: 5px; }
+  .topbar #btnTheme { width: 32px; }
+  .topbar #btnAdd { padding: 6px 10px; }
+  .topbar #btnRefresh svg { display: none; }
+  .page-intro { padding: 25px 19px 22px; }
+  .page-intro h1 { font-size: 24px; }
+  .page-intro p { font-size: 11px; max-width: 38em; }
+  .page-eyebrow { font-size: 9px; }
+  .page-context { display: none; }
+  .view { padding: 0 14px 35px; }
+  .box { border-radius: 12px; margin-bottom: 17px; }
+  .box > header { padding: 15px; gap: 8px; }
+  .box > header h3 { white-space: normal; font-size: 12px; }
+  .box > header .note { font-size: 10px; }
+  .box > header > .grow { flex-basis: 0; }
+  .box > .state { margin: 12px 14px 14px; padding: 11px 12px; font-size: 11px; }
+  .box .pad { padding: 15px; }
+  .checkin-command > header { padding: 18px 16px; }
+  .command-symbol { width: 36px; height: 36px; border-radius: 10px; margin-right: 2px; }
+  .command-copy { flex-basis: calc(100% - 60px); }
+  .checkin-command > header h3 { font-size: 15px; }
+  .command-copy p { font-size: 10.5px; }
+  .checkin-command #btnCkMaster { width: 100%; margin-top: 6px; }
+  .checkin-command #ckMasterNote:not(:empty) { flex-basis: 100%; }
+  .platform-mark { width: 30px; height: 30px; border-radius: 9px; font-size: 10px; }
+  .checkin-platform > header { padding: 15px; min-height: 73px; }
+  #view-checkin .trow, #view-checkin .arow { grid-template-columns: minmax(0,1fr) auto; gap: 9px 14px; padding: 14px 15px; }
+  #view-checkin .trow > :nth-child(2) { justify-self: end; }
+  #view-checkin .trow > :nth-child(3) { grid-column: 1; }
+  #view-checkin .trow > :nth-child(4) { grid-column: 2; justify-self: end; }
+  #view-checkin .arow > :last-child { grid-column: 1 / -1; }
+  #view-checkin .thead, #view-checkin .ahead { display: none; }
+  #view-checkin .trow .who, #view-checkin .arow .who { max-width: 100%; }
+  .arow, .trow, .srow { min-width: 0; }
+  #view-ideaccounts .arow, #view-ideaccounts .trow { grid-template-columns: minmax(0,1fr) auto; gap: 10px; }
+  #view-ideaccounts .arow > :last-child, #view-ideaccounts .trow > :last-child { grid-column: 1 / -1; }
+  #view-ideaccounts .ahead, #view-ideaccounts .thead { display: none; }
+  #view-ideaccounts .who { min-width: 0; max-width: 180px; }
+  .grid2, .grid3 { grid-template-columns: minmax(0,1fr); }
+  .kpis, .kpis.k4 { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; padding: 14px 14px 3px; }
+  .stats { grid-template-columns: repeat(2,minmax(0,1fr)); margin-left: 14px; margin-right: 14px; }
+  .kpis.k4 .kpi:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .kpi { padding: 12px 11px 13px 14px; }
+  .kpi .v { font-size: 23px; }
+  .kpi .k { font-size: 10px; }
+  .kpi .sub { font-size: 9px; }
+  .vtabs { display: flex; }
+  .vtabs button { padding: 5px 9px; font-size: 10.5px; }
+  .trange .tr-custom { flex-wrap: wrap; }
+  .trange input[type=datetime-local] { min-width: 0; max-width: 100%; }
+  .exp-nm { min-width: 0; overflow-wrap: anywhere; }
+  .exp-row { flex-wrap: wrap; }
+  .savebar { bottom: 8px; flex-wrap: wrap; padding: 12px 14px; }
+  .savebar .hint, .savebar .restart-note { font-size: 10px; }
+  #logBox { font-size: 10.5px; padding: 15px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .view:not([hidden]) { animation: console-appear .2s ease-out; }
+  @keyframes console-appear { from { opacity: .35; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+}
+
 </style>
 </head>
 <body>
+<a class="skip-link" href="#mainContent">跳到主要内容</a>
 <div class="shell">
-  <nav class="nav">
-    <div class="brand">
-      <div class="name">WorkBuddy2API</div>
-      <div class="sub" id="navSub">控制台</div>
-    </div>
-    <ul>
-      <li><a href="#checkin" data-view="checkin" class="on">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="3" width="11.6" height="10" rx="1.8"/><path d="M2.2 6.2h11.6M5 1.8v2.4M11 1.8v2.4"/><path d="m6.2 9 1.4 1.4L10 8"/></svg>
+<nav aria-label="控制台导航" class="nav">
+<div class="brand"><span aria-hidden="true" class="brand-mark"><svg fill="none" viewbox="0 0 24 24"><path d="M4 6.5 8.5 18 12 9.5 15.5 18 20 6.5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"></path></svg></span>
+
+
+<div class="brand-copy"><div class="name">WorkBuddy2API</div><div class="sub" id="navSub">控制台</div></div></div>
+<ul>
+<li aria-hidden="true" class="nav-section-label">工作台</li><li><a class="on" data-view="checkin" href="#checkin">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><rect height="10" rx="1.8" width="11.6" x="2.2" y="3"></rect><path d="M2.2 6.2h11.6M5 1.8v2.4M11 1.8v2.4"></path><path d="m6.2 9 1.4 1.4L10 8"></path></svg>
         签到池</a></li>
-      <li><a href="#usage" data-view="usage">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
+<li><a data-view="usage" href="#usage">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><path d="M2 13.5h12"></path><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"></path></svg>
         用量</a></li>
-      <li><a href="#packages" data-view="packages">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
+<li><a data-view="packages" href="#packages">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"></path><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"></path></svg>
         积分构成</a></li>
-      <li><a href="#taskscenter" data-view="taskscenter">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
+<li><a data-view="taskscenter" href="#taskscenter">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><path d="M3 2.5h10v9H8l-3 3v-3H3z"></path><path d="M6 6.5h4M6 9h2.5"></path></svg>
         任务中心</a></li>
-      <li><a href="#ideaccounts" data-view="ideaccounts">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2.2 2 8l4 5.8M10 2.2 14 8l-4 5.8"/></svg>
+<li><a data-view="ideaccounts" href="#ideaccounts">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><path d="M6 2.2 2 8l4 5.8M10 2.2 14 8l-4 5.8"></path></svg>
         IDE 账号池</a></li>
-      <li><a href="#models" data-view="models">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
+<li><a data-view="models" href="#models">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"></path><path d="M2 5l6 3.2L14 5M8 8.2v6"></path></svg>
         模型与档位</a></li>
-      <li><a href="#config" data-view="config">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
+<li aria-hidden="true" class="nav-section-label system">系统管理</li><li><a data-view="config" href="#config">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><circle cx="8" cy="8" r="2.2"></circle><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"></path></svg>
         配置</a></li>
-      <li><a href="#logs" data-view="logs">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
+<li><a data-view="logs" href="#logs">
+<svg fill="none" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"></path></svg>
         运行日志</a></li>
-    </ul>
-    <div class="sig">
-      <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
-      <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
-    </div>
-  </nav>
+</ul>
+<div class="sig">
+<div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
+<div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+</div>
+</nav>
+<div class="main" id="mainContent" role="main" tabindex="-1">
+<div class="topbar"><span class="breadcrumb-root">工作空间</span><span aria-hidden="true" class="sep">›</span>
+<h2 id="ttl">签到池</h2>
 
-  <div class="main">
-    <div class="topbar">
-      <h2 id="ttl">签到池</h2>
-      <span class="sep">/</span>
-      <span class="meta" id="subMeta">-</span>
-      <div class="grow"></div>
-      <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
-        <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
-      </button>
-      <button id="btnRefresh">刷新</button>
-      <button class="primary" id="btnAdd">添加账号</button>
-    </div>
 
+<div class="grow"></div><span class="meta" id="subMeta">正在连接</span>
+<button aria-label="切换主题" class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）">
+<svg fill="none" height="15" id="icoTheme" stroke="currentColor" stroke-width="1.4" viewbox="0 0 16 16" width="15"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"></path></svg>
+</button>
+<button id="btnRefresh"><svg aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" viewbox="0 0 16 16"><path d="M13 6A5.2 5.2 0 1 0 13 10M13 2v4H9"></path></svg>刷新</button>
+<button class="primary" id="btnAdd"><svg aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" viewbox="0 0 16 16"><path d="M8 3v10M3 8h10"></path></svg>添加账号</button>
+</div>
+
+<div class="page-intro"><div><div class="page-eyebrow" id="pageEyebrow">DAILY WORKSPACE</div><h1 id="pageTitle">签到池</h1><p id="pageDescription">查看各平台账号状态，集中完成每日签到与凭证维护。</p></div><div class="page-context" aria-hidden="true"><span class="page-context-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="4" width="14" height="13" rx="3"/><path d="M3 8h14M7 2v4M13 2v4m-6 6 2 2 4-4"/></svg></span><span><span id="pageContextLabel">跨平台账号管理</span><small id="pageContextDetail">YOUR DAILY ROUTINE</small></span></div></div>
     <!-- 切号冻结提示条：切号后显示，点击即解冻并刷新当前视图 -->
     <div class="freeze-bar" id="freezeBar" hidden></div>
 
@@ -782,123 +1152,113 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
          只是不再有独立页面 —— 签到池的「一键签到」覆盖主号池，账号明细走用量/积分页。 -->
 
     <!-- 签到池 -->
-    <section class="view" id="view-checkin" hidden>
-      <div class="box">
-        <header>
-          <h3>一键签到</h3>
-          <span class="grow"></span>
-          <span class="note" id="ckMasterNote"></span>
-          <button class="primary" id="btnCkMaster">一键签到</button>
-        </header>
-        <div class="state" id="ckMasterState" hidden></div>
-      </div>
+    <section class="view" hidden="" id="view-checkin">
+<div class="box checkin-command">
+<header><div aria-hidden="true" class="command-symbol"><svg fill="none" stroke="currentColor" stroke-width="1.7" viewbox="0 0 24 24"><rect height="16" rx="4" width="16" x="4" y="5"></rect><path d="M4 10h16M8 3v4M16 3v4m-7 8 2 2 4-4"></path></svg></div><div class="command-copy"><h3>一键签到</h3><p>一键完成多平台签到，结果会在对应账号下更新。</p></div>
 
-      <div class="box">
-        <header>
-          <h3>WorkBuddy 签到</h3>
-          <span class="grow"></span>
-          <span class="note" id="ckWbSummary"></span>
-        </header>
-        <div class="state" id="ckWbState"><span class="dots">加载中</span></div>
-        <div id="ckWbList"></div>
-      </div>
 
-      <div class="box">
-        <header>
-          <h3>Qoder 签到</h3>
-          <span class="grow"></span>
-          <span class="note" id="ckQoderSummary"></span>
-          <button class="xs primary" id="btnCkQoderCheckinAll">全部签到</button>
-        </header>
-        <div class="state" id="ckQoderState"><span class="dots">加载中</span></div>
-        <div id="ckQoderList"></div>
-        <!-- 一键签到的七相分桶结果（claimed/already/blocked/pending/failed/login_required/error） -->
-        <div id="ckQoderBuckets"></div>
-      </div>
+<span class="note" id="ckMasterNote"></span>
+<button class="primary" id="btnCkMaster">一键签到</button>
+</header>
+<div class="state" hidden="" id="ckMasterState"></div>
+</div>
+<div class="box checkin-platform" data-platform="wb">
+<header><span aria-hidden="true" class="platform-mark">WB</span><div class="platform-copy"><h3>WorkBuddy 签到</h3><span class="note" id="ckWbSummary"></span></div>
 
-      <div class="box">
-        <header>
-          <h3>MiniMax 签到</h3>
-          <span class="grow"></span>
-          <span class="note" id="ckMmSummary"></span>
-          <button class="xs" id="btnMmRenewAll" title="给号池全部账号续期凭证（token 只有 1 小时，定时任务每 30 分钟也会自动续）">全部续期</button>
-          <button class="xs primary" id="btnMmCheckinAll">全部签到</button>
-        </header>
-        <div class="state" id="ckMmState"><span class="dots">加载中</span></div>
-        <div id="ckMmList"></div>
-      </div>
 
-      <div class="box">
-        <header>
-          <h3>CodeArts 签到</h3>
-          <span class="grow"></span>
-          <span class="note" id="ckCaSummary"></span>
-          <button class="xs primary" id="btnCaCheckinAll">全部签到</button>
-        </header>
-        <div class="state" id="ckCaState"><span class="dots">加载中</span></div>
-        <div id="ckCaList"></div>
-      </div>
 
-      <div class="box">
-        <header>
-          <h3>豆包签到</h3>
-          <span class="grow"></span>
-          <span class="note" id="ckDbSummary"></span>
-          <button class="xs primary" id="btnDbCheckinAll">全部签到</button>
-        </header>
-        <div class="state" id="ckDbState"><span class="dots">加载中</span></div>
-        <div id="ckDbList"></div>
-      </div>
+</header>
+<div class="state" id="ckWbState"><span class="dots">加载中</span></div>
+<div id="ckWbList"></div>
+</div>
+<div class="box checkin-platform" data-platform="qoder">
+<header><span aria-hidden="true" class="platform-mark">Q</span><div class="platform-copy"><h3>Qoder 签到</h3><span class="note" id="ckQoderSummary"></span></div>
 
-      <div class="box">
-        <header>
-          <h3>Trae 签到</h3>
-          <span class="grow"></span>
-          <span class="note" id="traeSummary"></span>
-          <button class="xs" id="btnTraeRenew" title="检查并续期全部 Trae 账号的凭证（浏览器通道较慢）">全部续期</button>
-          <button class="xs primary" id="btnTraeCheckinAll">一键签到</button>
-        </header>
-        <div class="state" id="traeState"><span class="dots">加载中</span></div>
-        <div id="traeList"></div>
-      </div>
 
-      <!-- 积分总览：Trae / Qoder / WorkBuddy，统一「账号 / 积分余额 / 签到可得」三列 -->
-      <div class="box">
-        <header>
-          <h3>积分总览</h3>
-          <span class="grow"></span>
-          <span class="note" id="tcNote"></span>
-          <button class="xs" id="btnTcRefresh">刷新</button>
-        </header>
 
-        <div class="pad"><div class="ck-group">Trae</div></div>
-        <div class="state" id="tcState"><span class="dots">加载中</span></div>
-        <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
-            <tbody id="tcBody"></tbody>
-          </table>
-        </div>
+<button class="xs primary" id="btnCkQoderCheckinAll">全部签到</button>
+</header>
+<div class="state" id="ckQoderState"><span class="dots">加载中</span></div>
+<div id="ckQoderList"></div>
+<!-- 一键签到的七相分桶结果（claimed/already/blocked/pending/failed/login_required/error） -->
+<div id="ckQoderBuckets"></div>
+</div>
+<div class="box checkin-platform" data-platform="minimax">
+<header><span aria-hidden="true" class="platform-mark">M</span><div class="platform-copy"><h3>MiniMax 签到</h3><span class="note" id="ckMmSummary"></span></div>
 
-        <div class="pad"><div class="ck-group">Qoder</div></div>
-        <div class="state" id="qkState"><span class="dots">加载中</span></div>
-        <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
-            <tbody id="qkBody"></tbody>
-          </table>
-        </div>
 
-        <div class="pad"><div class="ck-group">WorkBuddy</div></div>
-        <div class="state" id="wkState"><span class="dots">加载中</span></div>
-        <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
-            <tbody id="wkBody"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
+
+<button class="xs" id="btnMmRenewAll" title="给号池全部账号续期凭证（token 只有 1 小时，定时任务每 30 分钟也会自动续）">全部续期</button>
+<button class="xs primary" id="btnMmCheckinAll">全部签到</button>
+</header>
+<div class="state" id="ckMmState"><span class="dots">加载中</span></div>
+<div id="ckMmList"></div>
+</div>
+<div class="box checkin-platform" data-platform="codearts">
+<header><span aria-hidden="true" class="platform-mark">CA</span><div class="platform-copy"><h3>CodeArts 签到</h3><span class="note" id="ckCaSummary"></span></div>
+
+
+
+<button class="xs primary" id="btnCaCheckinAll">全部签到</button>
+</header>
+<div class="state" id="ckCaState"><span class="dots">加载中</span></div>
+<div id="ckCaList"></div>
+</div>
+<div class="box checkin-platform" data-platform="doubao">
+<header><span aria-hidden="true" class="platform-mark">豆</span><div class="platform-copy"><h3>豆包签到</h3><span class="note" id="ckDbSummary"></span></div>
+
+
+
+<button class="xs primary" id="btnDbCheckinAll">全部签到</button>
+</header>
+<div class="state" id="ckDbState"><span class="dots">加载中</span></div>
+<div id="ckDbList"></div>
+</div>
+<div class="box checkin-platform" data-platform="trae">
+<header><span aria-hidden="true" class="platform-mark">TR</span><div class="platform-copy"><h3>Trae 签到</h3><span class="note" id="traeSummary"></span></div>
+
+
+
+<button class="xs" id="btnTraeRenew" title="检查并续期全部 Trae 账号的凭证（浏览器通道较慢）">全部续期</button>
+<button class="xs primary" id="btnTraeCheckinAll">一键签到</button>
+</header>
+<div class="state" id="traeState"><span class="dots">加载中</span></div>
+<div id="traeList"></div>
+</div>
+<!-- 积分总览：Trae / Qoder / WorkBuddy，统一「账号 / 积分余额 / 签到可得」三列 -->
+<div class="box checkin-credits">
+<header>
+<h3>积分总览</h3>
+<span class="grow"></span>
+<span class="note" id="tcNote"></span>
+<button class="xs" id="btnTcRefresh">刷新</button>
+</header>
+<div class="pad"><div class="ck-group">Trae</div></div>
+<div class="state" id="tcState"><span class="dots">加载中</span></div>
+<div class="tbl-wrap">
+<table class="acc">
+<thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
+<tbody id="tcBody"></tbody>
+</table>
+</div>
+<div class="pad"><div class="ck-group">Qoder</div></div>
+<div class="state" id="qkState"><span class="dots">加载中</span></div>
+<div class="tbl-wrap">
+<table class="acc">
+<thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
+<tbody id="qkBody"></tbody>
+</table>
+</div>
+<div class="pad"><div class="ck-group">WorkBuddy</div></div>
+<div class="state" id="wkState"><span class="dots">加载中</span></div>
+<div class="tbl-wrap">
+<table class="acc">
+<thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
+<tbody id="wkBody"></tbody>
+</table>
+</div>
+</div>
+</section>
 
     <!-- IDE 账号（Qoder / Trae / WorkBuddy 切号） -->
     <section class="view" id="view-ideaccounts" hidden>
@@ -1565,226 +1925,203 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <!-- 添加账号 -->
 <div class="veil" id="addVeil">
-  <div class="dlg">
-    <header>
-      <h3>添加账号</h3>
-      <div class="tabs" id="addTabs">
-        <button class="tab on" data-tab="wb">WorkBuddy</button>
-        <button class="tab" data-tab="trae">Trae</button>
-        <button class="tab" data-tab="qoder">Qoder</button>
-        <button class="tab" data-tab="minimax">MiniMax</button>
-        <button class="tab" data-tab="doubao">豆包</button>
-        <button class="tab" data-tab="codearts">华为 CodeArts</button>
-        <button class="tab" data-tab="import">导入 JSON</button>
-      </div>
-    </header>
-    <div class="body">
-      <!-- WorkBuddy 浏览器登录（国内版 / 国际版） -->
-      <div id="addTabWb" class="tab-panel">
-        <div id="addPick">
-          <div class="realm-row">
-            <span class="hint" style="font-size:12px">版本：</span>
-            <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
-            <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
-          </div>
-        </div>
-        <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
-        <div id="addReady" hidden>
-          <div class="state">在浏览器打开以下链接并登录：</div>
-          <div class="url" id="addUrl"></div>
-          <div class="state"><span class="dots">等待授权完成，自动检测中</span></div>
-        </div>
-        <div id="addDone" class="state ok" hidden></div>
-        <div id="addErr" class="state err" hidden></div>
-        <div style="margin-top:10px">
-          <button id="btnWbSyncPool">同步本机已登录的 WorkBuddy 账号</button>
-        </div>
-      </div>
-      <!-- Trae 登录（trae.cn，与 WorkBuddy 是两套独立账号体系） -->
-      <div id="addTabTrae" class="tab-panel" hidden>
-        <div class="state" style="margin-bottom:8px">
+  <div class="dlg import-dialog" role="dialog" aria-modal="true" aria-labelledby="addDialogTitle">
+    <header class="import-header"><div><div class="import-kicker">账号中心</div><h3 id="addDialogTitle">添加平台账号</h3><p>选择平台，按对应方式完成授权或导入。</p></div><button id="btnCloseAdd" class="import-close" type="button" aria-label="关闭添加账号窗口">×</button></header>
+    <div class="import-workspace">
+      <nav class="import-nav" aria-label="选择账号平台"><div class="import-nav-label">选择平台 <span>7</span></div><div class="tabs" id="addTabs" role="tablist" aria-label="账号平台" aria-orientation="vertical"><button class="tab on" id="addNav-wb" data-tab="wb" role="tab" aria-controls="addTabWb" aria-selected="true" tabindex="0"><span class="import-nav-icon" data-platform="wb" aria-hidden="true">WB</span><span class="import-nav-copy"><b>WorkBuddy</b><small>网页授权</small></span><span class="import-nav-arrow" aria-hidden="true">›</span></button><button class="tab" id="addNav-trae" data-tab="trae" role="tab" aria-controls="addTabTrae" aria-selected="false" tabindex="-1"><span class="import-nav-icon" data-platform="trae" aria-hidden="true">TR</span><span class="import-nav-copy"><b>Trae</b><small>授权返回地址</small></span><span class="import-nav-arrow" aria-hidden="true">›</span></button><button class="tab" id="addNav-qoder" data-tab="qoder" role="tab" aria-controls="addTabQoder" aria-selected="false" tabindex="-1"><span class="import-nav-icon" data-platform="qoder" aria-hidden="true">Q</span><span class="import-nav-copy"><b>Qoder</b><small>网页授权</small></span><span class="import-nav-arrow" aria-hidden="true">›</span></button><button class="tab" id="addNav-minimax" data-tab="minimax" role="tab" aria-controls="addTabMinimax" aria-selected="false" tabindex="-1"><span class="import-nav-icon" data-platform="minimax" aria-hidden="true">M</span><span class="import-nav-copy"><b>MiniMax</b><small>验证码授权</small></span><span class="import-nav-arrow" aria-hidden="true">›</span></button><button class="tab" id="addNav-doubao" data-tab="doubao" role="tab" aria-controls="addTabDoubao" aria-selected="false" tabindex="-1"><span class="import-nav-icon" data-platform="doubao" aria-hidden="true">豆</span><span class="import-nav-copy"><b>豆包</b><small>Cookie / 请求标头</small></span><span class="import-nav-arrow" aria-hidden="true">›</span></button><button class="tab" id="addNav-codearts" data-tab="codearts" role="tab" aria-controls="addTabCodearts" aria-selected="false" tabindex="-1"><span class="import-nav-icon" data-platform="codearts" aria-hidden="true">CA</span><span class="import-nav-copy"><b>华为 CodeArts</b><small>Cookie 验证</small></span><span class="import-nav-arrow" aria-hidden="true">›</span></button><button class="tab" id="addNav-import" data-tab="import" role="tab" aria-controls="addTabImport" aria-selected="false" tabindex="-1"><span class="import-nav-icon" data-platform="import" aria-hidden="true">{ }</span><span class="import-nav-copy"><b>JSON 文件</b><small>批量导入</small></span><span class="import-nav-arrow" aria-hidden="true">›</span></button></div><div class="import-nav-note">每个平台使用独立账号，选择对应的导入方式。</div></nav>
+      <div class="body import-content"><div class="import-platform-heading"><div class="import-platform-mark" id="addPlatformMark" data-platform="wb" aria-hidden="true">WB</div><div class="import-platform-copy"><h4 id="addPlatformTitle">WorkBuddy</h4><p id="addPlatformSubtitle">在官方网页完成授权，账号会自动添加。</p></div><span id="addMethodBadge" class="import-method-badge">网页授权</span></div><div id="addTabWb" class="tab-panel" role="tabpanel" aria-labelledby="addNav-wb"><div class="import-flow" aria-label="操作流程"><span><b>01</b>选择版本</span><span><b>02</b>网页授权</span><span><b>03</b>自动添加</span></div><div class="import-card"><div class="import-card-title">选择账号版本</div><p class="import-note">与你要登录的 WorkBuddy 版本保持一致。</p>
+<div id="addPick">
+<div class="realm-row">
+<span class="hint" style="font-size:12px">版本：</span>
+<label class="realm-opt"><input checked="" name="addRealm" type="radio" value="cn"/> 国内版（CN）</label>
+<label class="realm-opt"><input name="addRealm" type="radio" value="global"/> 国际版（Global）</label>
+</div>
+</div>
+<div class="state" hidden="" id="addLoad"><span class="dots">正在获取授权链接</span></div>
+<div hidden="" id="addReady">
+<div class="state">在浏览器打开以下链接并登录：</div>
+<div class="url" id="addUrl"></div>
+<div class="state"><span class="dots">等待授权完成，自动检测中</span></div>
+</div>
+<div class="state ok" hidden="" id="addDone"></div>
+<div class="state err" hidden="" id="addErr"></div>
+
+</div><details class="import-alternative" id="wbDesktopOptions" hidden><summary>从本机客户端同步</summary><div style="margin-top:10px">
+<button id="btnWbSyncPool">同步本机已登录的 WorkBuddy 账号</button>
+</div></details></div><div id="addTabTrae" class="tab-panel" role="tabpanel" aria-labelledby="addNav-trae" hidden><div class="import-flow" aria-label="操作流程"><span><b>01</b>打开登录页</span><span><b>02</b>复制返回地址</span><span><b>03</b>验证并导入</span></div><div class="import-card">
+<div class="import-description">
           在官方网页完成登录，再把授权返回地址粘贴到这里。账号由服务器保存并自动续期。
         </div>
-        <button id="btnTraeManualStart" class="primary">获取网页登录链接</button>
-        <div id="addTraeManualReady" hidden>
-          <p><a id="traeManualAuthLink" target="_blank" rel="noopener noreferrer">打开 TRAE 官方登录页</a></p>
-          <p class="note">完成登录并点击「登录并打开 TRAE」后，浏览器可能显示「无法访问此网站」。请复制此时地址栏里以 http://127.0.0.1: 开头的完整地址，返回这里粘贴。无需启动本机程序。链接 15 分钟内有效。</p>
-          <label for="traeManualReturn">授权返回地址</label>
-          <textarea id="traeManualReturn" rows="4" autocomplete="off" autocapitalize="none" spellcheck="false" style="width:100%;box-sizing:border-box;margin:8px 0" placeholder="http://127.0.0.1:端口/authorize?…"></textarea>
-          <button id="btnTraeManualImport" class="primary">验证并导入账号</button>
-          <p class="note">返回地址包含登录凭证，仅粘贴到此面板；导入成功后会清空。</p>
-        </div>
-        <div id="addTraeDone" class="state ok" hidden></div>
-        <div id="addTraeErr" class="state err" hidden></div>
-        <details style="margin-top:16px">
-          <summary>桌面版其他添加方式</summary>
-        <div class="state" style="margin-bottom:8px">
+<button class="primary" id="btnTraeManualStart">获取网页登录链接</button>
+<div hidden="" id="addTraeManualReady">
+<p><a id="traeManualAuthLink" rel="noopener noreferrer" target="_blank">打开 TRAE 官方登录页</a></p>
+<p class="note">完成登录并点击「登录并打开 TRAE」后，浏览器可能显示「无法访问此网站」。请复制此时地址栏里以 http://127.0.0.1: 开头的完整地址，返回这里粘贴。无需启动本机程序。链接 15 分钟内有效。</p>
+<label for="traeManualReturn">授权返回地址</label>
+<textarea autocapitalize="none" autocomplete="off" id="traeManualReturn" placeholder="http://127.0.0.1:端口/authorize?…" rows="4" spellcheck="false" style="width:100%;box-sizing:border-box;margin:8px 0"></textarea>
+<button class="primary" id="btnTraeManualImport">验证并导入账号</button>
+<p class="note">返回地址包含登录凭证，仅粘贴到此面板；导入成功后会清空。</p>
+</div>
+<div class="state ok" hidden="" id="addTraeDone"></div>
+<div class="state err" hidden="" id="addTraeErr"></div>
+<details class="import-alternative" hidden="" id="traeDesktopOptions" style="margin-top:16px">
+<summary>桌面版其他添加方式</summary>
+<div class="state" style="margin-bottom:8px">
           点「打开登录窗口」后，面板会拉起一个<b>独立浏览器窗口</b>（每次全新会话），登录要添加的 Trae 账号即可。
         </div>
-        <div id="addTraeLoad" class="state" hidden><span class="dots">正在启动浏览器</span></div>
-        <div id="addTraeReady" hidden>
-          <div class="state"><span class="dots">等待你在浏览器中完成 Trae 登录（面板会自动识别）</span></div>
-        </div>
-        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnTraeStart" class="primary">打开登录窗口</button>
-          <button id="btnTraeStop" hidden>关闭登录窗口</button>
-          <button id="btnTraeClientSync">从本机客户端提取当前账号</button>
-        </div>
-        </details>
-      </div>
-      <!-- Qoder：浏览器登录（客户端接管） / 捕获本机当前登录态 -->
-      <div id="addTabQoder" class="tab-panel" hidden>
-        <div class="state" id="addQoderCur" style="margin-bottom:8px">正在读取本机 Qoder 登录态…</div>
-        <div id="addQoderDone" class="state ok" hidden></div>
-        <div id="addQoderErr" class="state err" hidden></div>
-        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnQoderWeb" class="primary">网页登录并添加</button>
-          <button id="btnQoderLogin">客户端浏览器登录</button>
-          <button id="btnQoderCapture">添加当前 Qoder 账号</button>
-        </div>
-        <label class="hint" style="margin-top:10px;display:flex;gap:6px;align-items:flex-start;cursor:pointer">
-          <input type="checkbox" id="chkQoderLogout" style="margin-top:2px">
-          <span>「客户端浏览器登录」时勾选这一项：先退出当前账号再登录另一个号。服务端在**登录时**给账号发"这个人"的身份（scope），面板直接写登录态不会重新签发，两个号就会被算成同一个人、每天只能领一份 100 积分。</span>
-        </label>
-        <div id="addQoderWebBox" hidden style="margin-top:10px">
-          <div class="state"><span class="dots" id="addQoderWebState">已打开浏览器（这个账号的独立会话），请登录要添加的 Qoder 账号…</span></div>
-          <div id="addQoderWebErr" class="state err" hidden style="margin-top:8px"></div>
-        </div>
-        <div id="addQoderLoginBox" hidden style="margin-top:10px">
-          <div class="state"><span class="dots" id="addQoderLoginState">已启动 Qoder 客户端，请在客户端里点「浏览器登录 / 扫码登录」完成鉴权…</span></div>
-          <div id="addQoderLoginErr" class="state err" hidden style="margin-top:8px"></div>
-        </div>
-        <div class="hint" style="margin-top:10px">
-          <b>网页登录</b>：每个号一个独立浏览器会话（profile 存在本机），你在浏览器里登录一次即可，之后每天由面板用这份会话自动领取每日 100 积分 —— <b>不需要再登客户端，也不需要每次登网页</b>。<br>
-          <b>客户端浏览器登录</b>：启动 Qoder 客户端，在客户端里用浏览器/扫码完成鉴权，面板自动收录这个号。
-        </div>
-      </div>
-      <!-- MiniMax：浏览器登录（设备码）/ 捕获客户端登录态 / 粘贴 access+refresh token -->
-      <div id="addTabMinimax" class="tab-panel" hidden>
-        <div class="state" id="addMmCur" style="margin-bottom:8px">正在读取本机 MiniMax Code 登录态…</div>
-        <div id="addMmDone" class="state ok" hidden></div>
-        <div id="addMmErr" class="state err" hidden></div>
-        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnMmCapture" class="primary">添加当前 MiniMax 账号</button>
-          <button id="btnMmToggleManual">改用粘贴 Token</button>
-        </div>
-        <div id="addMmManual" hidden style="margin-top:12px">
-          <div class="hint" style="margin-bottom:6px">粘贴 access_token（mmoat_ 开头）与 refresh_token（mmort_ 开头）。适合添加未在本机登录的账号。</div>
-          <input type="text" id="mmAccessInput" placeholder="access_token (mmoat_...)" style="width:100%;margin-bottom:6px">
-          <input type="text" id="mmRefreshInput" placeholder="refresh_token (mmort_...)（可选）" style="width:100%;margin-bottom:8px">
-          <button id="btnMmAddManual" class="primary">保存账号</button>
-        </div>
-        <!-- 浏览器登录：OAuth 设备码授权（RFC 8628 + S256 PKCE） -->
-        <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
-          <div class="realm-row" style="margin-bottom:8px">
-            <span class="hint" style="font-size:12px">版本：</span>
-            <label class="realm-opt"><input type="radio" name="mmRealm" value="cn" checked> 国内版（CN）</label>
-            <label class="realm-opt"><input type="radio" name="mmRealm" value="global"> 国际版（Global）</label>
-          </div>
-          <div class="hint" style="margin-bottom:8px">
+<div class="state" hidden="" id="addTraeLoad"><span class="dots">正在启动浏览器</span></div>
+<div hidden="" id="addTraeReady">
+<div class="state"><span class="dots">等待你在浏览器中完成 Trae 登录（面板会自动识别）</span></div>
+</div>
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<button class="primary" id="btnTraeStart">打开登录窗口</button>
+<button hidden="" id="btnTraeStop">关闭登录窗口</button>
+<button id="btnTraeClientSync">从本机客户端提取当前账号</button>
+</div>
+</details>
+</div></div><div id="addTabQoder" class="tab-panel" role="tabpanel" aria-labelledby="addNav-qoder" hidden><div class="import-flow" aria-label="操作流程"><span><b>01</b>选择地区</span><span><b>02</b>网页授权</span><span><b>03</b>自动添加</span></div><div class="import-card"><div class="import-card-title">连接你的 Qoder 账号</div>
+<div class="import-description" id="addQoderCur" style="margin-bottom:8px">通过官方网页授权添加账号，完成后由面板保存凭证。</div>
+<div class="state ok" hidden="" id="addQoderDone"></div>
+<div class="state err" hidden="" id="addQoderErr"></div>
+<label for="qdDeviceRegion">账号地区</label>
+<select class="import-region-select" id="qdDeviceRegion"><option value="cn">国内版（qoder.com.cn）</option><option value="intl">国际版（qoder.com）</option></select>
+<button class="primary" id="btnQoderDevice">网页登录并添加</button>
+<div hidden="" id="qdDeviceBox" style="margin-top:12px">
+<div class="state" id="qdDeviceState">正在生成登录链接…</div>
+<a class="import-open-link" hidden="" id="qdDeviceUrl" rel="noopener noreferrer" target="_blank">打开 Qoder 官方授权网页 ↗</a>
+<div class="hint" style="margin-top:8px">在网页中登录并确认授权，再回到这里等待账号显示。若提示打开 Qoder 应用，可取消该提示。</div>
+<button hidden="" id="btnQoderDeviceRetry">重新检查授权结果</button>
+<div class="state err" hidden="" id="qdDeviceErr"></div>
+</div>
+<details class="import-alternative" hidden="" id="qoderDesktopOptions" style="margin-top:12px">
+<summary>本机 Windows 登录方式</summary>
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<button id="btnQoderWeb">服务器浏览器登录</button>
+<button id="btnQoderLogin">客户端浏览器登录</button>
+<button id="btnQoderCapture">添加当前 Qoder 账号</button>
+</div>
+<label class="hint"><input id="chkQoderLogout" type="checkbox"/>客户端登录前退出当前账号</label>
+<div hidden="" id="addQoderWebBox"><div class="state" id="addQoderWebState"></div><div class="state err" hidden="" id="addQoderWebErr"></div></div>
+<div hidden="" id="addQoderLoginBox"><div class="state" id="addQoderLoginState"></div><div class="state err" hidden="" id="addQoderLoginErr"></div></div>
+</details>
+</div></div><div id="addTabMinimax" class="tab-panel" role="tabpanel" aria-labelledby="addNav-minimax" hidden><div class="import-flow" aria-label="操作流程"><span><b>01</b>获取验证码</span><span><b>02</b>网页授权</span><span><b>03</b>自动添加</span></div><div class="state ok" hidden="" id="addMmDone"></div><div class="state err" hidden="" id="addMmErr"></div><div class="import-card">
+<div class="realm-row" style="margin-bottom:8px">
+<span class="hint" style="font-size:12px">版本：</span>
+<label class="realm-opt"><input checked="" name="mmRealm" type="radio" value="cn"/> 国内版（CN）</label>
+<label class="realm-opt"><input name="mmRealm" type="radio" value="global"/> 国际版（Global）</label>
+</div>
+<div class="hint" style="margin-bottom:8px">
             浏览器登录：点按钮拿到验证码与授权链接，在浏览器里登录要添加的 MiniMax 账号，授权完自动入池并签到。
             授权窗口只有 5 分钟，超时了点按钮重发。
           </div>
-          <button id="btnMmLogin" class="primary">浏览器登录添加账号</button>
-          <div id="addMmLoginBox" hidden style="margin-top:10px">
-            <div class="state">在浏览器打开下面的链接，输入验证码完成登录：</div>
-            <div class="url" id="mmLoginUrl"></div>
-            <div class="state">验证码 <b id="mmLoginCode"></b> · 剩余 <span id="mmLoginCountdown">--</span></div>
-            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-              <button id="btnMmLoginOpen" class="primary">打开授权页</button>
-              <button id="btnMmLoginCopy">复制验证码</button>
-            </div>
-            <div id="addMmLoginErr" class="state err" hidden style="margin-top:8px"></div>
-          </div>
-        </div>
-      </div>
-      <!-- 豆包：浏览器登录（自拉浏览器） / 客户端登录+提取 / 手动粘贴 Cookie -->
-      <div id="addTabDoubao" class="tab-panel" hidden>
-        <div class="state" id="addDbCur" style="margin-bottom:8px">豆包签到用的就是网页 Cookie（sessionid / ttwid / msToken），所以两种加号方式拿到的是同一批凭据：<b>浏览器登录</b>（面板自拉一个干净浏览器窗口，你在网页版登录）或 <b>客户端登录</b>（拉起豆包客户端登录，再提取它的 Cookie）。</div>
-        <div id="addDbDone" class="state ok" hidden></div>
-        <div id="addDbErr" class="state err" hidden></div>
-        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnDbBrowser" class="primary">浏览器登录并添加</button>
-          <button id="btnDbClient">客户端登录并添加</button>
-          <button id="btnDbToggleManual">改用粘贴 Cookie</button>
-        </div>
-        <div id="addDbBrowserBox" hidden style="margin-top:10px">
-          <div class="state"><span class="dots" id="addDbBrowserState">已打开浏览器，请登录豆包账号…</span></div>
-          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-            <button id="btnDbBrowserStop">关闭登录窗口</button>
-          </div>
-          <div id="addDbBrowserErr" class="state err" hidden style="margin-top:8px"></div>
-        </div>
-        <div id="addDbManual" hidden style="margin-top:12px">
-          <div class="hint" style="margin-bottom:6px">粘贴完整 Cookie 串（浏览器 F12 → Network 任意 doubao.com 请求 → Request Headers → Cookie，需含 sessionid）。</div>
-          <textarea id="dbCookieInput" rows="4" placeholder="sessionid=...; ttwid=...; msToken=..." style="width:100%;margin-bottom:8px"></textarea>
-          <button id="btnDbAddCookie" class="primary">保存账号</button>
-        </div>
-      </div>
-      <!-- CodeArts：明确选择正确域名，并只复制 Cookie 的值。 -->
-      <div id="addTabCodearts" class="tab-panel" hidden>
-        <div class="state">在当前电脑浏览器完成登录，复制 Cookie 的值，交给面板验证并保存。</div>
-        <ol class="ca-steps">
-          <li>
-            <span class="ca-step-title">打开华为码道并登录</span>
-            <a href="https://devcloud.cn-north-4.huaweicloud.com/chat/" target="_blank" rel="noopener noreferrer">打开华为码道网页登录 ↗</a>
-            <div class="hint">登录后留在码道网页，按 F12，切换到「网络 / Network」。</div>
-          </li>
-          <li>
-            <span class="ca-step-title">筛选账号请求，再刷新网页</span>
-            <div>在网络面板的筛选框中输入：</div>
-            <div class="ca-filter"><code>package/overview</code><button id="btnCaCopyFilter" type="button">复制筛选词</button></div>
-            <div>刷新网页，点击出现的 <b>overview</b> 请求，核对请求地址：</div>
-            <code class="ca-request">https://devcloud.cn-north-4.huaweicloud.com/chat/snap-manager/v1/package/overview</code>
-            <div class="ca-wrong-request">请跳过 <b>furiondata.myhuaweicloud.com</b> 和 <b>/furiondataserver/fr</b>，它们不是这里需要的码道登录请求。</div>
-            <details class="hint">
-              <summary>筛选后没有请求，或找不到 Cookie？</summary>
-              <p>确认网页已登录，再打开「活动福利」触发请求。仍没有结果时，清空筛选，选择发往 devcloud.cn-north-4.huaweicloud.com 的 /chat/ 请求，查找请求标头中的 Cookie 一项。</p>
-            </details>
-          </li>
-          <li>
-            <span class="ca-step-title">只复制 Cookie 这一项的值</span>
-            <div>在所选请求中打开 <b>标头 → 请求标头 / Request Headers</b>，找到 <b>Cookie</b>，右键选择 <b>复制值 / Copy value</b>。</div>
-            <div class="ca-example"><span class="hint">正确值示例（仅展示格式）：</span><code>name=value; name2=value2; name3=value3</code></div>
-            <div class="hint" style="margin-top:7px">请勿复制以 GET / POST 开头的整段请求标头。也不要使用 document.cookie，它读不到 HttpOnly 登录票据。</div>
-          </li>
-          <li>
-            <span class="ca-step-title">粘贴 Cookie 值并导入</span>
-            <label for="caCookieInput" class="ca-field">Cookie 值（只粘贴 name=value; …）</label>
-            <textarea id="caCookieInput" rows="4" autocomplete="off" spellcheck="false" aria-describedby="caCookieHint" placeholder="只粘贴 Cookie 的值，例如 name=value; name2=value2" style="width:100%;box-sizing:border-box"></textarea>
-            <div id="caCookieHint" class="hint">可分行粘贴完整的 name=value 项；请勿在单个票据中间手动断行。</div>
-            <label for="caCookieLabel" class="ca-field">账号备注（可选）</label>
-            <input id="caCookieLabel" type="text" maxlength="100" autocomplete="off" placeholder="例如：我的华为云账号" style="width:100%;margin-bottom:10px">
-            <button id="btnCaImportCookie" type="button" class="primary">验证并导入账号</button>
-            <div id="addCaDone" class="state ok" role="status" hidden style="margin-top:8px"></div>
-            <div id="addCaErr" class="state err" role="alert" hidden style="margin-top:8px"></div>
-          </li>
-        </ol>
-        <div class="hint">Cookie 仅提交到本面板，导入成功后会清空输入框。会话失效后需重新登录导入，此方式不能保证永久自动续期。</div>
-        <details style="margin-top:12px">
-          <summary>备用：在服务器本机打开登录窗口（桌面部署）</summary>
-          <p class="hint">仅当运行面板的机器有桌面和 Chrome / Edge 时可用；群晖 / Docker 请使用上方粘贴导入。</p>
-          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-            <button id="btnCaAdd">打开服务器登录窗口</button>
-            <button id="btnCaStop" hidden>关闭登录窗口</button>
-          </div>
-        </details>
-        <div id="addCaState" class="state" role="status" hidden style="margin-top:10px"></div>
-      </div>
-      <!-- 导入 JSON -->
-      <div id="addTabImport" class="tab-panel" hidden>
-        <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
-        <div id="importDone" class="state ok" hidden></div>
-        <div id="importErr" class="state err" hidden></div>
-      </div>
+<button class="primary" id="btnMmLogin">浏览器登录添加账号</button>
+<div hidden="" id="addMmLoginBox" style="margin-top:10px">
+<div class="state">在浏览器打开下面的链接，输入验证码完成登录：</div>
+<div class="url" id="mmLoginUrl"></div>
+<div class="state">验证码 <b id="mmLoginCode"></b> · 剩余 <span id="mmLoginCountdown">--</span></div>
+<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+<button class="primary" id="btnMmLoginOpen">打开授权页</button>
+<button id="btnMmLoginCopy">复制验证码</button>
+</div>
+<div class="state err" hidden="" id="addMmLoginErr" style="margin-top:8px"></div>
+</div>
+</div><details class="import-alternative"><summary>使用已有令牌导入</summary>
+
+
+
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+
+<button id="btnMmToggleManual">改用粘贴 Token</button>
+</div>
+<div hidden="" id="addMmManual" style="margin-top:12px">
+<div class="hint" style="margin-bottom:6px">粘贴 access_token（mmoat_ 开头）与 refresh_token（mmort_ 开头）。适合添加未在本机登录的账号。</div>
+<input id="mmAccessInput" placeholder="access_token (mmoat_...)" style="width:100%;margin-bottom:6px" type="text"/>
+<input id="mmRefreshInput" placeholder="refresh_token (mmort_...)（可选）" style="width:100%;margin-bottom:8px" type="text"/>
+<button class="primary" id="btnMmAddManual">保存账号</button>
+</div>
+<!-- 浏览器登录：OAuth 设备码授权（RFC 8628 + S256 PKCE） -->
+
+<div id="minimaxDesktopOptions" hidden><div class="state" id="addMmCur" style="margin-bottom:8px">正在读取本机 MiniMax Code 登录态…</div><button class="primary" id="btnMmCapture">添加当前 MiniMax 账号</button></div></details></div><div id="addTabDoubao" class="tab-panel" role="tabpanel" aria-labelledby="addNav-doubao" hidden><div class="import-flow" aria-label="操作流程"><span><b>01</b>登录豆包</span><span><b>02</b>复制请求标头</span><span><b>03</b>粘贴并导入</span></div>
+<p id="addDbCur" class="import-description">支持 Cookie 值和整段请求标头，名称和值分行的格式也可以直接粘贴。</p>
+<div class="import-guide-grid">
+  <section class="import-card import-guide-card">
+    <div class="import-card-eyebrow">01 · 网页登录</div>
+    <h5>先登录要添加的豆包账号</h5>
+    <p>在豆包网页确认已显示你的头像或昵称。</p>
+    <a class="import-open-link" href="https://www.doubao.com/chat/" target="_blank" rel="noopener noreferrer">打开豆包网页登录 <span aria-hidden="true">↗</span></a>
+  </section>
+  <section class="import-card import-guide-card">
+    <div class="import-card-eyebrow">02 · 复制请求标头</div>
+    <h5>F12 → 网络，筛选后刷新</h5>
+    <div class="import-copy-row"><code>domain:www.doubao.com</code><button id="btnDbCopyFilter" type="button" aria-label="复制豆包请求筛选词">复制</button></div>
+    <p>选择目标为 <b>www.doubao.com</b> 的请求，复制「请求标头 / Request Headers」。</p>
+  </section>
+</div>
+<div id="addDbManual" class="import-card import-paste-card">
+  <div class="import-card-head"><div><div class="import-card-eyebrow">03 · 粘贴并导入</div><h5>把复制的内容粘贴到这里</h5></div><span class="import-format-tag">自动提取 Cookie</span></div>
+  <label class="import-field-label" for="dbCookieInput">Cookie 或请求标头</label>
+  <textarea id="dbCookieInput" rows="4" autocomplete="off" spellcheck="false" aria-describedby="dbCookieHelp" placeholder="Cookie: sessionid=…; ttwid=…&#10;也可以直接粘贴整段请求标头，无需手动删行。"></textarea>
+  <div class="import-form-footer"><span class="import-note" id="dbCookieHelp">需包含 sessionid 或 sessionid_ss；成功后自动清空输入框。</span><button id="btnDbAddCookie" class="primary">导入豆包账号</button></div>
+  <div id="addDbDone" class="state ok" role="status" hidden></div>
+  <div id="addDbErr" class="state err" role="alert" hidden></div>
+</div>
+<details class="import-help"><summary>怎样避免选错请求？</summary><p>请查看请求的目标域名，跳过 <code>mssdk.bytedance.com</code>。仅有 <code>ttwid</code> 的请求不含账号登录信息；重新选择带 <code>sessionid</code> 或 <code>sessionid_ss</code> 的豆包请求。</p></details>
+<details class="import-alternative" hidden="" id="doubaoDesktopOptions" style="margin-top:12px">
+<summary>本机 Windows 登录方式</summary>
+<button id="btnDbBrowser">浏览器登录并添加</button>
+<button id="btnDbClient">客户端登录并添加</button>
+<button hidden="" id="btnDbToggleManual">粘贴 Cookie</button>
+<div hidden="" id="addDbBrowserBox"><div class="state" id="addDbBrowserState"></div><button id="btnDbBrowserStop">关闭登录窗口</button><div class="state err" hidden="" id="addDbBrowserErr"></div></div>
+</details></div><div id="addTabCodearts" class="tab-panel" role="tabpanel" aria-labelledby="addNav-codearts" hidden><div class="import-flow" aria-label="操作流程"><span><b>01</b>登录码道</span><span><b>02</b>复制 Cookie 值</span><span><b>03</b>验证并导入</span></div>
+<div class="state">在当前电脑浏览器完成登录，复制 Cookie 的值，交给面板验证并保存。</div>
+<ol class="ca-steps">
+<li>
+<span class="ca-step-title">打开华为码道并登录</span>
+<a href="https://devcloud.cn-north-4.huaweicloud.com/chat/" rel="noopener noreferrer" target="_blank">打开华为码道网页登录 ↗</a>
+<div class="hint">登录后留在码道网页，按 F12，切换到「网络 / Network」。</div>
+</li>
+<li>
+<span class="ca-step-title">筛选账号请求，再刷新网页</span>
+<div>在网络面板的筛选框中输入：</div>
+<div class="ca-filter"><code>package/overview</code><button id="btnCaCopyFilter" type="button">复制筛选词</button></div>
+<div>刷新网页，点击出现的 <b>overview</b> 请求，核对请求地址：</div>
+<code class="ca-request">https://devcloud.cn-north-4.huaweicloud.com/chat/snap-manager/v1/package/overview</code>
+<div class="ca-wrong-request">请跳过 <b>furiondata.myhuaweicloud.com</b> 和 <b>/furiondataserver/fr</b>，它们不是这里需要的码道登录请求。</div>
+<details class="hint">
+<summary>筛选后没有请求，或找不到 Cookie？</summary>
+<p>确认网页已登录，再打开「活动福利」触发请求。仍没有结果时，清空筛选，选择发往 devcloud.cn-north-4.huaweicloud.com 的 /chat/ 请求，查找请求标头中的 Cookie 一项。</p>
+</details>
+</li>
+<li>
+<span class="ca-step-title">只复制 Cookie 这一项的值</span>
+<div>在所选请求中打开 <b>标头 → 请求标头 / Request Headers</b>，找到 <b>Cookie</b>，右键选择 <b>复制值 / Copy value</b>。</div>
+<div class="ca-example"><span class="hint">正确值示例（仅展示格式）：</span><code>name=value; name2=value2; name3=value3</code></div>
+<div class="hint" style="margin-top:7px">请勿复制以 GET / POST 开头的整段请求标头。也不要使用 document.cookie，它读不到 HttpOnly 登录票据。</div>
+</li>
+<li>
+<span class="ca-step-title">粘贴 Cookie 值并导入</span>
+<label class="ca-field" for="caCookieInput">Cookie 值（只粘贴 name=value; …）</label>
+<textarea aria-describedby="caCookieHint" autocomplete="off" id="caCookieInput" placeholder="只粘贴 Cookie 的值，例如 name=value; name2=value2" rows="4" spellcheck="false" style="width:100%;box-sizing:border-box"></textarea>
+<div class="hint" id="caCookieHint">可分行粘贴完整的 name=value 项；请勿在单个票据中间手动断行。</div>
+<label class="ca-field" for="caCookieLabel">账号备注（可选）</label>
+<input autocomplete="off" id="caCookieLabel" maxlength="100" placeholder="例如：我的华为云账号" style="width:100%;margin-bottom:10px" type="text"/>
+<button class="primary" id="btnCaImportCookie" type="button">验证并导入账号</button>
+<div class="state ok" hidden="" id="addCaDone" role="status" style="margin-top:8px"></div>
+<div class="state err" hidden="" id="addCaErr" role="alert" style="margin-top:8px"></div>
+</li>
+</ol>
+<div class="hint">Cookie 仅提交到本面板，导入成功后会清空输入框。会话失效后需重新登录导入，此方式不能保证永久自动续期。</div>
+<details class="import-alternative" hidden="" id="codeartsDesktopOptions" style="margin-top:12px">
+<summary>备用：在服务器本机打开登录窗口（桌面部署）</summary>
+<p class="hint">仅当运行面板的机器有桌面和 Chrome / Edge 时可用；群晖 / Docker 请使用上方粘贴导入。</p>
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<button id="btnCaAdd">打开服务器登录窗口</button>
+<button hidden="" id="btnCaStop">关闭登录窗口</button>
+</div>
+</details>
+<div class="state" hidden="" id="addCaState" role="status" style="margin-top:10px"></div>
+</div><div id="addTabImport" class="tab-panel" role="tabpanel" aria-labelledby="addNav-import" hidden><div class="import-flow" aria-label="操作流程"><span><b>01</b>准备账号文件</span><span><b>02</b>选择 JSON</span><span><b>03</b>查看导入结果</span></div><div class="import-card"><div class="import-file-symbol" aria-hidden="true">{ }</div><h5>导入已有账号文件</h5><p class="import-note">选择 cockpit tools 导出的账号 JSON 文件，导入后会显示成功、跳过和失败的数量。</p><label for="importFile" class="import-field-label">选择 .json 账号文件</label><input type="file" id="importFile" accept=".json"><div class="import-note">选择文件后开始导入，请等待结果显示。</div><div id="importDone" class="state ok" role="status" hidden></div><div id="importErr" class="state err" role="alert" hidden></div></div></div></div>
     </div>
-    <footer>
-      <span class="grow"></span>
-      <button id="btnStartLogin" class="primary">获取授权链接</button>
-      <button id="btnCopyUrl" hidden>复制链接</button>
-      <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
-      <button id="btnCloseAdd">关闭</button>
-    </footer>
+    <footer class="import-footer"><span class="import-footnote" id="addFooterNote">获取链接后，在官方网页完成授权。</span><span class="grow"></span><button id="btnStartLogin" class="primary">获取授权链接</button><button id="btnCopyUrl" hidden>复制链接</button><button id="btnOpenUrl" class="primary" hidden>打开授权页</button><button id="btnCloseAddFooter" type="button">关闭</button></footer>
   </div>
 </div>
 

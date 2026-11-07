@@ -200,7 +200,8 @@ type QoderAccountView struct {
 	// 每日额度，见 QoderQuotaGroupKey 的注释）。
 	Scope string `json:"scope,omitempty"`
 	// ScopeLabel scope 的短标签，给人看。
-	ScopeLabel string `json:"scope_label,omitempty"`
+	ScopeLabel    string `json:"scope_label,omitempty"`
+	IdentityLabel string `json:"identity_label,omitempty"`
 	// QuotaGroup 该账号所在**同一人组**里的账号数（含自己）。
 	// >1 = 服务端已判定它与别的号是同一个人，每天只有一份每日额度。
 	QuotaGroup int `json:"quota_group,omitempty"`
@@ -227,19 +228,28 @@ func ListQoderAccounts() ([]QoderAccountView, error) {
 			}
 		}
 		scope := QoderQuotaScopeKey(a)
+		identityLabel := a.Email
+		if a.Auth != nil {
+			if a.Auth.User.Email != "" {
+				identityLabel = a.Auth.User.Email
+			} else if a.UserID != "" {
+				identityLabel = "UID " + a.UserID
+			}
+		}
 		out = append(out, QoderAccountView{
-			Email:      a.Email,
-			UserID:     a.UserID,
-			Name:       a.Name,
-			ExpiresAt:  expAt(a),
-			Expired:    exp,
-			Current:    strings.EqualFold(a.Email, curEmail),
-			SavedAt:    a.SavedAt,
-			MachineID:  a.MachineID,
-			DeviceID:   a.DeviceID,
-			Scope:      scope,
-			ScopeLabel: QoderQuotaScopeLabel(scope),
-			QuotaGroup: sizes[strings.ToLower(strings.TrimSpace(a.Email))],
+			IdentityLabel: identityLabel,
+			Email:         a.Email,
+			UserID:        a.UserID,
+			Name:          a.Name,
+			ExpiresAt:     expAt(a),
+			Expired:       exp,
+			Current:       strings.EqualFold(a.Email, curEmail),
+			SavedAt:       a.SavedAt,
+			MachineID:     a.MachineID,
+			DeviceID:      a.DeviceID,
+			Scope:         scope,
+			ScopeLabel:    QoderQuotaScopeLabel(scope),
+			QuotaGroup:    sizes[strings.ToLower(strings.TrimSpace(a.Email))],
 		})
 	}
 	return out, nil
@@ -319,7 +329,7 @@ func qoderSnapshotEmail(a *QoderSnapshot) string {
 		return em
 	}
 	if a.Auth != nil {
-		return strings.TrimSpace(a.Auth.User.Email)
+		return QoderIdentityKey(a.Auth)
 	}
 	return ""
 }

@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +93,10 @@ func shortHash(s string) string {
 
 // qoderWebStart 拉起浏览器（该账号的独立 profile）并打开 Qoder 网页控制台。
 func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
+	if runtime.GOOS != "windows" {
+		writeErr(w, http.StatusBadRequest, "此登录方式需要服务器上的 Windows 桌面；请使用设备授权登录")
+		return
+	}
 	var req struct {
 		Email string `json:"email"`
 	}
