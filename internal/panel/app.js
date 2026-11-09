@@ -94,6 +94,37 @@ function esc(s) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
+
+/* ── 账号标识脱敏（2026-11-08）─────────────────────────────────────────
+   面板上**不显示真实邮箱**。
+   原因不是"好看"，是邮箱本身就是凭据的一部分：
+     · 截图/录屏/投屏给别人看时会把账号直接送出去；
+     · 面板是可分享的（同事、答辩现场），邮箱一露就是实名。
+   做法：邮箱 → 稳定不可逆短码（同一个邮箱永远同一个码），
+        显示成「账号 a1b2c3」，既保留"能分清是哪一个号"，
+        又不泄露是谁。
+   ⚠ 只改**显示**，不改功能：所有 data-* 属性、请求参数仍用原邮箱，
+      点按钮查的还是真账号。
+   ───────────────────────────────────────────────────────────────────── */
+function identLabel(email, fallback) {
+  const s = String(email == null ? '' : email).trim();
+  if (!s) return fallback || '未命名';
+  /* 不是邮箱（uid / user_id / 别名）就原样显示 */
+  if (s.indexOf('@') < 0) return s;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return '账号 ' + h.toString(16).slice(0, 6).padStart(6, '0');
+}
+/* 名字字段本身可能就是邮箱（很多平台 name = email），同样要脱敏 */
+function identName(name, email, fallback) {
+  const n = String(name == null ? '' : name).trim();
+  if (!n) return identLabel(email, fallback);
+  if (n.indexOf('@') >= 0) return identLabel(n, fallback);
+  return n;
+}
 /* ── 行内控件统一外观 ─────────────────────────────────────────────────
    全面板只有三种控件外观，别再各写各的：
 
@@ -412,7 +443,7 @@ function go(v) {
   if (v === 'usage') { loadUsage(); loadUsageOfficial(); }
   if (v === 'packages') { loadPackages(); loadPkIdea(true); }
   if (v === 'taskscenter') { reattachQueueView(); loadIdeaTasks(true); }
-  if (v === 'checkin') { loadTraeStatus(true); loadTraeCredits(true); loadCheckinPool(true); loadQkCredits(true); loadWkCredits(true); }
+  if (v === 'checkin') { loadTraeStatus(true); loadTraeCredits(true); loadCheckinPool(true); loadQkCredits(true); loadWkCredits(true); loadMmCredits(true); loadCaCredits(true); }
   // 冻结期内进 IDE 账号页不自动重取：保留切换前那份列表与滚动位置。
   if (v === 'ideaccounts' && !viewFrozen()) { loadQoderAccounts(true); loadTraeIdeAccounts(true); loadWorkBuddyAccounts(true); }
   saveViewState();
@@ -1979,7 +2010,7 @@ function reloadCurrentView(skipOverview) {
   if (view === 'ideaccounts') { loadQoderAccounts(true); loadTraeIdeAccounts(true); loadWorkBuddyAccounts(true); }
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') { reattachQueueView(); loadIdeaTasks(true); }
-  else if (view === 'checkin') { loadTraeStatus(true); loadTraeCredits(true); loadCheckinPool(true); loadQkCredits(true); loadWkCredits(true); }
+  else if (view === 'checkin') { loadTraeStatus(true); loadTraeCredits(true); loadCheckinPool(true); loadQkCredits(true); loadWkCredits(true); loadMmCredits(true); loadCaCredits(true); }
   else if (view === 'usage') { loadUsage(); loadUsageOfficial(); }
   else if (view === 'packages') { loadPackages(); loadPkIdea(true); }
   else if (view === 'models') { loadModels(); loadModelQueue(); }
@@ -2424,7 +2455,17 @@ async function loadTraeStatus(quiet) {
   const st = $('traeState'), list = $('traeList');
   if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
   try {
-    const d = await api('trae/accounts');
+    // accounts 给签到状态，credits 给真实余额 —— 之前卡片行的「积分」列显示的是
+    // status 的 credits 字段（= 今日签到额度 100），不是账号余额，看着像"只有 100 积分"。
+    // 两个接口都在服务端有缓存，并发取，不额外打上游。
+    const [d, cr] = await Promise.all([
+      api('trae/accounts'),
+      api('trae/credits').catch(() => null),
+    ]);
+    const balBy = {};
+    ((cr && cr.accounts) || []).forEach(a => {
+      if (a && a.user_id) balBy[String(a.user_id)] = a;
+    });
     const arr = d.accounts || [];
     if (d.enabled === false) {
       st.hidden = false; st.className = 'state';
@@ -2453,7 +2494,16 @@ async function loadTraeStatus(quiet) {
           : (a.checked_in
             ? UI.badge('ok', '✓', '今日已签')
             : UI.badge('warn', '○', '未签到')));
-      const credits = a.credits == null ? '—' : a.credits;
+      // 「积分」列显示**账号真实余额**（上游 ide_user_ent_usage 口径），
+      // 签到额度另标在状态列下方 —— 之前这一列放的是 status 的 credits
+      // （= 今日签到可得 100），看着像"账号只剩 100 积分"。
+      const cb = balBy[String(a.user_id || '')];
+      const bal = cb && cb.has_balance
+        ? '<b>' + Number(cb.balance).toLocaleString('zh-CN', { maximumFractionDigits: 2 }) + '</b>' +
+          (cb.balance_source === 'local' ? ' <span class="tag mute">快照</span>' : '')
+        : '<span class="note">—</span>';
+      // 签到额度（今日可得）另算，用于状态列下方的说明。
+      const checkinGain = cb && cb.has_checkin ? Number(cb.checkin_credits || 0) : (a.credits || 0);
       // 续期能力：refresh_token 通道（最快）> 浏览器会话通道 > 都无（需重新登录）。
       const renewTip = a.refreshable ? '可自动续期（refresh_token 通道）'
         : (a.has_profile ? '可自动续期（浏览器会话通道）' : '暂不可自动续期，请在「添加账号 → Trae 登录」重新登录一次');
@@ -2469,25 +2519,24 @@ async function loadTraeStatus(quiet) {
       return '<div class="trow">' +
         '<div class="who"><div class="nm" title="' + esc(a.name || '') + '">' + esc(a.name || '未命名') + '</div>' +
         '<div class="id" title="' + esc(idTitle) + '">' + esc(a.user_id || '') + '</div></div>' +
-        '<div class="credits" title="当前积分">' + esc(credits) + '</div>' +
+        '<div class="credits" title="账号积分余额">' + bal + '</div>' +
         '<div>' + status +
-        (a.credits !== undefined && a.credits !== null
-          ? '<div class="note" style="margin-top:4px">积分 ' + Number(a.credits).toFixed(0) +
-            (a.credits_used ? ' · 已用 ' + Number(a.credits_used).toFixed(0) : '') +
-            (a.today_gain ? ' · 今日 +' + Number(a.today_gain).toFixed(0) : '') +
-            (a.credits_expiring > 0 ? ' · 将过期 ' + Number(a.credits_expiring).toFixed(0) : '') + '</div>'
-          : '') + '</div>' +
+        '<div class="note" style="margin-top:4px">今日签到可得 ' + Number(checkinGain || 0).toFixed(0) +
+        (cb && cb.used ? ' · 已用 ' + Number(cb.used).toFixed(0) : '') + '</div>' +
+        '</div>' +
         '<div class="acts">' + ckBtn + renewBtn + '</div>' +
         (a.error ? '<div class="err">' + esc(a.error) + '</div>' : '') +
         '</div>';
     }).join('');
     const autoN = arr.filter(a => a.refreshable || a.has_profile).length;
     const renewNote = ' · ' + autoN + '/' + arr.length + ' 可自动续期';
+    // 统计行格式与其它平台统一：共 N 个 · 已签 M 个（异常情况追加说明）。
+    const base = '共 ' + arr.length + ' 个 · 已签 ' + done;
     $('traeSummary').textContent = expired
-      ? done + '/' + arr.length + ' 已签 · ' + expired + ' 个凭证过期' + renewNote
+      ? base + ' · ' + expired + ' 个凭证过期' + renewNote
       : (errs
-        ? done + '/' + arr.length + ' 已签 · ' + errs + ' 个查询失败' + renewNote
-        : (done === arr.length ? '今日全部完成 🎉' + renewNote : done + '/' + arr.length + ' 已签' + renewNote));
+        ? base + ' · ' + errs + ' 个查询失败' + renewNote
+        : base + renewNote);
     st.hidden = true;
     list.querySelectorAll('button[data-trae-uid]').forEach(b => {
       b.onclick = () => doTraeCheckin([b.dataset.traeUid]);
@@ -2637,7 +2686,7 @@ async function loadTraeCredits(quiet) {
     st.hidden = false; st.className = 'state err'; st.textContent = e.message;
   }
 }
-if ($('btnTcRefresh')) $('btnTcRefresh').onclick = () => loadTraeCredits(false);
+if ($('btnTcRefresh')) $('btnTcRefresh').onclick = () => { loadTraeCredits(false); loadQkCredits(false); loadWkCredits(false); loadMmCredits(false); loadCaCredits(false); };
 
 /* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
    规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
@@ -4539,8 +4588,8 @@ async function loadQoderAccounts(quiet) {
       const renew = UI.sub('data-qoder-renew', a.email, '续期', '用 refresh_token 换新 token');
       const rm = UI.sub('data-qoder-remove', a.email, '移除');
       return '<div class="arow" data-acc="' + esc(a.email) + '">' +
-        '<div class="who"><div class="nm">' + esc(a.name || '未命名') + '</div>' +
-        '<div class="id" title="' + esc(a.email) + '">' + esc(a.email) + '</div></div>' +
+        '<div class="who"><div class="nm">' + esc(identName(a.name, a.email, '未命名')) + '</div>' +
+        '<div class="id">' + esc(identLabel(a.email, '未设置')) + '</div></div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' + renew + sw + rm + '</div>' +
         '</div>';
@@ -4597,6 +4646,56 @@ async function doQoderSwitch(email, btn) {
     onSwitchDone('qoder', d.email || email, d.restart_note);
   } catch (e) { toast(e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = old || '切换'; }
+}
+
+// doQoderRelogin 让某个号在 Qoder 客户端里真登录一次。
+//
+// 为什么需要它（2026-11-09 实测）：每日 100 Credits 的活动由上游按「账号 +
+// 服务端给这个号发过的 scope」下发。某个号长期没在客户端登录过 → scope 过期
+// → 上游不再给它下发当天的活动（活动列表里只剩早先的促销）→ 面板无论用 real
+// 还是 derived 设备、按邮箱还是按设备去签都只能拿到 pending。
+// 正解是让这个号在客户端里扫码登录一次，服务端会重新下发 scope 与当日活动。
+async function doQoderRelogin(btn, email) {
+  if (!email) return;
+  if (!confirm('让「' + email + '」在 Qoder 客户端里重新登录一次？\n\n' +
+    '会自动结束 Qoder、把该号的设备身份恢复回去并清掉登录态，然后启动客户端。\n' +
+    '请在弹出的客户端里用这个号扫码登录；登录完面板自动收录并补签今天的额度。')) return;
+  const old = btn ? btn.textContent : '重新登录该号';
+  if (btn) { btn.disabled = true; btn.textContent = '等待登录…'; }
+  try {
+    const d = await api('ide/qoder/relogin', { method: 'POST', body: JSON.stringify({ email }) });
+    toast(d.message || '已启动 Qoder 客户端，请扫码登录', 'ok');
+    // 等登录完成：后端登录轮询成功后会把这个号（新 scope）收进号池。
+    const tick = async () => {
+      try {
+        const r = await api('ide/qoder/login/poll');
+        if (r.done) {
+          if (btn) { btn.disabled = false; btn.textContent = old; }
+          toast((r.ok ? '登录成功：' : '登录失败：') + (r.message || ''), r.ok ? 'ok' : 'err');
+          if (r.ok) {
+            loadQoderAccounts(true);
+            loadCkQoder(true);
+            // 登录完立刻补签：上游这才会把当天的活动发给这个号。
+            try {
+              await api('ide/qoder/checkin', { method: 'POST', body: JSON.stringify({ emails: [], priority: email }) });
+              loadCkQoder(true);
+            } catch (e) { /* 补签失败由列表上的状态显示，不在这里二次报错 */ }
+          }
+          return;
+        }
+        if (r.expired) { if (btn) { btn.disabled = false; btn.textContent = old; } return; }
+      } catch (e) {
+        if (btn) { btn.disabled = false; btn.textContent = old; }
+        toast(e.message, 'err');
+        return;
+      }
+      setTimeout(tick, 2500);
+    };
+    setTimeout(tick, 2500);
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+    toast(e.message, 'err');
+  }
 }
 
 async function doQoderRemove(email) {
@@ -4689,6 +4788,8 @@ async function openQoderEgress(email) {
   const errEl = $('qdEgressErr');
   if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
   if ($('qdEgressEmail')) $('qdEgressEmail').value = email || '';
+  /* 显示的是脱敏标识，真邮箱留在隐藏字段里（保存时按邮箱定位账号） */
+  if ($('qdEgressEmailLabel')) $('qdEgressEmailLabel').value = identLabel(email, '未选择');
   if ($('qdEgressMode')) $('qdEgressMode').value = 'real';
   if ($('qdEgressProxy')) $('qdEgressProxy').value = '';
   if ($('qdEgressProfile')) $('qdEgressProfile').value = '';
@@ -4706,7 +4807,7 @@ async function openQoderEgress(email) {
     }
     if (body) {
       body.innerHTML = p
-        ? '<div class="note">当前：' + esc(p.email || '') + ' · 设备 ' + esc(p.device_mode || 'real') +
+        ? '<div class="note">当前：' + esc(identLabel(p.email, '未设置')) + ' · 设备 ' + esc(p.device_mode || 'real') +
           ' · 出口 ' + esc(p.proxy_url || '默认网络') +
           (p.updated_at ? ' · 更新于 ' + esc(caTime(p.updated_at) || p.updated_at) : '') + '</div>' +
           '<div class="note" data-qd-probe="' + esc(p.email || '') + '">' + esc(qdProbeLine(p)) + '</div>'
@@ -4850,8 +4951,8 @@ async function loadTraeIdeAccounts(quiet) {
       }
       const rm = UI.sub('data-traeide-remove', id, '移除');
       return '<div class="arow" data-acc="' + esc(id) + '">' +
-        '<div class="who"><div class="nm">' + esc(a.name || '未命名') + '</div>' +
-        '<div class="id" title="' + esc(a.email || a.user_id || '') + '">' + esc(a.email || a.user_id || '') + '</div></div>' +
+        '<div class="who"><div class="nm">' + esc(identName(a.name, a.email || a.user_id, '未命名')) + '</div>' +
+        '<div class="id">' + esc(identLabel(a.email || a.user_id, '未设置')) + '</div></div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' + ops + rm + '</div>' +
         '</div>';
@@ -5098,7 +5199,8 @@ async function loadCkWorkBuddy(quiet) {
       st.textContent = 'WorkBuddy 号池为空。';
       list.innerHTML = ''; return;
     }
-    const head = '<div class="thead"><div>账号</div><div>版本</div><div>状态</div><div>操作</div></div>';
+    // 表头与其他平台统一为：账号 | 积分 | 状态 | 操作。
+    const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
     list.innerHTML = head + all.map(a => {
       const uid = wbUid(a);
       const doneToday = !!a.checked_in_today;
@@ -5114,14 +5216,38 @@ async function loadCkWorkBuddy(quiet) {
         ? UI.off('已签到', '今日已签到（点击可重新签到并刷新余额）')
         : UI.act('data-ck-wb', uid, '签到', '今天签到');
       return '<div class="trow">' +
-        '<div class="who"><div class="nm">' + esc(a.nickname || '未命名') + '</div>' +
+        '<div class="who"><div class="nm">' + esc(a.nickname || '未命名') +
+        ' <span class="tag mute">' + esc(wbEditionLabel(a.edition)) + '</span></div>' +
         '<div class="id" title="' + esc(uid) + '">' + esc(uid || 'UID 未返回') + '</div></div>' +
-        '<div class="credits">' + esc(wbEditionLabel(a.edition)) + '</div>' +
+        '<div class="credits" data-wb-ck-cred="' + esc(uid) + '"><span class="note">查询中…</span></div>' +
         '<div>' + status + '</div>' +
         '<div>' + btn + '</div>' +
         '</div>';
     }).join('');
     st.hidden = true;
+    // 积分列：逐号查额度（与积分总览同一接口，服务端有缓存）。
+    list.querySelectorAll('[data-wb-ck-cred]').forEach(cell => {
+      const uid = cell.dataset.wbCkCred;
+      if (!uid) { cell.innerHTML = '<span class="note">—</span>'; return; }
+      api('ide/workbuddy/usage?uid=' + encodeURIComponent(uid)).then(r => {
+        if (!r || !r.ok || !r.usage) { cell.innerHTML = '<span class="note">' + esc((r && r.error) || '—') + '</span>'; return; }
+        if (r.usage.remaining != null) {
+          cell.innerHTML = '<b>' + r.usage.remaining + '</b>' + (r.usage.total != null ? ' / ' + r.usage.total : '');
+          return;
+        }
+        const found = {};
+        (function walk(o) {
+          if (!o || typeof o !== 'object') return;
+          for (const k in o) {
+            const v = o[k];
+            if (v && typeof v === 'object') walk(v);
+            else if (/credit|balance|remaining|quota|available|used|total/i.test(String(k))) found[k] = v;
+          }
+        })(r.usage);
+        const keys = Object.keys(found).slice(0, 2);
+        cell.innerHTML = keys.length ? '<span class="note">' + keys.map(k => k + ':' + found[k]).join(' · ') + '</span>' : '<span class="note">—</span>';
+      }).catch(e => { cell.innerHTML = '<span class="note">' + esc(e.message) + '</span>'; });
+    });
     list.querySelectorAll('button[data-ck-wb]').forEach(b => { b.onclick = () => doWorkBuddyCheckin(b.dataset.ckWb, b); });
   } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
 }
@@ -5148,6 +5274,19 @@ async function doWbCheckinAll(btn) {
     if (btn) { btn.disabled = false; btn.textContent = old || '一键签到'; }
   }
 }
+
+// WorkBuddy 卡片上的「全部签到」按钮（与其它平台卡片同款入口）。
+if ($('btnCkWbCheckinAll')) $('btnCkWbCheckinAll').onclick = async () => {
+  const btn = $('btnCkWbCheckinAll');
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '签到中…';
+  try {
+    const r = await doWbCheckinAll(btn);
+    toast('WorkBuddy 签到：成功 ' + r.ok + ' · 已签 ' + r.skip + ' · 失败 ' + r.fail, r.fail ? 'err' : 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = old || '全部签到'; }
+  if (!viewFrozen()) loadCkWorkBuddy(true);
+};
 
 /* ── Qoder 分桶 / 轮换 / 历史 / 设备出口（C-UI-REPAIR@1）────────────
    数据一律来自 C-QD-API@1：checkin 响应的 results[] 与 checkin-status 的
@@ -5242,7 +5381,9 @@ function renderQoderBuckets() {
   const box = $('ckQoderBuckets');
   if (!box) return;
   if (!lastQoderCheckin) {
-    box.innerHTML = '<div class="note">尚未执行一键签到（点上方「全部签到」查看每号真实结果与分桶）。</div>';
+    /* ⚠ 2026-10-31：原来这里写「尚未执行一键签到（点上方「全部签到」…）」，
+     *   用户要求去掉 —— 没跑过签到时这里空着就行，不用教用户怎么点。 */
+    box.innerHTML = '';
     return;
   }
   box.innerHTML = qdBucketHTML(lastQoderCheckin) ||
@@ -5254,56 +5395,17 @@ async function loadCkQoder(quiet) {
   if (!st || !list) return;
   if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
   try {
+    // ① 先只取账号列表（本地读，2ms）→ 立刻把卡片画出来。
+    // ② 再取签到状态（打上游，缓存过期时要 3.4s）→ 再补状态列。
+    //
+    // 之前两个接口用 Promise.all 一起等，Qoder 卡片必须等最慢的那个
+    // （checkin-status 打上游）才出现，而其他平台 accounts 是本地读、0.1s 就好
+    // —— 用户看到的「Qoder 比别的加载慢」就是这么来的。改成两阶段渲染。
     const d = await api('ide/qoder/accounts');
     const cur = d.current_email || '';
     const arr = d.accounts || [];
     // 号池为空但本机有登录态：仍然展示当前号（后端会回退成「签当前账号」）。
     const rows = arr.length ? arr : (cur ? [{ email: cur, name: d.current_name || '当前登录', current: true }] : []);
-    // 今日签到状态：上游核实结果（后端逐号向 Qoder 活动列表确认）。
-    const st2 = await api('ide/qoder/checkin-status').catch(() => null);
-    const doneMap = {}, quotaMap = {}, msgMap = {}, holderMap = {};
-    const strategyMap = {}, rankMap = {}, lastClaimMap = {}, histDaysMap = {}, phaseMap = {};
-    ((st2 && st2.results) || []).forEach(r => {
-      if (!r || !r.email) return;
-      const k = String(r.email).toLowerCase();
-      // checked_in_today 由后端按**上游活动列表**判定（真签到口径）。
-      // ⚠️ 此前这里读的是 checked_in_local（本地记录，可能是旧版误报），
-      //    且顶层 checked_in_today 是「今天整体没有可领的了」的**聚合值**，
-      //    被当成当前登录号的状态用 —— 两个号的签到显示因此整个反了。
-      doneMap[k] = !!r.checked_in_today;
-      quotaMap[k] = !!r.same_person_taken;
-      msgMap[k] = r.msg || '';
-      holderMap[k] = r.quota_taken_by || '';
-      phaseMap[k] = r.phase || '';
-      strategyMap[k] = r.strategy || '';
-      rankMap[k] = r.rotation_rank || 0;
-      lastClaimMap[k] = r.last_claimed_at || '';
-      histDaysMap[k] = r.claim_history_days || 0;
-    });
-    // 当前登录号：用 current.checked_in_today（**单号**口径），不用顶层聚合值。
-    if (cur && st2 && st2.current && typeof st2.current.checked_in_today === 'boolean') {
-      doneMap[cur.toLowerCase()] = !!st2.current.checked_in_today;
-    }
-    const doneCount = rows.filter(a => doneMap[String(a.email || '').toLowerCase()]).length;
-    // 「人」组数：服务端判定为同一个人的账号共享一份每日额度，组数才是"能领几份"。
-    const groups = new Set();
-    rows.forEach(a => {
-      const g = a.quota_group > 1 ? (a.quota_taken_by || 'same:' + String(a.email || '').toLowerCase()) : ('solo:' + String(a.email || '').toLowerCase());
-      groups.add(g);
-    });
-    const sharedGroups = rows.filter(a => (a.quota_group || 0) > 1).length;
-    if ($('ckQoderSummary')) {
-      let s = rows.length
-        ? ('共 ' + rows.length + ' 个 · 已签 ' + doneCount + (arr.length ? '' : '（号池为空，仅当前号）'))
-        : '号池为空';
-      if (rows.length > 1) {
-        s += ' · ' + groups.size + ' 个额度组';
-        if (sharedGroups > 0) {
-          s += '（服务端判定为同一个人的 ' + sharedGroups + ' 个号共享一份每日额度）';
-        }
-      }
-      $('ckQoderSummary').textContent = s;
-    }
     if (!rows.length) {
       st.hidden = false; st.className = 'state';
       st.textContent = '本机 Qoder 未登录，号池也为空。请先在 Qoder 登录，再到「IDE 账号池」点「添加账号」。';
@@ -5311,28 +5413,86 @@ async function loadCkQoder(quiet) {
       renderQoderBuckets();
       return;
     }
-    const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
-    list.innerHTML = head + rows.map(a => {
-      const email = a.email || '';
-      const k = String(email).toLowerCase();
-      const isDone = !!doneMap[k];
-      const quota = !!quotaMap[k];
-      const why = msgMap[k] || '';
-      // 同一个人组：服务端判定为同一个人的号共享**一份**每日额度。
-      // 谁领到了就点名，避免用户以为是自己这个号没签成功。
-      const holder = holderMap[k] || '';
-      const gsize = a.quota_group || 0;
-      const groupTag = gsize > 1
-        ? '<span class="tag mute" style="margin-left:6px" title="服务端判定为同一个人的 ' + gsize +
-          ' 个账号共享一份每日签到额度">同一人组（' + gsize + ' 个号' +
-          (holder ? '，今日由 ' + esc(holder) + ' 领到' : '，今日尚无号领到') + '）</span>'
-        : '';
-      const quotaTip = quota
-        ? (holder
-          ? '今日每日额度已被服务端判定为同一个人的另一个账号 ' + holder + ' 领走（同人一天只发一份）'
-          : '今日每日额度已被服务端判定为同一个人的另一个账号领走（同人一天只发一份、先打先得）')
-        : '';
-      const status = isDone
+    // 骨架：先出账号行，状态列占位「查询中…」。
+    renderQoderRows(rows, arr, cur, null);
+    // 状态查询在后台补：拿到真值后整表重绘一次。
+    const st2 = await api('ide/qoder/checkin-status').catch(() => null);
+    renderQoderRows(rows, arr, cur, st2);
+  } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+}
+
+// renderQoderRows 渲染 Qoder 卡片列表。st2 为 null = 状态还没到（先画骨架）。
+function renderQoderRows(rows, arr, cur, st2) {
+  const st = $('ckQoderState'), list = $('ckQoderList');
+  if (!st || !list) return;
+  const doneMap = {}, quotaMap = {}, msgMap = {}, holderMap = {};
+  const strategyMap = {}, rankMap = {}, lastClaimMap = {}, histDaysMap = {}, phaseMap = {};
+  ((st2 && st2.results) || []).forEach(r => {
+    if (!r || !r.email) return;
+    const k = String(r.email).toLowerCase();
+    // checked_in_today 由后端按**上游活动列表**判定（真签到口径）。
+    // ⚠️ 此前这里读的是 checked_in_local（本地记录，可能是旧版误报），
+    //    且顶层 checked_in_today 是「今天整体没有可领的了」的**聚合值**，
+    //    被当成当前登录号的状态用 —— 两个号的签到显示因此整个反了。
+    doneMap[k] = !!r.checked_in_today;
+    quotaMap[k] = !!r.same_person_taken;
+    msgMap[k] = r.msg || '';
+    holderMap[k] = r.quota_taken_by || '';
+    phaseMap[k] = r.phase || '';
+    strategyMap[k] = r.strategy || '';
+    rankMap[k] = r.rotation_rank || 0;
+    lastClaimMap[k] = r.last_claimed_at || '';
+    histDaysMap[k] = r.claim_history_days || 0;
+  });
+  // 当前登录号：用 current.checked_in_today（**单号**口径），不用顶层聚合值。
+  if (cur && st2 && st2.current && typeof st2.current.checked_in_today === 'boolean') {
+    doneMap[cur.toLowerCase()] = !!st2.current.checked_in_today;
+  }
+  const doneCount = rows.filter(a => doneMap[String(a.email || '').toLowerCase()]).length;
+  // 「人」组数：服务端判定为同一个人的账号共享同一份每日额度，组数才是"能领几份"。
+  const groups = new Set();
+  rows.forEach(a => {
+    const g = a.quota_group > 1 ? (a.quota_taken_by || 'same:' + String(a.email || '').toLowerCase()) : ('solo:' + String(a.email || '').toLowerCase());
+    groups.add(g);
+  });
+  const sharedGroups = rows.filter(a => (a.quota_group || 0) > 1).length;
+  if ($('ckQoderSummary')) {
+    let s = rows.length
+      ? ('共 ' + rows.length + ' 个 · 已签 ' + (st2 ? doneCount : '…') + (arr.length ? '' : '（号池为空，仅当前号）'))
+      : '号池为空';
+    if (rows.length > 1) {
+      s += ' · ' + groups.size + ' 个额度组';
+      if (sharedGroups > 0) {
+        s += '（服务端判定为同一个人的 ' + sharedGroups + ' 个号共享一份每日额度）';
+      }
+    }
+    $('ckQoderSummary').textContent = s;
+  }
+  const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
+  list.innerHTML = head + rows.map(a => {
+    const email = a.email || '';
+    const k = String(email).toLowerCase();
+    const isDone = !!doneMap[k];
+    const quota = !!quotaMap[k];
+    const why = msgMap[k] || '';
+    // 同一个人组：服务端判定为同一个人的号共享**一份**每日额度。
+    // 谁领到了就点名，避免用户以为是自己这个号没签成功。
+    const holder = holderMap[k] || '';
+    const gsize = a.quota_group || 0;
+    const groupTag = gsize > 1
+      ? '<span class="tag mute" style="margin-left:6px" title="服务端判定为同一个人的 ' + gsize +
+        ' 个账号共享一份每日签到额度">同一人组（' + gsize + ' 个号' +
+        (holder ? '，今日由 ' + esc(holder) + ' 领到' : '，今日尚无号领到') + '）</span>'
+      : '';
+    const quotaTip = quota
+      ? (holder
+        ? '今日每日额度已被服务端判定为同一个人的另一个账号 ' + holder + ' 领走（同人一天只发一份）'
+        : '今日每日额度已被服务端判定为同一个人的另一个账号领走（同人一天只发一份、先打先得）')
+      : '';
+    // 状态还没查到（骨架阶段）：显示占位，绝不猜「可签到/已签到」。
+    const status = !st2
+      ? '<span class="note">查询中…</span>'
+      : (isDone
         // ⚠️ already 但额度是**同人的另一个号**领的（服务端按人发，一天一份）：
         // 本号账上没新增积分，不能说"今日已签到"。2026-11-04 用户反馈的
         // 「两个号都显示 +100」就是这里来的。
@@ -5350,58 +5510,63 @@ async function loadCkQoder(quiet) {
               ? UI.badge('todo', '!', '查询失败', why || '上游查询失败')
               : (a.expired
                 ? UI.badge('todo', '!', '凭证过期', why || '凭证已过期，请重新登录后添加')
-                : UI.badge('warn', '○', '可签到', why || '上游活动列表里有今天可领的签到活动')))));
-      // 策略/轮换/历史：字段缺失（老后端）时整行不显示，不编造默认值。
-      const strategy = strategyMap[k] || '';
-      const rank = Number(rankMap[k] || 0);
-      const lastClaim = lastClaimMap[k] || '';
-      const histDays = Number(histDaysMap[k] || 0);
-      const meta = [];
-      if (strategy) meta.push('策略：' + (qdStrategyText(strategy)));
-      if (rank > 0) meta.push('本轮顺序 #' + rank);
-      if (lastClaim) meta.push('上次领到 ' + (caTime(lastClaim) || lastClaim));
-      if (histDays > 0) meta.push('历史已领 ' + histDays + ' 天');
-      const metaHTML = meta.length
-        ? '<div class="note" style="margin-top:3px" data-qd-meta="' + esc(email) + '">' + esc(meta.join(' · ')) + '</div>'
-        : '';
-      return '<div class="trow" data-qd-row="' + esc(email) + '">' +
-        '<div class="who"><div class="nm">' + esc(a.name || '未命名') +
-        (a.current ? '<span class="tag mute" style="margin-left:6px">当前登录</span>' : '') + groupTag + '</div>' +
-        '<div class="id" title="' + esc(email) + '">' + esc(email) + '</div>' + metaHTML + '</div>' +
-        '<div class="credits" data-qk-cred="' + esc(email) + '"><span class="note">查询中…</span></div>' +
-        '<div>' + status + '</div>' +
-        '<div class="acts">' +
-        (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-ck-qoder', email, '签到', '今天让这个号先领（池里其余号也会一起打一遍）')) +
-        UI.sub('data-qd-egress', email, '设备/出口', '为该账号配置独立设备指纹 / 出口代理 / 浏览器 profile') +
-        UI.sub('data-qd-history', email, '历史', '查看最近 7 天领取历史') +
-        '</div>' +
-        '</div>';
-    }).join('');
-    st.hidden = true;
-    list.querySelectorAll('button[data-ck-qoder]').forEach(b => {
-      b.onclick = () => doQoderCheckin(b, b.dataset.ckQoder);
-    });
-    list.querySelectorAll('button[data-qd-egress]').forEach(b => {
-      b.onclick = () => openQoderEgress(b.dataset.qdEgress);
-    });
-    list.querySelectorAll('button[data-qd-history]').forEach(b => {
-      b.onclick = () => openQoderHistory(b.dataset.qdHistory);
-    });
-    renderQoderBuckets();
-    // 每行积分独立查询：各账号用自己的 token 查额度，不需要切号。
-    list.querySelectorAll('[data-qk-cred]').forEach(cell => {
-      const email = cell.dataset.qkCred;
-      api('ide/qoder/usage?email=' + encodeURIComponent(email)).then(u => {
-        if (!u || u.phase !== 'ok') {
-          cell.innerHTML = '<span class="note">' + esc((u && u.msg) || '无数据') + '</span>';
-          return;
-        }
-        const total = ((u.user_quota && u.user_quota.remaining) || 0) + ((u.add_on_quota && u.add_on_quota.remaining) || 0);
-        cell.innerHTML = '<b>' + total.toLocaleString('zh-CN') + '</b>' +
-          (u.plan_tier_name ? ' <span class="tag mute">' + esc(u.plan_tier_name) + '</span>' : '');
-      }).catch(e => { cell.innerHTML = '<span class="note">' + esc(e.message) + '</span>'; });
-    });
-  } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+                : UI.badge('warn', '○', '可签到', why || '上游活动列表里有今天可领的签到活动'))))));
+    // 轮换/历史：字段缺失（老后端）时整行不显示，不编造默认值。
+    // ⚠ 2026-10-31：原来这里还显示「策略：xxx」，用户要求去掉这个文案
+    //   —— 每个号下面挂一句策略说明纯属噪音，真正要看的状态在右侧徽章上。
+    const rank = Number(rankMap[k] || 0);
+    const lastClaim = lastClaimMap[k] || '';
+    const histDays = Number(histDaysMap[k] || 0);
+    const meta = [];
+    if (rank > 0) meta.push('本轮顺序 #' + rank);
+    if (lastClaim) meta.push('上次领到 ' + (caTime(lastClaim) || lastClaim));
+    if (histDays > 0) meta.push('历史已领 ' + histDays + ' 天');
+    const metaHTML = meta.length
+      ? '<div class="note" style="margin-top:3px" data-qd-meta="' + esc(email) + '">' + esc(meta.join(' · ')) + '</div>'
+      : '';
+    return '<div class="trow" data-qd-row="' + esc(email) + '">' +
+      '<div class="who"><div class="nm">' + esc(identName(a.name, email, '未命名')) +
+      (a.current ? '<span class="tag mute" style="margin-left:6px">当前登录</span>' : '') + groupTag + '</div>' +
+      '<div class="id">' + esc(identLabel(email, '未设置')) + '</div>' + metaHTML + '</div>' +
+      '<div class="credits" data-qk-cred="' + esc(email) + '"><span class="note">查询中…</span></div>' +
+      '<div>' + status + '</div>' +
+      '<div class="acts">' +
+      (!st2
+        ? '<span class="note">—</span>'
+        : (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-ck-qoder', email, '签到', '今天让这个号先领（池里其余号也会一起打一遍）'))) +
+      UI.sub('data-qd-relogin', email, '重新登录该号', '在 Qoder 客户端里用这个号扫码登录一次（上游没给这个号下发当日活动时的正解）') +
+      UI.sub('data-qd-egress', email, '设备/出口', '为该账号配置独立设备指纹 / 出口代理 / 浏览器 profile') +
+      UI.sub('data-qd-history', email, '历史', '查看最近 7 天领取历史') +
+      '</div>' +
+      '</div>';
+  }).join('');
+  st.hidden = true;
+  list.querySelectorAll('button[data-ck-qoder]').forEach(b => {
+    b.onclick = () => doQoderCheckin(b, b.dataset.ckQoder);
+  });
+  list.querySelectorAll('button[data-qd-relogin]').forEach(b => {
+    b.onclick = () => doQoderRelogin(b, b.dataset.qdRelogin);
+  });
+  list.querySelectorAll('button[data-qd-egress]').forEach(b => {
+    b.onclick = () => openQoderEgress(b.dataset.qdEgress);
+  });
+  list.querySelectorAll('button[data-qd-history]').forEach(b => {
+    b.onclick = () => openQoderHistory(b.dataset.qdHistory);
+  });
+  renderQoderBuckets();
+  // 每行积分独立查询：各账号用自己的 token 查额度，不需要切号。
+  list.querySelectorAll('[data-qk-cred]').forEach(cell => {
+    const email = cell.dataset.qkCred;
+    api('ide/qoder/usage?email=' + encodeURIComponent(email)).then(u => {
+      if (!u || u.phase !== 'ok') {
+        cell.innerHTML = '<span class="note">' + esc((u && u.msg) || '无数据') + '</span>';
+        return;
+      }
+      const total = ((u.user_quota && u.user_quota.remaining) || 0) + ((u.add_on_quota && u.add_on_quota.remaining) || 0);
+      cell.innerHTML = '<b>' + total.toLocaleString('zh-CN') + '</b>' +
+        (u.plan_tier_name ? ' <span class="tag mute">' + esc(u.plan_tier_name) + '</span>' : '');
+    }).catch(e => { cell.innerHTML = '<span class="note">' + esc(e.message) + '</span>'; });
+  });
 }
 
 /* ── MiniMax 签到（多账号）────────────────────────────────────────────
@@ -5443,11 +5608,12 @@ async function loadCkMiniMax(quiet) {
             : UI.badge('warn', '○', '可签到'))) +
           (expTxt ? ' <span class="tag mute">' + (a.expired ? '已于 ' : '到期 ') + expTxt + '</span>' : '');
       return '<div class="trow">' +
-        '<div class="who"><div class="nm">' + esc(a.user_name || a.label || 'MiniMax 账号') +
+        '<div class="who"><div class="nm">' + esc(identName(a.user_name || a.label, a.email || a.user_id || id, 'MiniMax 账号')) +
         (id && id === (d.current_id || '') ? '<span class="tag mute" style="margin-left:6px">当前</span>' : '') + '</div>' +
-        '<div class="id" title="' + esc(a.email || a.user_id || id) + '">' +
-        esc(a.email || a.user_id || id) + '</div></div>' +
-        '<div class="credits">' + (a.credits == null ? '—' : Number(a.credits).toFixed(0)) + '</div>' +
+        '<div class="id">' + esc(identLabel(a.email || a.user_id || id, '未设置')) + '</div></div>' +
+        // 积分列：余额 + 总量（"总量还剩多少"）—— 之前只有余额，缺总量口径。
+        '<div class="credits">' + (a.credits == null ? '—' : '<b>' + Number(a.credits).toLocaleString('zh-CN') + '</b>') +
+        (a.credits_total ? ' <span class="note">/ ' + Number(a.credits_total).toLocaleString('zh-CN') + '</span>' : '') + '</div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' +
         (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-mm-ck', id, '签到', '今天签到')) +
@@ -5563,7 +5729,8 @@ async function loadCkDoubao(quiet) {
         : '本机未安装豆包客户端。可先安装并登录，再提取；或通过「添加账号 → 豆包」粘贴 Cookie。';
       list.innerHTML = ''; return;
     }
-    const head = '<div class="thead"><div>账号</div><div>状态</div><div>操作</div></div>';
+    // 表头与其他平台统一为：账号 | 积分 | 状态 | 操作（豆包没有积分概念，列保留占位）。
+    const head = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>';
     list.innerHTML = head + arr.map(a => {
       const isDone = !!a.checked_in_today;
       const status = isDone
@@ -5576,6 +5743,7 @@ async function loadCkDoubao(quiet) {
         (a.source === 'browser' ? '<span class="tag mute" style="margin-left:6px">浏览器登录</span>' : '') + '</div>' +
         '<div class="id" title="session 尾号 ' + esc(a.session_tail || '') + ' · ' + esc(a.cookie_count || 0) + ' 个 Cookie">' +
         'session 尾号 ' + esc(a.session_tail || '—') + '</div></div>' +
+        '<div class="credits"><span class="note">—</span></div>' +
         '<div>' + status + '</div>' +
         '<div class="acts">' +
         (isDone ? UI.off('已签到', '今日已签到') : UI.act('data-db-ck', a.id, '签到', '今天签到')) +
@@ -5781,7 +5949,8 @@ function caTodayCreditsText(a) {
 }
 
 // caSummaryHtml 默认可见的单行摘要（前端测试直接抽取本函数）。
-// 正常状态：三段文字，没有任何按钮；需重新登录：多一个主按钮 + 一个文字链。
+// 列布局与其它平台卡片统一：账号 | 积分（今日） | 状态 | 操作。
+// 正常状态：除「操作」格外没有按钮；需重新登录：多一个主按钮 + 一个文字链。
 function caSummaryHtml(a) {
   a = a || {};
   const id = String(a.id || '');
@@ -5794,13 +5963,19 @@ function caSummaryHtml(a) {
     ops = UI.act('data-ca-relogin', id, '重新登录', '用这个号自己的身份槽重开登录窗口') +
       '<span class="ca-link" data-ca-forget="' + esc(id) + '">重置身份</span>';
   }
+  // 积分列：余额 / 总量（与积分总览同一口径），没有数据就显示「—」。
+  const bal = (a.credits === null || a.credits === undefined)
+    ? '<span class="note">—</span>'
+    : '<b>' + fmtNum(a.credits) + '</b>' +
+      (a.credits_total !== null && a.credits_total !== undefined
+        ? ' <span class="note">/ ' + fmtNum(a.credits_total) + '</span>' : '');
   return '<div class="ca-sum" data-ca-sum="' + esc(id) + '">' +
-    '<span class="ca-name" title="' + esc(id) + '">' + esc(name) + '</span>' +
-    '<span class="ca-sep">·</span>' +
-    UI.badge(badge.kind, badge.mark, phrase, tip) +
-    '<span class="ca-sep">·</span>' +
-    '<span class="ca-today">' + esc(caTodayCreditsText(a)) + '</span>' +
-    '<span style="flex:1"></span>' + ops +
+    '<div class="who"><div class="nm" title="' + esc(id) + '">' + esc(name) + '</div>' +
+    '<div class="id">' + esc(id) + '</div></div>' +
+    '<div class="credits">' + bal + '</div>' +
+    '<div>' + UI.badge(badge.kind, badge.mark, phrase, tip) +
+    '<div class="note" style="margin-top:3px">' + esc(caTodayCreditsText(a)) + '</div></div>' +
+    '<div class="acts">' + ops + '</div>' +
     '</div>';
 }
 
@@ -5907,7 +6082,8 @@ async function loadCkCodeArts(quiet) {
       st.textContent = '还没有账号。点右上角「添加账号」，在「华为 CodeArts」页签里登录华为云即可。';
       list.innerHTML = ''; return;
     }
-    list.innerHTML = arr.map(a => caRowHtml(a, slotById[String(a.id || '')])).join('');
+    list.innerHTML = '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>' +
+      arr.map(a => caRowHtml(a, slotById[String(a.id || '')])).join('');
     st.hidden = true;
     // 点行展开/收起详情；点行内按钮或「重置身份」文字链时不折叠。
     list.querySelectorAll('[data-ca-row]').forEach(row => {
@@ -6062,101 +6238,132 @@ if ($('btnCaAdd')) $('btnCaAdd').onclick = doCaAdd;
 if ($('btnCaStop')) $('btnCaStop').onclick = doCaStop;
 if ($('btnCaCheckinAll')) $('btnCaCheckinAll').onclick = () => doCaCheckin($('btnCaCheckinAll'));
 
-/* 总「一键签到」：主号池 → WorkBuddy → Qoder → MiniMax → Trae → CodeArts，全部账号一次签完。
-   各平台失败分别计数（不让某个平台的号失效把整条汇总染红）。 */
+/* 总「一键签到」：主号池 / WorkBuddy / Qoder / MiniMax / CodeArts / Trae / 豆包 全部账号一次签完。
+ *
+ * ⚠ 2026-11-08 改成**并行**：以前这里是 7 段 `await` 串行排队，
+ *   整条耗时 = 各平台耗时之和。而每个平台内部又是逐号串行、
+ *   账号间还有 1.2 秒节流（Trae）、失败 1.5 秒退避（Qoder）、
+ *   CodeArts 每号最多 4×2 秒余额重试等待、豆包每号起一个无头浏览器（15~40 秒）。
+ *   结果就是「点一次要等好几分钟，点单个小按钮却秒回」。
+ *   现在各平台**同时**发起，耗时 ≈ 最慢的那一个平台。
+ *   各平台失败分别计数（不让某个平台的号失效把整条汇总染红）。
+ *
+ * 【为什么并发是安全的】
+ *   七个平台用的是互不相干的接口与凭据（CodeArts 走 Cookie 号池、Qoder/Trae/WorkBuddy
+ *   走各自的 token、豆包走自己的无头浏览器会话），彼此不共享状态；
+ *   单个平台内部仍然保持逐号串行 —— 账号间节流是上游风控要求，不能并发。
+ */
 async function doCheckinAll(btn) {
   const old = btn ? btn.textContent : '一键签到';
   if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
   const st = $('ckMasterState');
-  if (st) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">开始签到 主号池 → WorkBuddy → Qoder → MiniMax → CodeArts → Trae</span>'; }
-  const parts = [];
-  let failCount = 0;
-  try {
-    // ① 主号池：网关自己的 CodeBuddy 账号（此前这条链完全没接进「一键签到」）。
+  if (st) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">签到中…（各平台并行）</span>'; }
+
+  /* 每个平台一个任务：返回 [说明文字, 失败数]。全部并发发起。 */
+  const jobs = [];
+
+  // ① 主号池：网关自己的 CodeBuddy 账号。
+  jobs.push((async () => {
     try {
       const mp = await doMainPoolCheckinAll();
-      failCount += mp.fail;
-      parts.push('主号池 成功 ' + mp.ok + ' · 已签 ' + mp.skip + ' · 失败 ' + mp.fail);
-    } catch (e) { failCount++; parts.push('主号池 失败：' + e.message); }
+      return ['主号池 成功 ' + mp.ok + ' · 已签 ' + mp.skip + ' · 失败 ' + mp.fail, mp.fail];
+    } catch (e) { return ['主号池 失败：' + e.message, 1]; }
+  })());
 
-    // ② WorkBuddy IDE 号池。
-    const wb = await doWbCheckinAll(null);
-    failCount += wb.fail;
-    parts.push('WorkBuddy 成功 ' + wb.ok + ' · 已签 ' + wb.skip + ' · 失败 ' + wb.fail);
-
+  // ② WorkBuddy IDE 号池。
+  jobs.push((async () => {
     try {
-      // Qoder 现在是「号池逐号签到」，按 results 七相汇总（不再有单一 phase）。
+      const wb = await doWbCheckinAll(null);
+      return ['WorkBuddy 成功 ' + wb.ok + ' · 已签 ' + wb.skip + ' · 失败 ' + wb.fail, wb.fail];
+    } catch (e) { return ['WorkBuddy 失败：' + e.message, 1]; }
+  })());
+
+  // ③ Qoder：号池逐号签到，按 results 七相汇总（不再有单一 phase）。
+  jobs.push((async () => {
+    try {
       const q = await api('ide/qoder/checkin', { method: 'POST', body: '{}' });
       const qr = (q && q.results) || [];
       const qc = qdCounts(qr);
       const qfail = qc.failed + qc.login_required + qc.error;
-      failCount += qfail;
       let qtxt = '已领 ' + qc.claimed + ' · 今日已领 ' + qc.already +
         (qc.blocked ? ' · 同一人已领 ' + qc.blocked + '（未签到）' : '') +
         (qc.pending ? ' · 今日未下发 ' + qc.pending : '') +
         (qfail ? ' · 失败 ' + qfail : '');
       if (q && q.credits) qtxt += '（+' + q.credits + '）';
-      parts.push('Qoder ' + qtxt);
-    } catch (e) { failCount++; parts.push('Qoder 失败：' + e.message); }
+      return ['Qoder ' + qtxt, qfail];
+    } catch (e) { return ['Qoder 失败：' + e.message, 1]; }
+  })());
 
+  // ④ MiniMax：号池逐账号签到（token 级，无需切号）。
+  // 注意：access token 有效期约 1 小时，refresh token 单次有效；客户端没续期时
+  // 这里会 401 —— 属于「该号需重新授权」，不是网关故障，如实计数即可。
+  jobs.push((async () => {
     try {
-      // MiniMax：号池逐账号签到（token 级，无需切号）。
-      // 注意：access token 有效期约 1 小时，refresh token 单次有效；客户端没续期时
-      // 这里会 401 —— 属于「该号需重新授权」，不是网关故障，如实计数即可。
       const mm = await api('ide/minimax/checkin', { method: 'POST', body: '{}' });
       const mr = (mm && mm.results) || [];
-      if (!mr.length) {
-        parts.push('MiniMax 无账号');
-      } else {
-        failCount += (mm.failed_accounts || 0);
-        let mtxt = '成功 ' + (mm.claimed_accounts || 0) + ' · 已签 ' + (mm.already_accounts || 0) +
-          ' · 失败 ' + (mm.failed_accounts || 0);
-        if (mm.credits) mtxt += '（+' + mm.credits + '）';
-        parts.push('MiniMax ' + mtxt);
-      }
-    } catch (e) { failCount++; parts.push('MiniMax 失败：' + e.message); }
+      if (!mr.length) return ['MiniMax 无账号', 0];
+      let mtxt = '成功 ' + (mm.claimed_accounts || 0) + ' · 已签 ' + (mm.already_accounts || 0) +
+        ' · 失败 ' + (mm.failed_accounts || 0);
+      if (mm.credits) mtxt += '（+' + mm.credits + '）';
+      return ['MiniMax ' + mtxt, (mm.failed_accounts || 0)];
+    } catch (e) { return ['MiniMax 失败：' + e.message, 1]; }
+  })());
 
+  // ⑤ CodeArts：网页 Cookie 通道，逐个账号打开控制台点「每日领取」。
+  jobs.push((async () => {
     try {
-      // CodeArts：网页 Cookie 通道，逐个账号打开控制台点「每日领取」。
       const ca = await api('ide/codearts/checkin', { method: 'POST', body: '{}' });
       const car = (ca && ca.results) || [];
-      if (!car.length) {
-        parts.push('CodeArts 无账号');
-      } else {
-        parts.push('CodeArts 成功 ' + (ca.claimed_accounts || 0) + ' · 已签 ' + (ca.already_accounts || 0) +
-          ' · 失败 ' + (ca.failed_accounts || 0));
-      }
-    } catch (e) { parts.push('CodeArts 失败：' + e.message); }
+      if (!car.length) return ['CodeArts 无账号', 0];
+      return ['CodeArts 成功 ' + (ca.claimed_accounts || 0) + ' · 已签 ' + (ca.already_accounts || 0) +
+        ' · 失败 ' + (ca.failed_accounts || 0), (ca.failed_accounts || 0)];
+    } catch (e) { return ['CodeArts 失败：' + e.message, 1]; }
+  })());
 
+  // ⑥ Trae。
+  jobs.push((async () => {
     try {
       const t = await api('trae/checkin', { method: 'POST', body: '{}' });
       const arr = (t && t.results) || [];
-      const okc = arr.filter(r => r.status === 'claimed').length;
-      const alc = arr.filter(r => r.status === 'already').length;
       const fc = arr.filter(r => r.status === 'fail').length;
-      failCount += fc;
-      parts.push('Trae 成功 ' + okc + ' · 已签 ' + alc + ' · 失败 ' + fc);
-    } catch (e) { failCount++; parts.push('Trae 失败：' + e.message); }
+      return ['Trae 成功 ' + arr.filter(r => r.status === 'claimed').length +
+        ' · 已签 ' + arr.filter(r => r.status === 'already').length + ' · 失败 ' + fc, fc];
+    } catch (e) { return ['Trae 失败：' + e.message, 1]; }
+  })());
 
+  // ⑦ 豆包：CDP 无头浏览器通道（每号一个会话，耗时略长）。
+  jobs.push((async () => {
     try {
-      // 豆包：CDP 无头浏览器通道（每号一个会话，耗时略长）。
       const db = await api('ide/doubao/checkin', { method: 'POST', body: '{}' });
       const dr = (db && db.results) || [];
-      if (!dr.length) {
-        parts.push('豆包 无账号');
+      if (!dr.length) return ['豆包 无账号', 0];
+      const dok = dr.filter(r => r.phase === 'claimed').length;
+      const dal = dr.filter(r => r.phase === 'already').length;
+      return ['豆包 成功 ' + dok + ' · 已签 ' + dal + ' · 失败 ' + (db.failed_accounts || 0),
+        (db.failed_accounts || 0)];
+    } catch (e) { return ['豆包 失败：' + e.message, 1]; }
+  })());
+
+  const parts = [];
+  let failCount = 0;
+  try {
+    /* allSettled：某一个平台炸了不影响其它平台的结果汇总。 */
+    const settled = await Promise.allSettled(jobs);
+    for (const s of settled) {
+      if (s.status === 'fulfilled') {
+        parts.push(s.value[0]);
+        failCount += (s.value[1] || 0);
       } else {
-        failCount += (db.failed_accounts || 0);
-        const dok = dr.filter(r => r.phase === 'claimed').length;
-        const dal = dr.filter(r => r.phase === 'already').length;
-        parts.push('豆包 成功 ' + dok + ' · 已签 ' + dal + ' · 失败 ' + (db.failed_accounts || 0));
+        failCount++;
+        parts.push('失败：' + ((s.reason && s.reason.message) || s.reason));
       }
-    } catch (e) { failCount++; parts.push('豆包 失败：' + e.message); }
+    }
 
     const text = parts.join('；');
     if (st) { st.className = failCount > 0 ? 'state err' : 'state ok'; st.textContent = '完成：' + text; }
     toast('一键签到完成：' + text, failCount > 0 ? 'err' : 'ok');
     await loadCheckinPool(true);
-    loadTraeStatus(true); loadTraeCredits(true); loadQkCredits(true); loadWkCredits(true);
+    loadTraeStatus(true); loadTraeCredits(true); loadQkCredits(true); loadWkCredits(true); loadMmCredits(true); loadCaCredits(true);
     loadOverview(true);
   } catch (e) {
     if (st) { st.className = 'state err'; st.textContent = e.message; }
@@ -6258,9 +6465,9 @@ async function loadQkCredits(quiet) {
     st.hidden = true;
     tb.innerHTML = rows.map(a => {
       const email = a.email || '';
-      return '<tr><td class="who"><div class="nm">' + esc(a.name || '未命名') +
+      return '<tr><td class="who"><div class="nm">' + esc(identName(a.name, email, '未命名')) +
         (a.current ? '<span class="tag mute" style="margin-left:6px">当前</span>' : '') + '</div>' +
-        '<div class="id">' + esc(email) + '</div></td>' +
+        '<div class="id">' + esc(identLabel(email, '未设置')) + '</div></td>' +
         '<td class="num" data-qk-total="' + esc(email) + '"><span class="note">查询中…</span></td>' +
         '<td class="num"><b>+100</b></td></tr>';
     }).join('');
@@ -6329,5 +6536,80 @@ async function loadWkCredits(quiet) {
       const out = tb.querySelector('[data-wk-out="' + CSS.escape(uid) + '"]');
       query(uid, out);
     });
+  } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+}
+
+/* ── MiniMax 积分总览块（2026-11-10 新增）────────────────────────────
+   之前积分总览只有 Trae / Qoder / WorkBuddy / CodeArts 四块，MiniMax 只在
+   签到页露过一行 credits，用户看不到「总量还剩多少」→ 这里补一块。
+   数据来自 ide/minimax/accounts（该接口已并发查好 credits / credits_total /
+   claimed_today / points_today），不额外打上游。 */
+async function loadMmCredits(quiet) {
+  const st = $('mmCrState'), tb = $('mmCrBody');
+  if (!st || !tb) return;
+  if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; tb.innerHTML = ''; }
+  try {
+    const d = await api('ide/minimax/accounts');
+    const arr = (d && d.accounts) || [];
+    if (!arr.length) {
+      st.hidden = false; st.className = 'state';
+      st.textContent = d.has_client ? 'MiniMax 号池为空（可点「添加当前账号」）。' : 'MiniMax Code 未登录。';
+      tb.innerHTML = ''; return;
+    }
+    st.hidden = true;
+    tb.innerHTML = arr.map(a => {
+      const ident = a.email || a.user_id || a.id || '';
+      const remain = Number(a.credits || 0);
+      const total = Number(a.credits_total || 0);
+      const bal = '<b>' + remain.toLocaleString('zh-CN') + '</b>' +
+        (total > 0 ? ' <span class="note">/ 总量 ' + total.toLocaleString('zh-CN') + '</span>' : '');
+      const gain = a.claimed_today
+        ? '<span style="color:var(--ink-3)">今日已签</span>'
+        : '<b>+' + Number(a.points_today || 0).toLocaleString('zh-CN') + '</b>';
+      return '<tr><td class="who"><div class="nm">' + esc(identName(a.user_name || a.label, ident, 'MiniMax 账号')) +
+        (a.id && a.id === d.current_id ? '<span class="tag mute" style="margin-left:6px">当前</span>' : '') + '</div>' +
+        '<div class="id">' + esc(identLabel(ident, '未设置')) + '</div></td>' +
+        '<td class="num">' + bal + '</td>' +
+        '<td class="num">' + gain + '</td></tr>';
+    }).join('');
+  } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
+}
+/* ── CodeArts（华为）积分块（2026-11-08 新增）──────────────────────────
+   积分总览原来只有 Trae / Qoder / WorkBuddy 三块 —— 但华为云码道每天也有
+   100 积分，只在「签到」页里露过一眼。用户要的是「几个都做齐」，
+   所以这里补上第四块。
+
+   数据直接取 ide/codearts/accounts：那个接口本来就**并发**查好了每个号的
+   credits / daily_bonus / checked_in_today，这里只是把它显示出来，
+   不会再多打一次上游（这也是"别让面板更慢"的要求）。 */
+async function loadCaCredits(quiet) {
+  const st = $('caCrState'), tb = $('caCrBody');
+  if (!st || !tb) return;
+  if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; tb.innerHTML = ''; }
+  try {
+    const d = await api('ide/codearts/accounts');
+    const arr = (d && d.accounts) || [];
+    if (!arr.length) {
+      st.hidden = false; st.className = 'state'; st.textContent = 'CodeArts 号池为空。'; tb.innerHTML = ''; return;
+    }
+    st.hidden = true;
+    tb.innerHTML = arr.map(a => {
+      const label = a.label || a.email || a.id || '账号';
+      const remain = a.credits;
+      const total = a.credits_total;
+      const bal = (remain === null || remain === undefined)
+        ? '<span style="color:var(--ink-3)">—</span>'
+        : '<b>' + Number(remain).toLocaleString('zh-CN') + '</b>' +
+          (total !== null && total !== undefined ? ' / ' + Number(total).toLocaleString('zh-CN') : '');
+      const gain = a.checked_in_today
+        ? '<span style="color:var(--ink-3)">今日已签</span>'
+        : '<b>+' + Number(a.daily_bonus || 0).toLocaleString('zh-CN') + '</b>';
+      const dead = a.login_expired ? '<span class="tag mute">会话失效</span>' : '';
+      return '<tr><td class="who"><div class="nm">' + esc(identName(label, a.email, '账号')) +
+        (dead ? dead : '') + '</div>' +
+        '<div class="id">' + esc(identLabel(a.email || a.id, '')) + '</div></td>' +
+        '<td class="num">' + bal + '</td>' +
+        '<td class="num">' + gain + '</td></tr>';
+    }).join('');
   } catch (e) { st.hidden = false; st.className = 'state err'; st.textContent = e.message; }
 }

@@ -264,6 +264,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/checkin-status", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.qoderCheckinStatus)))
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/usage", p.withAuth(p.cachedRead(apiCacheTTLIDE, p.qoderUsage)))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/renew", p.withAuth(p.qoderRenew))
+	p.mux.HandleFunc("POST /panel/api/ide/qoder/relogin", p.withAuth(p.qoderRelogin))
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/device", p.withAuth(p.qoderDevice))
 
 	// MiniMax Code：多账号号池 + 每日签到 + 积分（token 级操作，无需切号）

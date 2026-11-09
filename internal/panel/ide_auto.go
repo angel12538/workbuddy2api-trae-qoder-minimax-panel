@@ -60,7 +60,11 @@ func (p *Panel) StartMinimaxRenewAuto(ctx context.Context) {
 		return
 	}
 	go func() {
-		t := time.NewTicker(30 * time.Minute)
+		// ⚠ 2026-11-08：从 30 分钟收到 **10 分钟**（用户要求自动续期快一点）。
+		//   MiniMax 的 access token 有效期约 1 小时、refresh token 单次有效 ——
+		//   巡检越稀，越可能撞上"已经过期才想起来续"（401）。
+		//   这一轮只是比对本地有效期，不会打上游，很便宜。
+		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
 		for {
 			select {

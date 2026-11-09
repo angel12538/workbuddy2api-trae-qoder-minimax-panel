@@ -1126,14 +1126,42 @@ func (p *Panel) codeartsAccountItem(a *codearts.Account) map[string]any {
 	// 服务端说今天已领 ⇒ 直接算"已签到"。服务端是权威：
 	// 面板上显示"可签到"但点了才知道其实领过，是最让人困惑的状态。
 	serverClaimed := false
-	if camps, cerr := codearts.Campaigns(a); cerr == nil {
-		if c, ok := codearts.DailyCampaign(camps); ok {
+
+	/*
+	 * ⚠ 2026-11-08：这两个上游请求改成**并行**。
+	 *   以前是串行：Campaigns → Credits，各 8 秒超时 —— 一个死会话账号
+	 *   会把整张列表拖住 16 秒（账号之间虽然并发，但一个慢号就够面板卡半天）。
+	 *   并行后单号最坏 8 秒。
+	 *   两个请求互不依赖（一个查活动、一个查余额），并行没有副作用问题。
+	 */
+	type campResult struct {
+		camps []codearts.Campaign
+		err   error
+	}
+	type creditResult struct {
+		ci  *codearts.CreditInfo
+		err error
+	}
+	chCamp := make(chan campResult, 1)
+	chCredit := make(chan creditResult, 1)
+	go func() {
+		c, e := codearts.Campaigns(a)
+		chCamp <- campResult{c, e}
+	}()
+	go func() {
+		ci, e := codearts.Credits(a)
+		chCredit <- creditResult{ci, e}
+	}()
+
+	cr := <-chCamp
+	if cr.err == nil {
+		if c, ok := codearts.DailyCampaign(cr.camps); ok {
 			daily = float64(c.BenefitAmount)
 			a.DailyBonus = daily
 			serverClaimed = c.Claimed() || !c.Claimable
 			item["daily_claimed"] = serverClaimed
 		}
-	} else if errors.Is(cerr, codearts.ErrSessionExpired) {
+	} else if errors.Is(cr.err, codearts.ErrSessionExpired) {
 		expired = true
 	}
 	item["daily_bonus"] = daily
@@ -1144,7 +1172,9 @@ func (p *Panel) codeartsAccountItem(a *codearts.Account) map[string]any {
 		item["checked_in_today"] = true
 	}
 
-	if ci, cerr := codearts.Credits(a); cerr == nil && ci != nil {
+	lr := <-chCredit
+	if lr.err == nil && lr.ci != nil {
+		ci := lr.ci
 		a.CreditsRemain, a.CreditsTotal = ci.Remain, ci.Total
 		a.CreditsUsed, a.CreditsExpiring = ci.Used, ci.Expiring
 		item["credits"] = ci.Remain
@@ -1159,7 +1189,7 @@ func (p *Panel) codeartsAccountItem(a *codearts.Account) map[string]any {
 			item["credits_used"] = a.CreditsUsed
 			item["credits_expiring"] = a.CreditsExpiring
 		}
-		if errors.Is(cerr, codearts.ErrSessionExpired) {
+		if errors.Is(lr.err, codearts.ErrSessionExpired) {
 			// 会话已失效（等价于 failed）：credits 必须是 0，**不能**拿旧快照
 			// 冒充"当前余额"（契约澄清 #4）。旧值仍在 credits_total 等快照字段里。
 			item["credits"] = 0.0
@@ -1766,15 +1796,16 @@ func (p *Panel) codeartsMigratePool() {
 // 华为云的会话是「空闲超时」型：长时间不用才失效。定时打一次能把有效期
 // 拉到服务端允许的上限，并顺带吸收服务端续期下发的新 Cookie。
 //
-// 频率 15 分钟：实测服务端只回一个会话 Cookie（BENSESSCC_TAG），
-// **不给 SessionID 续期**，所以保活不是"续签"，而是"别让它因闲置而过期"。
-// 15 分钟足够把空闲计时器一直按在阈值以内。
+// 频率 5 分钟（2026-11-08 从 15 分钟调快）：实测服务端只回一个会话 Cookie
+// （BENSESSCC_TAG），**不给 SessionID 续期**，所以保活不是"续签"，
+// 而是"别让它因闲置而过期"—— 那就更不能隔太久才碰它一次。
+// 5 分钟足够把空闲计时器一直按在阈值以内（一次就是一个轻量接口的开销）。
 //
 // ⚠️ 这里必须比较 Cookie 的**值**而不是条数：服务端续期是**同名换值**
 // （条数不变），只看条数的话新 Cookie 永远存不回号池，等于白保活。
 func (p *Panel) codeartsKeepalive() {
 	p.codeartsKeepaliveOnce()
-	t := time.NewTicker(15 * time.Minute)
+	t := time.NewTicker(5 * time.Minute)
 	defer t.Stop()
 	for range t.C {
 		p.codeartsKeepaliveOnce()
@@ -1792,34 +1823,53 @@ func (p *Panel) codeartsKeepaliveOnce() {
 	// 不再整池回写（整池回写会把补采/续期刚写的新快照覆盖回旧值）。
 	changedIDs := make([]*codearts.Account, 0, len(pool.Accounts))
 	now0 := time.Now()
+
+	/*
+	 * ⚠ 2026-11-08：账号之间改成**并发**保活。
+	 *   以前是逐号串行，一个死会话账号要等满 5 秒超时才轮到下一个；
+	 *   号一多，一轮保活本身就可能超过新的 5 分钟间隔 —— 那等于保活没跟上，
+	 *   "别让它因闲置而过期"这个目的就落空了。
+	 *   面板的 keepalive 接口本来就是并发做的（codeartsKeepaliveHTTP），
+	 *   这里与它保持一致。
+	 *   每号改的是自己的 *Account，互不影响；落盘统一在下面做。
+	 */
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, a := range pool.Accounts {
 		if a == nil || len(a.Cookies) == 0 {
 			continue
 		}
-		before := codeartsCookieDigest(a.Cookies)
-		ok, kerr := codearts.Keepalive(a)
-		if kerr != nil {
-			if errors.Is(kerr, codearts.ErrSessionExpired) {
-				// 会话判死是**不可自愈**的状态：旧版每 15 分钟播一条，一天 96 条，
-				// 把日志里真正有用的东西冲没了。每天只播第一条。
-				if codeartsNoteOnce("codearts:dead:" + a.ID) {
-					log.Printf("[codearts] 账号 %s 会话已失效，需要重新登录（今天已提醒过，后续静默；"+
-						"自动续期见 panel: CodeArts 相关日志）", a.ID)
+		wg.Add(1)
+		go func(a *codearts.Account) {
+			defer wg.Done()
+			before := codeartsCookieDigest(a.Cookies)
+			ok, kerr := codearts.Keepalive(a)
+			if kerr != nil {
+				if errors.Is(kerr, codearts.ErrSessionExpired) {
+					// 会话判死是**不可自愈**的状态：旧版每 15 分钟播一条，一天 96 条，
+					// 把日志里真正有用的东西冲没了。每天只播第一条。
+					if codeartsNoteOnce("codearts:dead:" + a.ID) {
+						log.Printf("[codearts] 账号 %s 会话已失效，需要重新登录（今天已提醒过，后续静默；"+
+							"自动续期见 panel: CodeArts 相关日志）", a.ID)
+					}
+				} else {
+					log.Printf("[codearts] 账号 %s 保活失败: %v", a.ID, kerr)
 				}
-			} else {
-				log.Printf("[codearts] 账号 %s 保活失败: %v", a.ID, kerr)
+				return
 			}
-			continue
-		}
-		if !ok {
-			continue
-		}
-		if codeartsCookieDigest(a.Cookies) != before {
-			changed = true
-			changedIDs = append(changedIDs, a)
-			log.Printf("[codearts] 账号 %s 保活时收到续期 Cookie，已更新", a.ID)
-		}
+			if !ok {
+				return
+			}
+			if codeartsCookieDigest(a.Cookies) != before {
+				mu.Lock()
+				changed = true
+				changedIDs = append(changedIDs, a)
+				mu.Unlock()
+				log.Printf("[codearts] 账号 %s 保活时收到续期 Cookie，已更新", a.ID)
+			}
+		}(a)
 	}
+	wg.Wait()
 	if changed {
 		// 原子落盘（C-CA-TICKET@1 的 UpdatePool）：与补采/续期/登录并发写同一份
 		// 号池时，各自 Load→改→Save 会互相覆盖；这里持包级锁读-改-写。

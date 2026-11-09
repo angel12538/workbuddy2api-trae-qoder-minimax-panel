@@ -30,7 +30,12 @@ const (
 	// traeRefreshMargin 剩余不足这个时长就续期（JWT 8h → 提前 3h 续，够容错）。
 	traeRefreshMargin = 3 * time.Hour
 	// traeRefreshInterval 续期巡检间隔。
-	traeRefreshInterval = 4 * time.Hour
+	//
+	// ⚠ 2026-11-08：从 4 小时收到 **1 小时**（用户要求自动续期快一点）。
+	//   巡检本身很轻（只看本地 JWT 还剩多久），真正要续时才起浏览器，
+	//   1 小时一轮不会把浏览器拖垮，却能把"临期没赶上续"的窗口从
+	//   "最多 4 小时"压到"最多 1 小时"。
+	traeRefreshInterval = 1 * time.Hour
 )
 
 // traeRefreshMu 串行化续期：浏览器通道一次只能占一个 profile / 调试端口，

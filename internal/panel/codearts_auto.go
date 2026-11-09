@@ -39,13 +39,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/clockskew"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/codearts"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/ideauth"
 )
 
 const (
-	// codeartsAutoInterval 自动领取/续期巡检的间隔（与 codearts.AliveRecheck 同值）。
-	codeartsAutoInterval = codearts.AliveRecheck
+	// codeartsAutoInterval 自动领取/续期巡检的间隔。
+	//
+	// ⚠ 2026-11-08：从 15 分钟（= codearts.AliveRecheck）收到 **5 分钟**。
+	//   理由：华为云的应用会话是「空闲超时」型 —— 实测寿命约 7 小时，
+	//   但服务端**不续 SessionID**（保活只回一个 BENSESSCC_TAG），
+	//   所以保活能做的只是「别让它因闲置而过期」。
+	//   巡检越慢，一次请求的间隔就越可能踩在服务端的闲置阈值边上，
+	//   于是号莫名其妙就死了，只能重新扫码。
+	//   5 分钟一次只是打一个轻量接口（/chat/snap-manager/v1/package/overview），
+	//   成本可以忽略，却把「因闲置掉线」的概率压下去。
+	//   真正换不回会话时（票据过期）仍然是 needs_login —— 那是另一回事，
+	//   调快巡检解决不了，只能人工登录一次。
+	codeartsAutoInterval = 5 * time.Minute
 )
 
 // ── 可注入的执行钩子（生产默认指向真实实现；测试用来避免打上游/起浏览器） ──
@@ -131,7 +143,7 @@ func (p *Panel) codeartsAutoCheckinOnce() {
 	if err != nil || pool == nil || len(pool.Accounts) == 0 {
 		return
 	}
-	now := time.Now()
+	now := clockskew.Now()
 	plan := codeartsSamePersonDailyPlan(pool.Accounts, now)
 	claimed := 0
 	for _, a := range pool.Accounts {
@@ -459,7 +471,10 @@ func (p *Panel) codeartsSilentRenewOnce() {
 	if err != nil || pool == nil {
 		return
 	}
-	now := time.Now()
+	// 用**校准后**的时间：本机钟实测快 8 小时，拿未校准的 time.Now() 去比
+	// 服务端下发的票据到期时间，会提前 8 小时判成 ticket_expired →
+	// 直接 needs_login（跳过续期）→ 用户看到的就是「每次都要重新认证」。
+	now := clockskew.Now()
 	// 同人组当日只打一次：两个号属于同一个人时，第二个号本轮直接跳过，
 	// 不重复起浏览器、不重复打上游。
 	plan := codeartsSamePersonDailyPlan(pool.Accounts, now)
@@ -550,7 +565,8 @@ func (p *Panel) codeartsRenewAccount(a *codearts.Account, force bool) (phase, ms
 	if len(a.Cookies) == 0 {
 		return "failed", "账号没有 Cookie，无法续期；请重新登录或粘贴 Cookie"
 	}
-	now := time.Now()
+	// 校准后时间（见 codeartsSilentRenewOnce 处的说明）
+	now := clockskew.Now()
 
 	// 浏览器是独占资源：登录窗口开着时起第二个会抢调试端口，还会把用户
 	// 正在操作的窗口弄乱。
@@ -1091,27 +1107,57 @@ func (p *Panel) codeartsSilentRenew(acc *codearts.Account) (phase, msg string) {
 	// Cookie + 槽指纹（UA/语言/时区）一次做完：顺序必须是「Cookie → 指纹 →
 	// Page.navigate」，否则首个请求已经带着真实 UA 发出去，再改只对后续 XHR 生效。
 	// 指纹失败只记日志，不阻断（见 caSetCookiesAndFingerprint）。
-	if err := caSetCookiesAndFingerprint(port, ws, acc); err != nil {
-		return "failed", "注入 Cookie 失败: " + err.Error()
-	}
 	loginURL := "https://auth.huaweicloud.com/authui/login?service=" +
 		url.QueryEscape(codearts.APIBase+"/chat/home")
-	if err := caNavigate(ws, loginURL); err != nil {
-		return "failed", "导航失败: " + err.Error()
-	}
-	back := ""
-	for i := 0; i < 25; i++ {
-		time.Sleep(2 * time.Second)
-		cur := caPageURL(port, "")
-		if cur == "" || strings.Contains(cur, "about:blank") {
-			continue
+
+	// ── 两次尝试 ──────────────────────────────────────────────────────
+	// 第一次只带**长期票据**（不带已死的 SSO 会话 Cookie），第二次带全量。
+	// 为什么要分两步，见 codeartsSSOSessionCookies 的说明。
+	//
+	// 每次尝试 = 注入 Cookie → 导航 → 等跳回 devcloud 域。
+	tryOnce := func(cookies []codearts.Cookie) (string, bool, error) {
+		if err := caSetCookiesAndFingerprintWith(port, ws, acc, cookies); err != nil {
+			return "", false, err
 		}
-		back = cur
-		if strings.Contains(hostOf(cur), "devcloud") {
-			break
+		if err := caNavigate(ws, loginURL); err != nil {
+			return "", false, err
+		}
+		back := ""
+		for i := 0; i < 25; i++ {
+			time.Sleep(2 * time.Second)
+			cur := caPageURL(port, "")
+			if cur == "" || strings.Contains(cur, "about:blank") {
+				continue
+			}
+			back = cur
+			if strings.Contains(hostOf(cur), "devcloud") {
+				break
+			}
+		}
+		return back, strings.Contains(hostOf(back), "devcloud"), nil
+	}
+
+	back, ok, err := tryOnce(codeartsCookiesWithoutSSOSession(acc.Cookies))
+	if err != nil {
+		return "failed", "注入 Cookie/导航失败: " + err.Error()
+	}
+	if !ok {
+		// 第二次：带上全量 Cookie。若浏览器里已经有了**新签发**的
+		// SSOTGC/SSOJTC（第一次尝试过程中 authui 发的），以浏览器里的为准，
+		// 别用号池里那条早就作废的旧值把它盖掉。
+		full := codeartsCookiesMergedWithBrowser(acc.Cookies, port)
+		back2, ok2, err2 := tryOnce(full)
+		if err2 != nil {
+			return "failed", "注入 Cookie/导航失败: " + err2.Error()
+		}
+		if ok2 {
+			back = back2
+			ok = true
+		} else {
+			back = back2
 		}
 	}
-	if !strings.Contains(hostOf(back), "devcloud") {
+	if !ok {
 		// 停在 auth 域 = 票据被服务端拒绝，只能人工重新登录。
 		// 这不是"可重试的网络错误"：2 小时后重试同一个死票据仍会停在登录页。
 		return "needs_login", "票据换不回会话（停在 " + back + "），需要人工重新登录"

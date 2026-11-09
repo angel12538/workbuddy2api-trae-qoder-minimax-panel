@@ -970,6 +970,9 @@ type AccountStatus struct {
 	ClaimedToday bool    `json:"claimed_today"`
 	Points       float64 `json:"points_today"`
 	Credits      float64 `json:"credits"`
+	// CreditsTotal 累计授予的积分总量（各明细包 granted 之和）。
+	// 有了它才能回答「总量还剩多少」：remaining / total。
+	CreditsTotal float64 `json:"credits_total"`
 	Expired      bool    `json:"expired"`
 	ExpiresAtMs  int64   `json:"expires_at_ms"`
 	Error        string  `json:"error,omitempty"`
@@ -1027,6 +1030,7 @@ func StatusOfAccounts(ctx context.Context, client *Client) ([]AccountStatus, err
 		}
 		if cerr == nil && credits != nil {
 			st.Credits = credits.Remaining
+			st.CreditsTotal = credits.Granted
 		}
 		out = append(out, st)
 	}

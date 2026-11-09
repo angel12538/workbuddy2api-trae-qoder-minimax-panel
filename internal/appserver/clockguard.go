@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sort"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/clockskew"
 )
 
 // 本机时钟核对闸。
@@ -67,6 +69,9 @@ func checkClockSkew(ctx context.Context) {
 		log.Printf("时钟核对跳过：拿不到任何上游时间源（%v）", err)
 		return
 	}
+	/* 把偏差共享出去：CodeArts 的票据临期判定要用校准后的时间，
+	   否则钟快 8 小时会提前把票据判死 → 静默续期被跳过 → 每次都要重新登录。 */
+	clockskew.SetSkew(skew)
 	abs := skew
 	if abs < 0 {
 		abs = -abs
@@ -75,9 +80,9 @@ func checkClockSkew(ctx context.Context) {
 		log.Printf("时钟核对：本机与上游时间一致（%d 个源，最大偏差 %v）", n, abs.Round(time.Second))
 		return
 	}
-	dir := "慢"
+	dir := "快"
 	if skew > 0 {
-		dir = "快" // 上游时间 > 本机时间 = 本机慢了
+		dir = "慢" // 上游时间 > 本机时间 = 本机慢（skew 是 server-local）
 	}
 	log.Printf("⚠️⚠️ 本机时钟比上游%s %v（%d 个源核对）——"+
 		"「每天几点」的判定会成片错位：签到可信线（今日 10:05）、每日幂等键（本地自然日）、"+

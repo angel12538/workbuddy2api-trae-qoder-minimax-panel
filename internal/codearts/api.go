@@ -26,8 +26,13 @@ var APIBase = "https://devcloud.cn-north-4.huaweicloud.com"
 
 const apiUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 
-// 8 秒足够：积分/活动列表都是小接口，超时太久会把面板列表卡在「加载中」。
-var apiClient = &http.Client{Timeout: 8 * time.Second}
+// 5 秒足够：积分/活动列表都是小接口，超时太久会把面板列表卡在「加载中」。
+// ⚠ 2026-11-08 从 8 秒收紧到 5 秒：一个死会话账号原来能把整张列表拖住 16 秒
+// （两个接口串行各等 8 秒），用户点进去要等半天。现在两个接口并行，
+// 单号最坏 5 秒。
+// 超时**不会**被误判成"会话失效"：只有明确的登录页特征才返回 ErrSessionExpired，
+// 网络超时报的是 network（见 panel 的 codeartsKeepalivePhase）。
+var apiClient = &http.Client{Timeout: 5 * time.Second}
 
 // ErrSessionExpired 会话已失效。
 //

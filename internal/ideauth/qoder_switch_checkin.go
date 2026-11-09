@@ -68,13 +68,29 @@ func QoderSwitchedCheckinAll(logf func(string)) []QoderSwitchResult {
 			out = append(out, QoderSwitchResult{Email: email, Phase: "error", Msg: "客户端无法结束（" + note + "）"})
 			continue
 		}
-		if _, err := SwitchQoderTo(email, false); err != nil {
+		// ⚠️ restoreMachine 必须为 true：切号时要把**该号自己的** machine-id 一起恢复。
+		//
+		// 旧实现传 false，客户端于是带着**上一个号**的设备身份跑起来（auth.machine-id
+		// 是按登录账号写的）。后果有两条，都是实测踩出来的：
+		//  1. 上游不把这个号的每日活动发给它 —— 活动挂在「账号 + 设备身份」上，
+		//     设备对不上就只看到一条无关的旧促销（2026-11-09 实测：QQ 号列表里
+		//     只有 act-20261020-944 的促销，没有当天的每日 CLAIM_BENEFIT）；
+		//  2. 号池被污染 —— 切号后 CaptureQoderSnapshot 读的是 machine-id **文件**，
+		//     于是把上一个号的 machine_id 写进了这个号的快照（实测 QQ 号的
+		//     39b526e1 被覆盖成 gmail 的 e5e46416）。
+		if _, err := SwitchQoderTo(email, true); err != nil {
 			out = append(out, QoderSwitchResult{Email: email, Phase: "error", Msg: "切号失败: " + err.Error()})
 			continue
 		}
 		LaunchClient("qoder")
 		// 客户端启动 + deviceToken 刷新 + 活动下发，留足等待；签不到也会如实回报。
 		time.Sleep(30 * time.Second)
+		// 把客户端当前的登录态收回号池：客户端可能刷新过 token / 重新解析过 scope，
+		// 不回收的话号池里留的还是切号前那份旧快照。
+		if snap, err := CaptureQoderSnapshot(); err == nil && snap != nil &&
+			strings.EqualFold(snap.Email, email) {
+			_, _, _ = UpsertQoderAccount()
+		}
 		res, cerr := QoderCheckin() // 当前登录路径：真实设备指纹
 		phase := "error"
 		msg := ""
@@ -99,7 +115,7 @@ func QoderSwitchedCheckinAll(logf func(string)) []QoderSwitchResult {
 		if note := KillClient("qoder"); strings.Contains(note, "仍未退出") {
 			log("恢复失败：客户端无法结束（" + note + "）")
 		}
-		if _, err := SwitchQoderTo(orig, false); err != nil {
+		if _, err := SwitchQoderTo(orig, true); err != nil {
 			log("恢复失败：" + err.Error())
 		} else {
 			LaunchClient("qoder")

@@ -490,6 +490,11 @@ func Run() {
 	// MiniMax 凭证自动续期：access token 只有 1 小时，refresh token 每刷必轮换，
 	// 号池副本不续就死。每 30 分钟巡检临期账号，与客户端共享同一条 RT 链。
 	pn.StartMinimaxRenewAuto(ctx)
+	// Qoder 号池后台自动续期（2026-11-08 新增）：以前只有手动续期按钮，
+	// 而且只续当前登录那一个号 —— 号池里其它号的 token 过期后，
+	// 只能等签到时撞上 401 才现续，那一次签到就废了。
+	// 这里每小时把「剩余有效期不足 24 小时」的号提前续上。
+	pn.StartQoderRenewAuto(ctx)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，

@@ -141,24 +141,41 @@ body {
 .srow .luck { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .srow .luck svg { width: 14px; height: 14px; opacity: .7; }
 .srow .err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); margin-top: -4px; }
-/* Trae 签到行：账号 | 今日状态 | 积分 | 单号操作 */
-.trow { display: grid; grid-template-columns: minmax(150px, 230px) 1fr auto auto; gap: 14px; align-items: center; padding: 13px 16px; }
+/* 签到池所有平台行统一列宽（账号 | 积分 | 状态 | 操作）——
+   以前各平台各写各的 grid（1fr / auto 混用），同页里列线互相错开。
+   现在用同一组变量，六个平台（WorkBuddy/Qoder/MiniMax/CodeArts/豆包/Trae）共用。 */
+:root {
+  --ck-cols: minmax(160px, 260px) 132px 190px auto;
+}
+/* Trae 签到行：账号 | 积分 | 状态 | 操作 */
+.trow { display: grid; grid-template-columns: var(--ck-cols); gap: 14px; align-items: center; padding: 13px 16px; }
 .trow + .trow { border-top: 1px solid var(--line-soft); }
 .trow .who .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trow .who .id { font: 10.5px var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trow .credits { font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .trow .err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); margin-top: -4px; }
-.thead { display: grid; grid-template-columns: minmax(150px, 230px) 1fr auto auto; gap: 14px; padding: 8px 16px; font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft); }
+.thead { display: grid; grid-template-columns: var(--ck-cols); gap: 14px; padding: 8px 16px; font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft); }
+/* 积分总览四张表统一列宽（账号 | 积分余额 | 签到可得），保证四块竖线对齐 */
+.acc.ckfix { table-layout: fixed; }
+.acc.ckfix th:nth-child(1), .acc.ckfix td:nth-child(1) { width: 46%; }
+.acc.ckfix th:nth-child(2), .acc.ckfix td:nth-child(2) { width: 27%; }
+.acc.ckfix th:nth-child(3), .acc.ckfix td:nth-child(3) { width: 27%; }
+.acc.ckfix td { overflow: hidden; }
+.acc.ckfix td.who .nm, .acc.ckfix td.who .id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* CodeArts 账号行：默认只有一行摘要（账号 · 状态 · 今日积分），点行才展开技术详情。
    正常状态不出现按钮与长文案 —— 这是「默认不打扰」的落地点。 */
-#ckCaList .ca-row { display: block; padding: 11px 16px; cursor: pointer; }
-#ckCaList .ca-sum { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-#ckCaList .ca-sum .ca-name { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 340px; }
+#ckCaList .ca-row { display: block; padding: 0; cursor: pointer; }
+#ckCaList .ca-row + .ca-row { border-top: 1px solid var(--line-soft); }
+#ckCaList .ca-sum { display: grid; grid-template-columns: var(--ck-cols); gap: 14px; align-items: center; padding: 13px 16px; }
+#ckCaList .ca-sum .who .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 340px; }
+#ckCaList .ca-sum .who .id { font: 10.5px var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#ckCaList .ca-sum .credits { font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 #ckCaList .ca-sum .ca-today { font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 #ckCaList .ca-sum .ca-sep { color: var(--ink-3); }
+#ckCaList .ca-sum .acts { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
 #ckCaList .ca-link { font-size: 12px; color: var(--ink-3); text-decoration: underline; cursor: pointer; }
 #ckCaList .ca-link:hover { color: var(--ink-2); }
-#ckCaList .ca-detail { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line-soft); }
+#ckCaList .ca-detail { margin-top: 0; padding: 8px 16px 12px; border-top: 1px dashed var(--line-soft); }
 #ckCaList .ca-kv { display: flex; gap: 10px; font-size: 12px; line-height: 1.75; }
 #ckCaList .ca-k { min-width: 150px; flex: none; color: var(--ink-3); }
 #ckCaList .ca-v { color: var(--ink-2); font-family: var(--mono); word-break: break-all; }
@@ -783,6 +800,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>WorkBuddy 签到</h3>
           <span class="grow"></span>
           <span class="note" id="ckWbSummary"></span>
+          <button class="xs primary" id="btnCkWbCheckinAll">全部签到</button>
         </header>
         <div class="state" id="ckWbState"><span class="dots">加载中</span></div>
         <div id="ckWbList"></div>
@@ -859,7 +877,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad"><div class="ck-group">Trae</div></div>
         <div class="state" id="tcState"><span class="dots">加载中</span></div>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc ckfix">
             <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
             <tbody id="tcBody"></tbody>
           </table>
@@ -868,7 +886,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad"><div class="ck-group">Qoder</div></div>
         <div class="state" id="qkState"><span class="dots">加载中</span></div>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc ckfix">
             <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
             <tbody id="qkBody"></tbody>
           </table>
@@ -877,9 +895,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad"><div class="ck-group">WorkBuddy</div></div>
         <div class="state" id="wkState"><span class="dots">加载中</span></div>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc ckfix">
             <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
             <tbody id="wkBody"></tbody>
+          </table>
+        </div>
+
+        <!-- MiniMax：签到页能看到 credits，但积分总览里缺这一块，
+             用户看不到「总量还剩多少」→ 补上（余额 / 今日可得 / 总量）。 -->
+        <div class="pad"><div class="ck-group">MiniMax</div></div>
+        <div class="state" id="mmCrState"><span class="dots">加载中</span></div>
+        <div class="tbl-wrap">
+          <table class="acc ckfix">
+            <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
+            <tbody id="mmCrBody"></tbody>
+          </table>
+        </div>
+
+        <!-- CodeArts（华为云码道）：同样有每日 100 积分，之前只有签到页能看到，
+             积分总览里缺这一块 → 三个平台显示、第四个不显示，看着就不齐。 -->
+        <div class="pad"><div class="ck-group">CodeArts（华为）</div></div>
+        <div class="state" id="caCrState"><span class="dots">加载中</span></div>
+        <div class="tbl-wrap">
+          <table class="acc ckfix">
+            <thead><tr><th>账号</th><th>积分余额</th><th>签到可得</th></tr></thead>
+            <tbody id="caCrBody"></tbody>
           </table>
         </div>
       </div>
@@ -1490,8 +1530,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <div class="body">
       <div id="qdEgressBody"></div>
       <div class="state err" id="qdEgressErr" hidden></div>
-      <label class="fld"><span class="lb">邮箱</span>
-        <input type="text" id="qdEgressEmail" readonly>
+      <label class="fld"><span class="lb">账号</span>
+        <!-- 显示用脱敏标识，真邮箱放在隐藏字段里（保存时要按邮箱定位账号） -->
+        <input type="text" id="qdEgressEmailLabel" readonly>
+        <input type="hidden" id="qdEgressEmail">
       </label>
       <label class="fld"><span class="lb">设备模式（device_mode）</span>
         <select id="qdEgressMode">

@@ -70,7 +70,18 @@ const (
 // 文案必须与 strategy 自洽：unassigned 只表示「本号今天没有被分配到额度」，
 // 不能写成与某个号「是同一个人」的肯定句，也不能出现 shared_person 才成立的
 // 「额度已被对方领走」。两端口点（POST checkin / GET checkin-status）共用本常量。
-const qoderPendingNotAssignedMsg = "服务端今天没有给本号下发每日额度（已核实本号额度未被其它号占用）"
+//
+// ⚠️ 2026-11-09 改写：旧文案只说「服务端没下发 + 已核实未被占用」，用户看到
+// 一句「没下发」完全不知道下一步做什么，表现为「两种签到方式都试过还是签不了」。
+// 实测（QQ 号 11-08 / 11-09 连续 pending）：该号的活动列表里**根本没有当天的
+// 每日 CLAIM_BENEFIT**，只剩一条早先的促销；而它最近一次领到的是 11-07 的
+// 特殊活动（act-20261105-316，2000 分）。根因是**该号的客户端登录身份过期**：
+// 每日活动只对「在 Qoder 客户端登录过（= 服务端给这个号发过 scope）」的账号
+// 下发，纯 API 签不到没下发的活动 —— 必须让用户在客户端里用这个号真登录一次。
+// 所以这里要直接把「下一步怎么做」写出来。
+const qoderPendingNotAssignedMsg = "服务端今天没有给本号下发每日额度（已核实：这份额度没有被号池里的其它账号领走）" +
+	"；多半是这个号的客户端登录身份过期了 —— 请点该号的「重新登录该号」，在 Qoder 客户端里用这个号扫码登录一次，" +
+	"服务端会重新给它下发当日活动，之后面板就能自动签到"
 
 // qoderPendingUnknownMsg 证据不足时的 pending 说明（未探测出任何同人结论）。
 const qoderPendingUnknownMsg = "未观察到今日签到活动（Qoder 每天 10:00 后下发；后台会自动重试）"
@@ -211,6 +222,10 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 	}
 	patches := map[string]poolPatch{}
 
+	// clientFresh：本轮用了「客户端当前登录态」的账号 → 客户端那份凭证。
+	// 用来把新 token 写回号池（号池快照本来停在旧 token 上）。
+	clientFresh := map[string]*QoderAuth{}
+
 	// 需要二次判定的账号（自己的列表里没有今天的活动）。
 	type pendingProbe struct {
 		item qoderPoolItem
@@ -246,6 +261,20 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		key := normalizeQoderEmail(email)
 		auth := cloneQoderAuth(it.snap.Auth)
 		scope := QoderQuotaScopeKey(it.snap)
+
+		// 客户端里这个号可能持有一份**更新的会话**（用户在软件里登录/领过额度，
+		// 客户端会自己刷新 token + scope）。号池里的快照还停在旧值时，面板拿着
+		// 旧 token 去问上游 —— 上游对认不出来的会话一律回 200 + 空 campaigns，
+		// 于是面板显示「今日未下发」，而软件里明明有任务（2026-11-09 用户反馈）。
+		// 这里先对齐：客户端登录的就是这个号时，用客户端那份凭证，并把新 token
+		// 写回号池（下面的 patches 通道）。
+		if ca := QoderClientAuthFor(email); ca != nil &&
+			strings.TrimSpace(ca.Token) != "" &&
+			strings.TrimSpace(ca.Token) != strings.TrimSpace(auth.Token) {
+			auth = cloneQoderAuth(ca)
+			it.snap.Auth = cloneQoderAuth(ca)
+			clientFresh[key] = ca
+		}
 
 		// 按账号解析设备/出口（默认真实设备，行为与现网一致）。
 		dev, devErr := qoderDeviceForEmailSafe(email)
@@ -295,6 +324,16 @@ func QoderCheckinPoolOrdered(emails []string, priority string) (*QoderCheckinPoo
 		res.Email = firstNonEmpty(email, res.Email)
 		res.Scope = scope
 		res.QuotaGroup = groupSize[key]
+
+		// 用的是客户端那份会话时，把客户端的 token 一并写回号池（下面统一落盘）。
+		if ca := clientFresh[key]; ca != nil {
+			if at == "" {
+				at = strings.TrimSpace(ca.Token)
+			}
+			if rt == "" {
+				rt = strings.TrimSpace(ca.RefreshToken)
+			}
+		}
 
 		// token / ClaimCID 变更收集起来，最后一次性走 UpdateQoderPool。
 		if at != "" || rt != "" || res.ClaimCID != "" {

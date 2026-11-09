@@ -30,9 +30,11 @@ func TestQoderCheckinUIListsAllAccounts(t *testing.T) {
 	}
 	src := string(raw)
 
-	body := grabJSFunc(t, src, "loadCkQoder")
+	// 渲染主体在 renderQoderRows（2026-11-10 起 loadCkQoder 拆成两阶段：
+	// 先画骨架再补状态，渲染代码移到 renderQoderRows），断言随之跟过去。
+	body := grabJSFunc(t, src, "renderQoderRows")
 	if !strings.Contains(body, "rows.map(") {
-		t.Error("loadCkQoder 应按号池全量渲染（rows.map）")
+		t.Error("renderQoderRows 应按号池全量渲染（rows.map）")
 	}
 	// 属性名由 UI.act(...) 生成（渲染结果仍是 data-ck-qoder="…"），
 	// 所以这里断言属性名本身，而不是字面量写法。
@@ -44,6 +46,21 @@ func TestQoderCheckinUIListsAllAccounts(t *testing.T) {
 	}
 	if strings.Contains(body, `$('ckQoderSummary').textContent = cur ?`) {
 		t.Error("汇总文案又退回成「只显示当前账号」了")
+	}
+
+	// 两阶段渲染（2026-11-10）：Qoder 卡片必须**先**用 accounts 画出骨架，
+	// 再等 checkin-status 补状态 —— 否则卡片要等上游 3.4s 才出现，
+	// 用户就会觉得「Qoder 比别的平台加载慢」。
+	loader := grabJSFunc(t, src, "loadCkQoder")
+	if !strings.Contains(loader, "renderQoderRows(rows, arr, cur, null)") {
+		t.Error("loadCkQoder 应先用 null 状态渲染骨架（renderQoderRows(rows, arr, cur, null)）")
+	}
+	if !strings.Contains(loader, "renderQoderRows(rows, arr, cur, st2)") {
+		t.Error("loadCkQoder 应在拿到 checkin-status 后重绘（renderQoderRows(rows, arr, cur, st2)）")
+	}
+	// 骨架阶段不得猜「可签到/已签到」——状态没查到就显示占位。
+	if !strings.Contains(body, "查询中…") {
+		t.Error("状态未到达时应显示「查询中…」占位，不得猜签到状态")
 	}
 
 	// 签到函数必须支持按账号，且默认=全部
